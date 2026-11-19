@@ -495,8 +495,9 @@ void camera_frame(const CameraFrameContext& context) {
             s_main_cameras = {};
         } else {
             if (c.ready && !c.valid(mem)) c.reset();
+            static const bool mouse_log = std::getenv("RBREW_MOUSE_LOG") != nullptr; // vpad.cpp reads main_view
             const bool need = want || settings.camera_distance != 100 || settings.camera_height != 0 || s_fly.load() ||
-                              s_spawn_wanted.load() || settings.camera_motion || context.shaders_on;
+                              s_spawn_wanted.load() || settings.camera_motion || context.shaders_on || mouse_log;
             static uint64_t retry_at = 0; // a failed search waits 5 s before the next one
             if (context.world_frames < 2) retry_at = 0;
             if (need && !c.ready && !c.job.valid() && context.world_frames > 15 && context.world_frames >= retry_at)

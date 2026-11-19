@@ -361,6 +361,11 @@ const bool dispatch_instrumented = [] {
     const char* profile = rbrew_diagnostic_env("RBREW_IMPORT_PROFILE");
     return (trace && *trace) || (profile && *profile && *profile != '0') || import_trace_path;
 }();
+} // namespace
+// Read by the generated code's inline dispatch fast path (same condition as
+// below; initialized right after dispatch_instrumented, before guest code).
+extern "C" RBREW_HOST_API const bool rbrew_dispatch_plain = !dispatch_instrumented;
+namespace {
 void import_trace(CPUState* cpu, uint32_t guest_addr) {
     if (!import_trace_path || guest_addr < 0x02D00000u || guest_addr >= 0x02E00000u) return;
     struct Slot {

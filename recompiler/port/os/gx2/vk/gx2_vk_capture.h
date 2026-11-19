@@ -30,15 +30,21 @@ size_t replay_command_count();
 size_t replay_set_binds(); // descriptor-set binds in the replay frame (not substituted)
 bool replay_complete();    // the replay frame captured every command it needs
 // Uniform buffer substitution for a push-descriptor write of `unit`: return
-// true and the buffer/offset to bind instead.
+// true and the buffer/offset to bind instead. kNoDepthTest is or'ed into the
+// unit when its draw does not test depth.
+constexpr uint32_t kNoDepthTest = 0x80000000u;
 using Substitute = bool (*)(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range,
                             VkBuffer& out_buffer, VkDeviceSize& out_offset);
 void replay(Substitute substitute);
 } // namespace gx2vk::capture
 
 namespace gx2vk {
+// Prevent poll_completed() and upload() from destroying deferred resources
+// (such as descriptor pools) or recycling upload chunks with serial >= since_serial
+// while a frame is actively being captured for in-between replay. Pass 0 to release.
+void set_capture_hold(uint64_t since_serial);
 // Keep the upload chunks and deferred destructions used since `since_serial`
-// alive until the submission now being recorded completes (the replay reuses
-// frame N's data).
-void retain_until_current_submission(uint64_t since_serial);
+// alive until the submission now being recorded (or one of the following
+// `later_submissions`) completes (the replay reuses frame N's data).
+void retain_until_current_submission(uint64_t since_serial, uint32_t later_submissions = 0);
 } // namespace gx2vk

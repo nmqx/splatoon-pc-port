@@ -90,8 +90,10 @@ inline void rbrew_host_sleep_until(std::chrono::steady_clock::time_point deadlin
 // logical CPU exists: the port keeps the game thread, render thread, Vulkan
 // recorder, audio and translation helper runnable at once, so on a small CPU
 // a millisecond spin takes the core the awaited thread or the game needs.
-// Default: each wait's own budget on >= 8 logical CPUs, else 50 us before it
-// sleeps. RBREW_HOST_SPIN=full keeps every budget, =<us> caps it.
+// Default: 200 us on >= 8 logical CPUs, else 50 us before it sleeps. The
+// render thread's 4 ms budget spent 22-35% of its time spinning in the plaza
+// (2026-11-19 profile, 6-core Zen 2), taking the SMT sibling from the game
+// thread. RBREW_HOST_SPIN=full keeps every budget, =<us> caps it.
 inline std::chrono::microseconds rbrew_host_spin_cap() {
     static const std::chrono::microseconds cap = [] {
         constexpr auto kFull = std::chrono::microseconds::max();
@@ -104,7 +106,7 @@ inline std::chrono::microseconds rbrew_host_spin_cap() {
             for (; process; process &= process - 1) ++cpus;
 #endif
         if (!cpus) cpus = std::thread::hardware_concurrency();
-        return cpus >= 8 ? kFull : std::chrono::microseconds(50);
+        return cpus >= 8 ? std::chrono::microseconds(200) : std::chrono::microseconds(50);
     }();
     return cap;
 }

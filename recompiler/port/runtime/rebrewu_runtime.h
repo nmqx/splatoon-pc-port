@@ -285,9 +285,13 @@ static inline uint64_t rbrew_bswap64(uint64_t v) {
 // effective address is a plain offset with no translation and no check.
 static inline bool rbrew_arena_access(const uint8_t* mem, uint32_t addr, uint32_t size) {
 #if defined(RBREW_HYPER_OPTIMIZE)
+    // Generated code always passes cpu->mem, the committed arena base, which
+    // is set before any guest code runs: no per-access null test (it cost a
+    // test/branch and a cold call per load/store; the exe shrank 180 -> 115 MB).
+    (void)mem;
     (void)addr;
     (void)size;
-    return mem != nullptr;
+    return true;
 #else
     return mem != nullptr && addr <= RBREW_APPLICATION_ARENA_END - size;
 #endif
@@ -582,16 +586,13 @@ static inline uint32_t rbrew_sraw_carry(uint32_t v, uint32_t amount) {
 // Returns a 4-bit CR field value: bit3=LT, bit2=GT, bit1=EQ, bit0=SO
 // Stored in cpu->cr[n] as a uint32_t with those bits.
 // ---------------------------------------------------------------------------
+// Branchless: 2 << (gt + 2*lt) gives EQ=2, GT=4, LT=8 (setcc + shift).
 static inline uint32_t rbrew_cmp_s32(uint32_t a, uint32_t b) {
     int32_t sa = (int32_t)a, sb = (int32_t)b;
-    if (sa < sb) return 8u; // LT
-    if (sa > sb) return 4u; // GT
-    return 2u;              // EQ
+    return 2u << ((uint32_t)(sa > sb) + 2u * (uint32_t)(sa < sb));
 }
 static inline uint32_t rbrew_cmp_u32(uint32_t a, uint32_t b) {
-    if (a < b) return 8u;
-    if (a > b) return 4u;
-    return 2u;
+    return 2u << ((uint32_t)(a > b) + 2u * (uint32_t)(a < b));
 }
 static inline uint32_t rbrew_cmp_f64(double a, double b) {
     if (a < b) return 8u;
@@ -801,8 +802,42 @@ RBREW_HOST_API RbrewGuestHook rbrew_guest_hook(uint32_t guest_addr);
 // Register (or clear with null) before guest code runs; returns false when full.
 RBREW_HOST_API bool rbrew_set_guest_hook(uint32_t guest_addr, RbrewGuestHook hook);
 
+// True when no dispatch diagnostic (entry trace, import profile/trace) is on:
+// then rbrew_dispatch_mem / rbrew_call_indirect_mem call a known target
+// directly. Fixed during static initialization, before guest code runs.
+RBREW_HOST_API extern const bool rbrew_dispatch_plain;
+
 #ifdef __cplusplus
 }
+#endif
+
+// Inline fast path of rbrew_dispatch_mem and rbrew_call_indirect_mem for the
+// generated code (the latter only adds the differential-replay check, also
+// tested here): a known target is called without the two out-of-line hops.
+// Everything else takes the original functions.
+static inline void rbrew_dispatch_inline(CPUState* cpu, uint8_t* mem, uint32_t guest_addr) {
+    const uint32_t index = guest_addr >> 2;
+    if (rbrew_dispatch_plain && !cpu->differential_validation && index < cpu->dispatch_size) {
+        if (HostFunc fn = cpu->dispatch_table[index]) {
+            fn(cpu);
+            return;
+        }
+    }
+    rbrew_dispatch_mem(cpu, mem, guest_addr);
+}
+static inline void rbrew_call_indirect_inline(CPUState* cpu, uint8_t* mem, uint32_t guest_addr) {
+    const uint32_t index = guest_addr >> 2;
+    if (rbrew_dispatch_plain && !cpu->differential_validation && index < cpu->dispatch_size) {
+        if (HostFunc fn = cpu->dispatch_table[index]) {
+            fn(cpu);
+            return;
+        }
+    }
+    rbrew_call_indirect_mem(cpu, mem, guest_addr);
+}
+#if defined(RBREW_HYPER_OPTIMIZE) && !defined(RBREW_ENABLE_PPC_FALLBACK) && !defined(RBREW_ENABLE_COVERAGE)
+#define rbrew_dispatch_mem(c, m, a) rbrew_dispatch_inline(c, m, a)
+#define rbrew_call_indirect_mem(c, m, a) rbrew_call_indirect_inline(c, m, a)
 #endif
 
 #include "rebrewu_coverage.h"

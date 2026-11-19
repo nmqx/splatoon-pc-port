@@ -13,7 +13,9 @@ param(
     [string]$Mlc,           # optional local system-resource source; never prompts
     [string]$Output,        # where the playable game folder is created
     [switch]$Clean,         # delete previous build outputs first
-    [switch]$NonInteractive # unattended execution without interactive prompts
+    [switch]$NonInteractive, # unattended execution without interactive prompts
+    [switch]$FastBuild,     # no /GL or /LTCG: much faster build and relinks, slightly slower game
+    [int]$Jobs = 0          # parallel compile jobs (0 = automatic, from cores and RAM)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -700,7 +702,7 @@ if (-not ((Complete-GeneratedModule $generated) -and (Test-Path -LiteralPath $st
     # Safe incremental regeneration: CppEmitter preserves unchanged file timestamps
     # and safely archives obsolete parts to avoid wiping valid compilation units.
     Ensure-Folder $generated
-    & $rebrewu.FullName recompile --rpx $rpx --output $generated --manifest $SelectedManifest
+    & $rebrewu.FullName recompile --rpx $rpx --output $generated --manifest $SelectedManifest --assume-xer-so-clear
     Check-Exit 'Recompiling Gambit.rpx'
     if (-not (Complete-GeneratedModule $generated)) { Fail 'The recompiler did not produce the complete supported-game function table. Installation stopped before building an incomplete game.' }
     Set-Content -LiteralPath $stamp -Value $current -Encoding ASCII
@@ -728,8 +730,10 @@ $gameCmakeArgs = @(
     '-DRBREW_ENABLE_COVERAGE=OFF',
     '-DRBREW_ENABLE_PPC_FALLBACK=OFF',
     '-DRBREW_DIAGNOSTIC_RUNTIME=OFF',
-    '-DRBREW_TEXTURE_DIAGNOSTICS=OFF'
+    '-DRBREW_TEXTURE_DIAGNOSTICS=OFF',
+    "-DRBREW_FAST_LINK=$(if ($FastBuild) { 'ON' } else { 'OFF' })"
 )
+if ($FastBuild) { Info 'Fast build: no /GL or /LTCG (use a normal build for the release zip).' }
 if ($ninja) {
     $gameCmakeArgs += @('-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$ninja", '-DCMAKE_BUILD_TYPE=Release')
 } else {
@@ -738,7 +742,14 @@ if ($ninja) {
 & $cmake @gameCmakeArgs
 Check-Exit 'Configuring the game'
 if ($ninja) {
-    $workerCount = [Environment]::ProcessorCount
+    # Each cl.exe job on a generated part can take several GB: cap the job
+    # count by installed RAM (about 4 GB per job), not only by the core count.
+    $workerCount = $Jobs
+    if ($workerCount -le 0) {
+        $ramGb = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+        $workerCount = [math]::Max(1, [math]::Min([Environment]::ProcessorCount, [math]::Floor($ramGb / 4)))
+    }
+    Info "Compiling with $workerCount parallel jobs."
     $gameBuildArgs = @('--build', $gameBuild, '--target', 'Gambit', '--', '-j', "$workerCount")
 } else {
     $gameBuildArgs = @('--build', $gameBuild, '--config', 'Release', '--target', 'Gambit', '--parallel')

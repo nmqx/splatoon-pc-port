@@ -53,6 +53,7 @@ struct CliOptions {
     std::string hints_file;            // diagnostic: extra forced entry addresses (hex per line)
     std::string analyzer_entries_file; // extra analyzer starts; merged with [entries] corroborate
     std::optional<uint32_t> functions_per_file;
+    bool assume_xer_so_clear{false}; // integer CR writes skip XER.SO (checked: no SO writer)
     std::string hooks_file; // extra host-hook entries; merged with [hooks]
 
     // Manifest: per-image guest data (identity, PLT map, entry hints). When no

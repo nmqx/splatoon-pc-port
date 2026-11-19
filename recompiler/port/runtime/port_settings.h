@@ -51,6 +51,8 @@ constexpr int kMouseBase = 1000;
 constexpr int kPadTriggerLeft = 100, kPadTriggerRight = 101;
 // The touchpad button opens the menu and cannot be bound.
 constexpr int kPadTouchpad = 20;
+// frame_rate value "one picture per display refresh" (settings.ini: frame_rate=display).
+constexpr int kFrameRateDisplay = 1;
 void default_bindings(int (&keys)[kActionCount], int (&pad)[kActionCount]);
 
 struct PictureLook {
@@ -60,8 +62,10 @@ struct PictureLook {
 struct Values {
     int resolution = k720p;  // takes effect at the next start
     bool plaza_60fps = true; // RBREW_PLAZA_60FPS
-    bool fps120 = false;     // RBREW_FPS120=interp: in-between frames (frame_rate 120 or 180)
-    int frame_rate = 60;     // 60, 120, 180 (two in-between frames, not in the plaza), 30 (low-end)
+    bool fps120 = false;     // RBREW_FPS120=interp: in-between frames (frame_rate above 60)
+    // 60; 120, 165, 180, 240 or kFrameRateDisplay: real in-between frames
+    // (gx2_frame_interp.h); 30 (low-end). settings.ini: a number or "display".
+    int frame_rate = 60;
     bool gsync = false;      // frames go to the display at once (IMMEDIATE) for G-Sync/FreeSync
     bool fullscreen = true;
     bool fps_overlay = false;       // debug overlay (F3), hidden at launch; RBREW_FPS_OVERLAY
@@ -71,7 +75,10 @@ struct Values {
     int gyro_sensitivity = 100;     // percent
     bool gyro_invert_pitch = false; // RBREW_GYRO_INVERT_PITCH
     int mouse_sensitivity = 100;    // percent
-    bool mouse_direct = true;       // mouse turns the camera 1:1 (motion aiming), not through the stick
+    bool mouse_direct = true;       // mouse aims directly, not through the right stick
+    bool mouse_camera = true;       // direct aiming turns the game's camera itself, 1:1 (hooks/mouse_aim.cpp);
+                                    // off: the old path through the GamePad motion sensors (RBREW_MOUSE_CAMERA)
+    bool frame_gen = false;         // optical-flow frame generation: one picture per display refresh (RBREW_FRAMEGEN)
     int volume = 100;               // percent
     int shader_quality =
         kShadersOff; // first start: the clean original game at 60 FPS; the graphics preset turns the shaders on
@@ -129,8 +136,9 @@ int active_resolution();
 
 // Hot-path views of get().
 inline std::atomic<bool> g_plaza_60fps{true};
-inline std::atomic<bool> g_fps120{false}; // 120 or 180: in-between frames
-inline std::atomic<bool> g_fps180{false}; // 180: two in-between frames per step
+inline std::atomic<bool> g_fps120{false}; // above 60: in-between frames (gx2_frame_interp.h)
+inline std::atomic<bool> g_fps180{false}; // 180 (kept for older code; the scheduler reads g_frame_rate)
+inline std::atomic<int> g_frame_rate{60}; // 30, 60, 120, 165, 180, 240 or kFrameRateDisplay
 inline std::atomic<bool> g_fps30{false};  // 30: two steps per drawn frame
 inline std::atomic<bool> g_gsync{false};
 inline std::atomic<bool> g_gyro{true};
@@ -138,6 +146,8 @@ inline std::atomic<bool> g_gyro_invert_pitch{false};
 inline std::atomic<float> g_gyro_scale{1.0f};
 inline std::atomic<float> g_mouse_scale{1.0f};
 inline std::atomic<bool> g_mouse_direct{true};
+inline std::atomic<bool> g_mouse_camera{true};
+inline std::atomic<bool> g_frame_gen{false};
 inline std::atomic<float> g_volume{1.0f};
 inline std::atomic<bool> g_confirm_quit{true};
 inline std::atomic<int> g_shader_quality{kShadersOff}; // load() publishes the player's selection

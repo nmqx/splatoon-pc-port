@@ -229,6 +229,19 @@ bool has_surface();
 bool present(Image& source, uint32_t source_width, uint32_t source_height);
 uint64_t present_count();
 VkPresentModeKHR present_mode();
+// Pictures really presented (render thread): rate over the last
+// `window_seconds` and the longest gap between two of them. 0 when nothing
+// was presented in that time.
+struct PresentRate {
+    float fps = 0.0f, worst_ms = 0.0f;
+};
+PresentRate present_rate(double window_seconds = 0.5);
+// Refresh rate of the display the window is on (Hz; 0 when unknown).
+// RBREW_DISPLAY_HZ=<rate> overrides it (tests).
+double display_refresh_hz();
+// Windows: DWM's refresh period and one of its vertical blanks on the steady
+// clock (nanoseconds). False when unknown.
+bool display_vblank(uint64_t& period_ns, uint64_t& vblank_ns);
 
 // ---- one-shot readback -------------------------------------------------------
 // Records a copy of one image subresource into host memory, submits, waits and

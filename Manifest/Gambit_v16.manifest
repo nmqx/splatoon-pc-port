@@ -2042,6 +2042,7 @@ hash = 0xA359D087A60635C1
 # The instruction is PowerPC assembly (cmpwi, li, stw, b, ...).
 # Branch targets are absolute guest addresses.
 hash = Undefined
+0x025DB0D8 = bl 0x02D0F000  # player camera update (025DAAF8): its input step 025D4A2C runs through the port's mouse-aim thunk (hooks/mouse_aim.cpp)
 
 [globals]
 # Guest addresses the port code needs by name (not covered by a hash).

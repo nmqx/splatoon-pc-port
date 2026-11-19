@@ -4,6 +4,7 @@
 #include "../../runtime/port_settings.h"
 #include "../../runtime/benchmark_input.h"
 #include "vk/gx2_vk_capture.h"
+#include "../../hooks/mouse_aim.h"
 
 #include <algorithm>
 #include <bit>
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -49,11 +51,13 @@ struct Unit {
     uint8_t ref_count = 0;
 };
 struct Record {
+    rbrew_aim::ViewTag view; // the frame's camera and mouse counts (display-rate mouse look)
     std::vector<Unit> units;
     std::vector<uint8_t> bytes;
     std::unordered_map<uint64_t, uint32_t> by_key;
     std::unordered_map<uint64_t, uint32_t> occurrences; // per base key: how many draws
     void clear() {
+        view = {};
         units.clear();
         bytes.clear();
         by_key.clear();
@@ -103,35 +107,83 @@ bool vk_mode() {
     return on;
 }
 unsigned s_scan_index = 0;
-bool s_held = false;
-uint64_t s_held_due = 0;
 uint64_t s_last_complete = 0;
 double s_last_complete_interval_ns = 0;
 double s_interval_ns = 16683333.0;
-// Render-thread budget: a frame's own work plus its replay must fit in one
-// frame interval, or the game (which waits for the renderer at its swap)
-// slows down. Averages decide; a skipped frame is simply presented at once.
+// Render-thread time of a frame's own work and of one in-between frame
+// (averages): what the controller's "does this rate fit" test uses.
 uint64_t s_frame_busy_ns = 0;
 double s_busy_avg_ns = 0, s_replay_avg_ns = 0;
-unsigned s_skip_streak = 0;
-// Share of frames that get an in-between frame, steered by the game's own
-// frame interval: the game waits for the renderer at queries and at its swap,
-// so render time alone does not tell whether a replay slows the game.
-double s_ratio = 1.0, s_credit = 0.0, s_game_interval_ns = 0;
-// In-between frames per game frame (1: 120 FPS, 2: 180 FPS) and the blend
-// position of the one being drawn (1/2; 1/3 and 2/3).
-unsigned s_replay_count = 1;
-// Per replay: matrices blended and matrices kept because they jumped.
+// Render-thread time of an in-between frame per captured command: a replay
+// costs about its frame's command count times this (0.5 ms in a light scene,
+// 3-7 ms facing the plaza's centre). The average alone, taken in a light
+// scene, let the controller raise the rate where the replays could not fit.
+double s_replay_ns_per_cmd = 0;
+uint64_t s_busy_last_ns = 0; // the last complete frame's own work
+// The game's own frame interval: the game waits for the renderer at queries
+// and at its swap, so render time alone does not tell whether the replays
+// slow the game.
+double s_game_interval_ns = 0;
+// Per step: matrices blended and matrices kept because they jumped.
 unsigned s_blended_matrices = 0, s_jumped_matrices = 0;
-float s_blend_t = 0.5f;
-bool s_mid = false; // 180 FPS: the second in-between frame waits
-uint64_t s_mid_due = 0;
+float s_blend_t = 0.5f; // blend position of the in-between frame being drawn (0: N-1, 1: N)
+
+// The schedule (see gx2_frame_interp.h). Pictures wait in copies of the scan
+// image (kSlots of them, used in turn) until their present time.
+constexpr double kLogicFrameNs = 1e9 * 1001.0 / 60000.0;
+constexpr unsigned kMaxPerStep = 8; // pictures planned for one game step
+struct Shot {
+    unsigned slot;
+    uint64_t due;
+    float t; // position between N-1 (0) and N (1); 1: the game's own frame
+};
+std::vector<Shot> s_shots; // waiting pictures, in present order
+unsigned s_next_slot = 0;
+struct Plan {
+    unsigned count = 0;
+    float t[kMaxPerStep]{};
+    uint64_t due[kMaxPerStep]{};
+    unsigned held_slot = 0; // the copy of frame N
+};
+Plan s_plan;
+double s_rate = 1.0;          // presents per game step now (the controller's level)
+unsigned s_level = 0;         // index in the controller's ladder (0: the target rate)
+double s_phase = 0.0;         // position of the next picture within the step being planned
+double s_phase_lo = 0.0;      // smallest position at this rate: shown without delay
+double s_anchor_ns = 0.0;     // smoothed completion time of the newest frame
+double s_jitter_ns = 0.0;     // how far completions stray from it
+double s_lead_ns = 2.5e6;     // from a frame's completion to its first in-between picture
+double s_lock_offset_ns = 0;  // fixed refresh: pull towards the display's vertical blank
+uint64_t s_last_present_ns = 0, s_burst_waited_ns = 0;
+bool s_schedule_reset = true; // the next planned step starts a new schedule
+Status s_status;
 std::vector<uint8_t> s_blend; // replay_bank result
+// Replayed frames whose GPU work may still be pending (replay_may_read): the
+// first serial of the captured frame and the last submission holding one of
+// its replays. A few steps are enough: older ones are long complete.
+struct Hold {
+    uint64_t from = 0, until = 0;
+};
+constexpr unsigned kHolds = 16;
+Hold s_holds[kHolds];
+unsigned s_hold_next = 0;
+// RBREW_INTERP_VB_GUARD=0 (diagnostics, the bug's reproduction): only count
+// the hazards (stats "hazards"), do not orphan.
+bool vb_guard() {
+    static const bool on = [] {
+        const char* v = std::getenv("RBREW_INTERP_VB_GUARD");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
 
 struct Stats {
-    unsigned frames = 0, replays = 0, held = 0, skipped = 0, units = 0, matched = 0, missing = 0, failed = 0,
-             changed = 0, set_binds = 0, cuts = 0;
-    double replay_ms = 0, busy_ms = 0;
+    unsigned frames = 0, replays = 0, held = 0, between = 0, presents = 0, direct = 0, skipped = 0, dropped = 0,
+             level_downs = 0, units = 0, matched = 0, missing = 0, failed = 0, changed = 0, set_binds = 0, cuts = 0,
+             lock_samples = 0, hazards = 0, late1 = 0, views = 0, look = 0, views_n = 0, views_p = 0, why_capture = 0, why_broken = 0, why_units = 0,
+             why_incomplete = 0, why_mid = 0;
+    double look_yaw = 0;
+    double replay_ms = 0, busy_ms = 0, late_ms = 0, late_max_ms = 0, lock_error_ms = 0;
 };
 Stats s_stats;
 FILE* stats_file() {
@@ -141,19 +193,33 @@ FILE* stats_file() {
     }();
     return f;
 }
+// RBREW_INTERP_STATS=<file>: one line per second. steps: game frames;
+// presents: pictures the schedule presented (between: in-between frames,
+// exact: the game's own frames) plus direct: frames presented as they came
+// (no in-between frame); rate: presents per step now; replay: render-thread
+// time per in-between frame and its share of one core; late: how long after
+// their time pictures went out.
 void report_stats() {
     FILE* f = stats_file();
     if (!f) return;
     static uint64_t second = now_ns();
     const uint64_t now = now_ns();
     if (now - second < 1000000000ull) return;
+    const double seconds = double(now - second) / 1e9;
     std::fprintf(f,
-                 "frames %u replays %u skipped %u held %u ratio %.2f | units %u matched %.0f%% changed %u set_binds %u "
-                 "missing %u | replay %.2f ms frame busy %.2f ms | failed %u cuts %u\n",
-                 s_stats.frames, s_stats.replays, s_stats.skipped, s_stats.held, s_ratio, s_stats.units,
-                 s_stats.units ? 100.0 * s_stats.matched / s_stats.units : 0.0, s_stats.changed, s_stats.set_binds,
-                 s_stats.missing, s_stats.replays ? s_stats.replay_ms / s_stats.replays : 0.0,
-                 s_stats.frames ? s_stats.busy_ms / s_stats.frames : 0.0, s_stats.failed, s_stats.cuts);
+                 "steps %u presents %u between %u exact %u direct %u skipped %u dropped %u | rate %.3f level %u "
+                 "downs %u | replay %.2f ms core %.1f%% busy %.2f ms lead %.2f ms | late avg %.2f max %.2f ms | "
+                 "units %u matched %.0f%% changed %u missing %u failed %u cuts %u | lock %.2f ms | hazards %u late1 %u | look %u views %u n %u p %u yaw %.2f | why c%u b%u u%u i%u m%u\n",
+                 s_stats.frames, s_stats.presents + s_stats.direct, s_stats.between, s_stats.held, s_stats.direct,
+                 s_stats.skipped, s_stats.dropped, s_rate, s_level, s_stats.level_downs,
+                 s_stats.replays ? s_stats.replay_ms / s_stats.replays : 0.0, s_stats.replay_ms / (10.0 * seconds),
+                 s_stats.frames ? s_stats.busy_ms / s_stats.frames : 0.0, s_lead_ns / 1e6,
+                 s_stats.presents ? s_stats.late_ms / s_stats.presents : 0.0, s_stats.late_max_ms, s_stats.units,
+                 s_stats.units ? 100.0 * s_stats.matched / s_stats.units : 0.0, s_stats.changed, s_stats.missing,
+                 s_stats.failed, s_stats.cuts, s_stats.lock_samples ? s_stats.lock_error_ms / s_stats.lock_samples : 0.0,
+                 s_stats.hazards, s_stats.late1, s_stats.look, s_stats.views, s_stats.views_n, s_stats.views_p,
+                 s_stats.look ? s_stats.look_yaw / s_stats.look : 0.0, s_stats.why_capture, s_stats.why_broken,
+                 s_stats.why_units, s_stats.why_incomplete, s_stats.why_mid);
     std::fflush(f);
     s_stats = {};
     second = now;
@@ -378,10 +444,233 @@ const Unit* match_prev(const Unit& cur) {
         }
     return best_unit;
 }
+// ---- Mouse look at the display's rate ---------------------------------------
+// The game turns its camera once per step; an in-between frame shows the
+// camera blended between N-1 and N. With the mouse turning the camera
+// (hooks/mouse_aim.h), each in-between frame adds the mouse movement that
+// came after the blended position: every count received so far minus the
+// counts in the blend (N-1's plus t of N's). The game turns the camera around
+// its look-at point (the eye orbits the player), so the extra yaw (about the
+// world's up axis) and pitch (about the camera's horizontal axis) turn the
+// world-to-view matrices around that point: M' = M * W^-1, W = the orbit. At
+// the next step the game's own camera has taken those counts: nothing jumps
+// back and nothing is counted twice. Only the blended scene passes are
+// changed; the HUD and the crosshair stay as in frame N.
+//
+// The view matrices are found in frame N's uniform data by their rotation:
+// three rows whose 3x3 part, against the camera basis of N's tag, is a
+// view (identity up to signs) or view-projection ([sx 0 cx; 0 sy cy; 0 0 a])
+// matrix; an optional fourth row along the view axis (the projection's w
+// row) goes with them. RBREW_INTERP_MOUSE=0: off.
+struct ViewFix {
+    bool on = false;
+    float rot[9]{};                  // the camera's extra rotation (world, row-major)
+    float pivot[3]{};                // it turns around this point
+    float basis[9]{};                // frame N's camera basis rows: right, up, forward
+    float basis_prev[9]{};           // the same from the newest tag
+    float yaw = 0.0f, pitch = 0.0f;  // degrees (stats)
+};
+ViewFix s_fix;
+// The tags of the frames being completed. A frame is drawn with the camera
+// of the update before it: the pose and counts taken at swap N are the ones
+// frame N+1 shows (with fast mouse turns frame N's view matrices matched the
+// pose taken at swap N-1, never the one taken at swap N). So frame N gets
+// the tag taken at the previous swap.
+rbrew_aim::ViewTag s_incoming_view, s_held_view;
+bool mouse_look_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("RBREW_INTERP_MOUSE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+void normalize3(float* v) {
+    const float n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (n > 1e-12f)
+        for (int i = 0; i < 3; ++i) v[i] /= n;
+}
+void cross3(const float* a, const float* b, float* out) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+float dot3(const float* a, const float* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+// The extra rotation of the in-between frame at position t (render thread,
+// before its replay). Samples the 1000 Hz raw-mouse history monotonically
+// from cur.taken_ns (Swap N-1, what frame N rendered) to s_held_view.taken_ns
+// (Swap N, one full frame newer and already received): zero backwards snap on
+// t=1.0, zero 0.8 ms burst duplicates, and 16.7 ms lower mouse input delay.
+void prepare_view_fix(float t) {
+    s_fix.on = false;
+    const rbrew_aim::ViewTag& cur = s_cur->view;
+    const rbrew_aim::ViewTag& last = s_last->view;
+    if (!mouse_look_on() || !cur.active || !last.active || cur.degrees_per_count == 0.0f) return;
+    double tx = 0.0, ty = 0.0;
+    const double u = std::clamp(double(t), 0.0, 1.0);
+    if (s_held_view.active && s_held_view.taken_ns > cur.taken_ns && cur.taken_ns > 0) {
+        const uint64_t q = cur.taken_ns + uint64_t(u * double(s_held_view.taken_ns - cur.taken_ns));
+        if (!rbrew_aim::counts_at(q, tx, ty)) return;
+    } else if (s_held_view.active) {
+        tx = double(cur.taken_x) + u * double(s_held_view.taken_x - cur.taken_x);
+        ty = double(cur.taken_y) + u * double(s_held_view.taken_y - cur.taken_y);
+    } else {
+        return;
+    }
+    const double bx = double(last.taken_x) + u * double(cur.taken_x - last.taken_x);
+    const double by = double(last.taken_y) + u * double(cur.taken_y - last.taken_y);
+    float yaw = float(-(tx - bx) * cur.degrees_per_count);
+    float pitch = float(-(ty - by) * cur.degrees_per_count);
+    const float base_pitch = last.pitch + (cur.pitch - last.pitch) * float(u);
+    pitch = std::clamp(base_pitch + pitch, cur.pitch_min, cur.pitch_max) - base_pitch;
+    yaw = std::clamp(yaw, -45.0f, 45.0f);
+    if (std::fabs(yaw) < 1e-4f && std::fabs(pitch) < 1e-4f) return;
+    float eye[3], at[3], f[3];
+    for (int i = 0; i < 3; ++i) {
+        eye[i] = last.eye[i] + (cur.eye[i] - last.eye[i]) * t;
+        at[i] = last.at[i] + (cur.at[i] - last.at[i]) * t;
+        f[i] = at[i] - eye[i];
+    }
+    normalize3(f);
+    // Yaw about +Y (as the game: atan2(x, z) grows), then pitch about the
+    // horizontal axis k = f' x Y (positive looks up).
+    const float a = yaw * (3.14159265358979f / 180.0f), ca = std::cos(a), sa = std::sin(a);
+    const float ry[9] = {ca, 0, sa, 0, 1, 0, -sa, 0, ca};
+    float f1[3] = {ry[0] * f[0] + ry[1] * f[1] + ry[2] * f[2], ry[3] * f[0] + ry[4] * f[1] + ry[5] * f[2],
+                   ry[6] * f[0] + ry[7] * f[1] + ry[8] * f[2]};
+    const float up[3] = {0, 1, 0};
+    float k[3];
+    cross3(f1, up, k);
+    normalize3(k);
+    const float b = pitch * (3.14159265358979f / 180.0f), cb = std::cos(b), sb = std::sin(b);
+    // Rodrigues: R = cI + s[k]x + (1-c) k k^T
+    const float rk[9] = {cb + (1 - cb) * k[0] * k[0],        (1 - cb) * k[0] * k[1] - sb * k[2],
+                         (1 - cb) * k[0] * k[2] + sb * k[1], (1 - cb) * k[1] * k[0] + sb * k[2],
+                         cb + (1 - cb) * k[1] * k[1],        (1 - cb) * k[1] * k[2] - sb * k[0],
+                         (1 - cb) * k[2] * k[0] - sb * k[1], (1 - cb) * k[2] * k[1] + sb * k[0],
+                         cb + (1 - cb) * k[2] * k[2]};
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            s_fix.rot[r * 3 + c] = rk[r * 3 + 0] * ry[0 * 3 + c] + rk[r * 3 + 1] * ry[1 * 3 + c] + rk[r * 3 + 2] * ry[2 * 3 + c];
+    std::copy(at, at + 3, s_fix.pivot);
+    // The camera bases of the tags (detection against N's own data).
+    auto basis_of = [&](const rbrew_aim::ViewTag& tag, float* out) {
+        float fn[3] = {tag.at[0] - tag.eye[0], tag.at[1] - tag.eye[1], tag.at[2] - tag.eye[2]};
+        normalize3(fn);
+        float rn[3], un[3];
+        cross3(fn, up, rn);
+        normalize3(rn);
+        cross3(rn, fn, un);
+        std::copy(rn, rn + 3, out);
+        std::copy(un, un + 3, out + 3);
+        std::copy(fn, fn + 3, out + 6);
+    };
+    basis_of(cur, s_fix.basis);
+    // Also accepted: the newest pose (the one-update shift above does not
+    // hold in every scene; both turn the same way).
+    if (s_held_view.active)
+        basis_of(s_held_view, s_fix.basis_prev);
+    else
+        basis_of(cur, s_fix.basis_prev);
+    s_fix.yaw = yaw;
+    s_fix.pitch = pitch;
+    s_fix.on = true;
+}
+// Rows m (3 vec4) of frame N: a world-to-view (or view-projection) matrix of
+// N's camera.
+bool is_view_matrix(const float* m, const float* bs) {
+    float q[3][3];
+    float n[3];
+    for (int i = 0; i < 3; ++i) {
+        n[i] = std::sqrt(dot3(m + 4 * i, m + 4 * i));
+        if (!(n[i] > 1e-6f) || !std::isfinite(n[i])) return false;
+        for (int j = 0; j < 3; ++j) q[i][j] = dot3(m + 4 * i, bs + 3 * j) / n[i];
+    }
+    constexpr float kOff = 0.035f, kOn = 0.3f;
+    // RBREW_INTERP_VIEW_LOG=<file> (diagnostics): candidates of some pictures.
+    static FILE* log = [] {
+        const char* p = std::getenv("RBREW_INTERP_VIEW_LOG");
+        return p && *p ? std::fopen(p, "w") : nullptr;
+    }();
+    if (log && (s_stats.look % 50) == 1) {
+        std::fprintf(log, "yaw %.3f pitch %.3f basis f %.4f %.4f %.4f | q %.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f\n",
+                     s_fix.yaw, s_fix.pitch, bs[6], bs[7], bs[8], q[0][0], q[0][1], q[0][2], q[1][0], q[1][1], q[1][2],
+                     q[2][0], q[2][1], q[2][2]);
+        std::fflush(log);
+    }
+    return std::fabs(q[0][1]) < kOff && std::fabs(q[1][0]) < kOff && std::fabs(q[2][0]) < kOff &&
+           std::fabs(q[2][1]) < kOff && std::fabs(q[0][0]) > kOn && std::fabs(q[1][1]) > kOn &&
+           std::fabs(q[2][2]) > 0.99f;
+}
+// Applies the extra rotation to the view matrices of a uniform block: `cur`
+// is frame N's bytes (detection), `out` the in-between frame's bytes.
+unsigned apply_view_fix(const uint8_t* cur, uint8_t* out, size_t size, bool host_order) {
+    const size_t rows = size / 16;
+    if (rows < 3) return 0;
+    auto read = [&](const uint8_t* p) { return to_float(host_order ? le(p) : be(p)); };
+    auto put = [&](size_t word, float v) {
+        const uint32_t w = host_order ? to_bits(v) : rbrew_bswap32(to_bits(v));
+        std::memcpy(out + word * 4, &w, 4);
+    };
+    const float* rot = s_fix.rot;
+    const float* p = s_fix.pivot;
+    unsigned fixed = 0;
+    for (size_t r = 0; r + 3 <= rows;) {
+        // Cheap filter: the third row lies along the view axis.
+        float z[4];
+        for (int i = 0; i < 4; ++i) z[i] = read(cur + (r + 2) * 16 + i * 4);
+        const float zn = std::sqrt(dot3(z, z));
+        if (!(zn > 1e-6f) || (std::fabs(dot3(z, s_fix.basis + 6)) < 0.99f * zn &&
+                              std::fabs(dot3(z, s_fix.basis_prev + 6)) < 0.99f * zn)) {
+            ++r;
+            continue;
+        }
+        float m[16];
+        for (int i = 0; i < 12; ++i) m[i] = read(cur + r * 16 + i * 4);
+        if (!vec4_ok(m) || !vec4_ok(m + 4) || !vec4_ok(m + 8)) {
+            ++r;
+            continue;
+        }
+        const float* bs = s_fix.basis;
+        if (is_view_matrix(m, s_fix.basis))
+            ++s_stats.views_n;
+        else if (is_view_matrix(m, s_fix.basis_prev)) {
+            ++s_stats.views_p;
+            bs = s_fix.basis_prev;
+        } else {
+            ++r;
+            continue;
+        }
+        size_t n = 3;
+        if (r + 4 <= rows) {
+            for (int i = 0; i < 4; ++i) m[12 + i] = read(cur + (r + 3) * 16 + i * 4);
+            const float wn = std::sqrt(dot3(m + 12, m + 12));
+            if (vec4_ok(m + 12) && wn > 1e-6f && std::fabs(dot3(m + 12, bs + 6)) > 0.99f * wn) n = 4;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            float row[4];
+            for (int c = 0; c < 4; ++c) row[c] = read(out + (r + i) * 16 + c * 4);
+            // row' . x = (R row) . x + row.w + row.p - (R row).p
+            float nr[3];
+            for (int c = 0; c < 3; ++c) nr[c] = rot[c * 3 + 0] * row[0] + rot[c * 3 + 1] * row[1] + rot[c * 3 + 2] * row[2];
+            const float w = row[3] + dot3(row, p) - dot3(nr, p);
+            for (int c = 0; c < 3; ++c) put((r + i) * 4 + c, nr[c]);
+            put((r + i) * 4 + 3, w);
+        }
+        ++fixed;
+        r += n;
+    }
+    return fixed;
+}
+
 // Vulkan replay: a uniform buffer bound by N's draw `unit` is replaced by its
 // N-1/N blend, uploaded for the in-between frame.
 bool substitute(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range, VkBuffer& out_buffer,
                 VkDeviceSize& out_offset) {
+    const bool no_depth = (unit & gx2vk::capture::kNoDepthTest) != 0;
+    if (no_depth) return false; // 2D / HUD / screen-space draws always keep exact frame N
+    unit &= ~gx2vk::capture::kNoDepthTest;
     if (unit >= s_cur->units.size()) return false;
     const Unit& binder = s_cur->units[unit];
     const uint64_t handle = uint64_t(reinterpret_cast<uintptr_t>(buffer));
@@ -449,37 +738,52 @@ bool substitute(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSiz
     if (s_prev_cache.size() != s_cur->units.size()) s_prev_cache.assign(s_cur->units.size(), &s_prev_cache);
     if (s_prev_cache[ref->owner] == &s_prev_cache) s_prev_cache[ref->owner] = match_prev(cur);
     const Unit* prev = static_cast<const Unit*>(s_prev_cache[ref->owner]);
+    // A screen-space draw (no depth test) that is one of several copies of
+    // its program and mesh (the panes of a 2D layout) is never blended: the
+    // most similar copy of N-1 can be another pane, and the blend of two
+    // panes is a shape of neither.
+    if (no_depth && prev) {
+        const auto copies = s_last->occurrences.find(cur.base);
+        if (copies != s_last->occurrences.end() && copies->second > 1) prev = nullptr;
+    }
     ++s_stats.units;
-    if (!prev) return false; // frame N's own data is already bound
+    // Without a match (or with the block unchanged since N-1) frame N's own
+    // data is already bound - unless the mouse look turns the view.
+    if (!prev && !s_fix.on) return false;
     const unsigned stage = ref->stage;
     const uint8_t* a = nullptr;
     const uint8_t* b = nullptr;
     size_t size = 0;
     if (ref->bank == 255) {
-        if (!cur.has_uf[stage] || !prev->has_uf[stage] || cur.uf_size[stage] != prev->uf_size[stage]) return false;
+        if (!cur.has_uf[stage]) return false;
         size = cur.uf_size[stage];
-        a = s_last->bytes.data() + prev->uf_off[stage];
         b = s_cur->bytes.data() + cur.uf_off[stage];
+        if (prev && prev->has_uf[stage] && prev->uf_size[stage] == size) a = s_last->bytes.data() + prev->uf_off[stage];
     } else {
         const unsigned bank = ref->bank;
-        if (!(cur.bank_mask[stage] >> bank & 1) || !(prev->bank_mask[stage] >> bank & 1) ||
-            cur.bank_size[stage][bank] != prev->bank_size[stage][bank])
-            return false;
+        if (!(cur.bank_mask[stage] >> bank & 1)) return false;
         size = cur.bank_size[stage][bank];
-        a = s_last->bytes.data() + prev->bank_off[stage][bank];
         b = s_cur->bytes.data() + cur.bank_off[stage][bank];
+        if (prev && (prev->bank_mask[stage] >> bank & 1) && prev->bank_size[stage][bank] == size)
+            a = s_last->bytes.data() + prev->bank_off[stage][bank];
     }
-    if (std::memcmp(a, b, size) == 0) return false; // unchanged: keep N's buffer
-    const VkDeviceSize bytes = std::max<VkDeviceSize>(range, size);
-    const VkDeviceSize align = std::max<VkDeviceSize>(gx2vk::caps().limits.minUniformBufferOffsetAlignment, 16);
-    const gx2vk::Span span = gx2vk::upload(bytes, align);
-    if (!span.data) return false;
+    if (a && std::memcmp(a, b, size) == 0) a = nullptr; // unchanged
+    if (!a && !s_fix.on) return false;                  // keep N's buffer
     // Blend in host memory: the upload span is write-combined, reading it
     // back (a comparison) cost ~25 us per block.
     thread_local std::vector<uint8_t> blended;
     blended.resize(size);
-    blend_bytes(a, b, blended.data(), size, ref->bank == 255);
-    if (std::memcmp(blended.data(), b, size) != 0) ++s_stats.changed;
+    if (a && s_blend_t < 1.0f)
+        blend_bytes(a, b, blended.data(), size, ref->bank == 255);
+    else
+        std::memcpy(blended.data(), b, size);
+    if (s_fix.on) s_stats.views += apply_view_fix(b, blended.data(), size, ref->bank == 255);
+    if (std::memcmp(blended.data(), b, size) == 0) return false; // nothing moved: N's buffer
+    ++s_stats.changed;
+    const VkDeviceSize bytes = std::max<VkDeviceSize>(range, size);
+    const VkDeviceSize align = std::max<VkDeviceSize>(gx2vk::caps().limits.minUniformBufferOffsetAlignment, 16);
+    const gx2vk::Span span = gx2vk::upload(bytes, align);
+    if (!span.data) return false;
     std::memcpy(span.data, blended.data(), size);
     // Bindings often declare 64 KB for a block of a few hundred bytes; zeroing
     // all of it was 70 MB per in-between frame. The game's block is all the
@@ -494,24 +798,29 @@ bool substitute(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSiz
 }
 // Capture follows the frame: on while a frame is recorded for interpolation.
 void sync_capture() {
-    if (!vk_mode()) return;
+    if (!vk_mode() || s_pending_replay) return;
     const bool want = capturing();
     if (want && !gx2vk::capture::enabled()) {
         gx2vk::capture::install();
         gx2vk::capture::set_enabled(true);
         s_capture_mid_frame = !s_capture_armed; // false: the frame starts here
         s_frame_first_serial = gx2vk::recording_serial();
+        gx2vk::set_capture_hold(s_frame_first_serial);
         s_capture_armed = false;
     } else if (!want && gx2vk::capture::enabled()) {
         gx2vk::capture::set_enabled(false);
         gx2vk::capture::discard();
+        gx2vk::set_capture_hold(0);
     }
 }
 } // namespace
 
 // ESC menu "120 FPS mode" (settings.ini fps120; RBREW_FPS120=interp turns it on).
+// Off while frame gen (optical flow, gx2_vk_framegen.inl) makes the pictures
+// between frames: the draw replay would add presents of its own.
 bool mode_enabled() {
-    return rbrew_settings::g_fps120.load(std::memory_order_relaxed);
+    return rbrew_settings::g_fps120.load(std::memory_order_relaxed) &&
+           !rbrew_settings::g_frame_gen.load(std::memory_order_relaxed);
 }
 void set_wanted(bool wanted) {
     s_wanted.store(wanted && mode_enabled(), std::memory_order_relaxed);
@@ -552,6 +861,10 @@ void present_begin() { // gx2_render_present: the present's own commands are not
 }
 
 void keep(Gx2AsyncWork* work) {
+    if (s_pending_replay) {
+        delete work;
+        return;
+    }
     sync_capture();
     if (!capturing() || !work->replayable() || s_frame_broken) {
         delete work;
@@ -670,39 +983,204 @@ void rotate() {
     // from here: the present that follows is not part of it.
     s_capture_armed = true;
 }
-void present_mid_now() {
-    if (!s_mid) return;
-    s_mid = false;
-    const bool capture = gx2vk::capture::enabled();
-    if (capture) gx2vk::capture::set_enabled(false);
-    gx2_render_interp_present_mid();
-    if (capture) gx2vk::capture::set_enabled(true);
-    ++s_stats.replays;
+
+bool env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] == '1';
 }
-void present_held_now() {
-    present_mid_now(); // in order, also when late
-    if (!s_held) return;
-    s_held = false;
-    const bool capture = gx2vk::capture::enabled();
-    if (capture) gx2vk::capture::set_enabled(false);
-    gx2_render_interp_present_held();
-    if (capture) gx2vk::capture::set_enabled(true);
-    ++s_stats.held;
+bool env_off(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] == '0';
+}
+
+// The rate to present at: the menu's choice, lowered to what the display can
+// show. With G-Sync/FreeSync (IMMEDIATE presents) the display follows each
+// picture as long as the rate stays inside its range, so the limit is a
+// little below the refresh rate; above it pictures would tear or be dropped.
+// Without it (MAILBOX) the display shows one picture per refresh at most, so
+// the limit is the refresh rate itself and the presents are locked to the
+// vertical blank. RBREW_INTERP_UNCAPPED=1 (measurements): no limit.
+struct Target {
+    double rate = 1.0, fps = 60.0, hz = 0.0; // rate: presents per game step
+    bool capped = false, vrr = false, lock = false;
+};
+constexpr double kStepsPerSecond = 60000.0 / 1001.0;
+Target compute_target(int frame_rate, bool vrr, bool fixed_refresh) {
+    Target t;
+    t.hz = gx2vk::display_refresh_hz();
+    t.vrr = vrr;
+    const bool display = frame_rate == rbrew_settings::kFrameRateDisplay;
+    // 120, 165, 180 and 240 are 2, 2.75, 3 and 4 presents per game step (the
+    // game steps 59.94 times a second, so 120 is 119.88 pictures a second).
+    double fps = display ? (t.hz > 0.0 ? t.hz : 120.0) : double(frame_rate) * kStepsPerSecond / 60.0;
+    static const bool uncapped = env_on("RBREW_INTERP_UNCAPPED");
+    if (t.hz > 0.0 && !uncapped) {
+        if (vrr) {
+            const double limit = t.hz - std::max(3.0, t.hz * 0.02);
+            if (fps > limit) {
+                t.capped = !display;
+                fps = limit;
+            }
+        } else if (fixed_refresh && fps > t.hz * 0.995) {
+            t.capped = !display && fps > t.hz * 1.005;
+            fps = t.hz;
+            t.lock = true;
+        }
+    }
+    t.fps = fps;
+    t.rate = std::clamp(fps / kStepsPerSecond, 1.0, double(kMaxPerStep - 2));
+    if (t.rate < 1.02) t.rate = 1.0;
+    return t;
+}
+Target current_target() {
+    const VkPresentModeKHR mode = gx2vk::present_mode();
+    const bool immediate = mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
+    const bool gsync = rbrew_settings::g_gsync.load(std::memory_order_relaxed);
+    return compute_target(rbrew_settings::g_frame_rate.load(std::memory_order_relaxed), gsync && immediate, !immediate);
+}
+
+// A rate of a/b presents per step (b <= 8) puts every picture on a multiple
+// of 1/a between two game frames: frame N itself is one of them (once every b
+// steps), and no picture is ever closer to N-1 than 1/a, so the whole
+// schedule runs 1/a of a step earlier. Other rates (the display's refresh
+// rate) have no such grid: lo = 0, and every picture is an in-between frame.
+struct Grid {
+    double lo = 0.0;   // smallest position a picture can have
+    double cost = 0.0; // in-between frames drawn per game step
+    unsigned a = 0;    // 0: no grid
+};
+Grid grid_of(double rate) {
+    for (unsigned b = 1; b <= 8; ++b) {
+        const double a = rate * b, whole = std::round(a);
+        if (whole >= 1.0 && std::fabs(a - whole) < 1e-4) return {1.0 / whole, rate - 1.0 / b, unsigned(whole)};
+    }
+    return {0.0, rate, 0};
+}
+// The controller's levels, highest first: evenly spaced rates whose cost
+// (in-between frames drawn per game step) is lower than every rate above.
+// A rate a/b shows frame N once every b steps, so it costs (a - 1) / b: the
+// whole rates are the cheap ones (2: 1 per step, 3: 2), and 2.5 costs as much
+// as 3 (dropped when 3 fits under the target). 165 with G-Sync (cap 161.7 at
+// 163.97 Hz: 2.698 per step) gives 8/3 (159.8 FPS, 2.33), 5/2 (2), 2 (1), 1.
+// A non-grid target (2.698: every picture an in-between frame) is kept only
+// when no grid rate is within 3% below it, or when the presents are locked to
+// a fixed refresh (which needs that exact rate).
+struct Level {
+    double rate, cost;
+};
+std::vector<Level> ladder(double target, bool lock) {
+    std::vector<Level> all;
+    const Grid top = grid_of(target);
+    all.push_back({target, top.cost});
+    for (unsigned b = 1; b <= 4; ++b)
+        for (unsigned a = b; double(a) <= target * b + 1e-6; ++a) all.push_back({double(a) / b, double(a - 1) / b});
+    std::sort(all.begin(), all.end(), [](const Level& x, const Level& y) {
+        return x.rate != y.rate ? x.rate > y.rate : x.cost < y.cost;
+    });
+    std::vector<Level> out;
+    for (const Level& l : all)
+        if (out.empty() || (l.cost < out.back().cost - 1e-6 && l.rate < out.back().rate - 1e-6)) out.push_back(l);
+    if (!lock && !top.a && out.size() > 1 && out[1].rate >= target * 0.97) out.erase(out.begin());
+    return out;
+}
+
+unsigned take_slot() {
+    const unsigned slot = s_next_slot;
+    s_next_slot = (s_next_slot + 1) % kSlots;
+    return slot;
+}
+uint64_t effective_due(const Shot& shot) {
+    // Never two pictures closer than half a present interval: late ones
+    // spread out again instead of going out in a bunch.
+    const uint64_t gap = uint64_t(0.5 * s_interval_ns / std::max(1.0, s_rate));
+    return std::max(shot.due, s_last_present_ns + gap);
+}
+// Presents the queued pictures whose time has come, in order. Before each
+// replay of a burst a picture due before that replay would end is waited for
+// (the next chance is a whole replay later: it went out that much late, then
+// the next one early, once per step: 8.9 / 3.5 ms instead of 6.2 / 6.2 at
+// 162 FPS); the waits of one burst are bounded.
+void present_due(bool in_burst, int site) {
+    // Keep burst wait very short (<= 0.5 ms): poll() presents between draws of
+    // frame N+1 with sub-0.1 ms accuracy, whereas spinning up to 4 ms here
+    // stalled the render & game threads and caused slowdowns.
+    const uint64_t burst_wait = uint64_t(std::clamp(s_replay_avg_ns * 0.6 + 50000.0, 100000.0, 500000.0));
+    constexpr uint64_t kBurstWaitBudgetNs = 500000;
+    while (!s_shots.empty()) {
+        const Shot shot = s_shots.front();
+        const uint64_t due = effective_due(shot);
+        uint64_t now = now_ns();
+        if (now < due) {
+            if (!in_burst || due - now > burst_wait || s_burst_waited_ns + (due - now) > kBurstWaitBudgetNs) break;
+            s_burst_waited_ns += due - now;
+            while ((now = now_ns()) < due) _mm_pause();
+        }
+        s_shots.erase(s_shots.begin());
+        gx2_render_interp_present(shot.slot);
+        s_last_present_ns = now_ns();
+        const double late_ms = double(now - due) / 1e6;
+        // RBREW_INTERP_PRESENT_LOG=<file>: per picture: present time, its due
+        // time (us), position t, where it went out (0 render loop, 1 between
+        // two draws, 2 before a replay), how long the present call took (us).
+        static FILE* log = [] {
+            const char* p = std::getenv("RBREW_INTERP_PRESENT_LOG");
+            return p && *p ? std::fopen(p, "w") : nullptr;
+        }();
+        if (log) {
+            std::fprintf(log, "%llu %llu %.3f %d %llu\n", (unsigned long long)(now / 1000),
+                         (unsigned long long)(due / 1000),
+                         shot.t, site, (unsigned long long)((s_last_present_ns - now) / 1000));
+            if ((s_stats.presents & 63) == 0) std::fflush(log);
+        }
+        s_stats.late_ms += late_ms;
+        s_stats.late_max_ms = std::max(s_stats.late_max_ms, late_ms);
+        if (late_ms > 1.0) ++s_stats.late1;
+        ++s_stats.presents;
+        if (shot.t < 1.0f)
+            ++s_stats.between;
+        else
+            ++s_stats.held;
+    }
+}
+void drop_shots() {
+    s_stats.dropped += unsigned(s_shots.size());
+    s_shots.clear();
 }
 } // namespace
 
+Status status() {
+    return s_status;
+}
+Status describe(int frame_rate, bool gsync) {
+    const Target t = compute_target(frame_rate, gsync, !gsync);
+    Status s;
+    s.target_fps = float(t.fps);
+    s.display_hz = float(t.hz);
+    s.capped = t.capped;
+    s.vrr = t.vrr;
+    s.locked = t.lock;
+    return s;
+}
+
+void set_view(const rbrew_aim::ViewTag& view) {
+    s_incoming_view = view;
+}
+
 bool frame_complete(unsigned scan_index) {
     const uint64_t now = now_ns();
+    s_cur->view = s_held_view;
+    s_held_view = s_incoming_view;
+    s_incoming_view = {};
     if (s_last_complete) {
         const double interval = double(now - s_last_complete);
         if (interval > 4e6 && interval < 50e6) s_interval_ns = s_interval_ns * 0.9 + interval * 0.1;
     }
     s_last_complete_interval_ns = s_last_complete ? double(now - s_last_complete) : 0;
     s_last_complete = now;
-    present_held_now(); // late: the previous held frame goes out first
     ++s_stats.frames;
     s_stats.busy_ms += double(s_frame_busy_ns) / 1e6;
     s_busy_avg_ns = s_busy_avg_ns ? s_busy_avg_ns * 0.8 + double(s_frame_busy_ns) * 0.2 : double(s_frame_busy_ns);
+    s_busy_last_ns = s_frame_busy_ns;
     s_frame_busy_ns = 0;
     report_stats();
     gx2vk::capture::set_enabled(false);
@@ -710,91 +1188,166 @@ bool frame_complete(unsigned scan_index) {
     s_vk_replay = vk_mode() && !s_capture_mid_frame && gx2vk::capture::replay_complete();
     bool replay = capturing() && !s_frame_broken && !s_last->units.empty() && !s_cur->units.empty() &&
                   (s_vk_replay || !s_works.empty());
-    // The game must keep its 60 logic steps per second: when frames take
-    // longer than a 60 Hz frame on average, fewer in-between frames are
-    // drawn (down to none); when it keeps up, more (up to every frame).
-    // RBREW_INTERP_ALWAYS=1 (diagnostics) replays every frame.
-    constexpr double kLogicFrameNs = 1e9 * 1001.0 / 60000.0;
-    static const bool always = [] {
-        const char* v = std::getenv("RBREW_INTERP_ALWAYS");
-        return v && v[0] == '1';
-    }();
+    // Why a frame has no in-between frames (stats "why"): not captured,
+    // capture broken, no recorded draws, Vulkan capture incomplete, capture
+    // started mid-frame.
+    if (!capturing())
+        ++s_stats.why_capture;
+    else if (s_frame_broken)
+        ++s_stats.why_broken;
+    else if (s_last->units.empty() || s_cur->units.empty())
+        ++s_stats.why_units;
+    if (vk_mode() && !gx2vk::capture::replay_complete()) ++s_stats.why_incomplete;
+    if (vk_mode() && s_capture_mid_frame) ++s_stats.why_mid;
+    // RBREW_INTERP_ALWAYS=1 (diagnostics): the target rate, whatever the game's speed.
+    static const bool always = env_on("RBREW_INTERP_ALWAYS");
     // A single hitch (streaming, 30-70 ms) counts as at most 1.5 frames: at
     // full weight it kept the average above the limit for 20+ frames and cut
     // the in-between frames for half a second (2026-10-27).
     // RBREW_INTERP_HITCH_CLAMP=0: full weight.
-    static const bool clamp_hitch = [] {
-        const char* v = std::getenv("RBREW_INTERP_HITCH_CLAMP");
-        return !(v && v[0] == '0');
-    }();
+    static const bool clamp_hitch = !env_off("RBREW_INTERP_HITCH_CLAMP");
     if (s_last_complete_interval_ns > 0 && s_last_complete_interval_ns < 100e6) {
         const double sample =
             clamp_hitch ? std::min(s_last_complete_interval_ns, kLogicFrameNs * 1.5) : s_last_complete_interval_ns;
         s_game_interval_ns = s_game_interval_ns ? s_game_interval_ns * 0.85 + sample * 0.15 : sample;
     }
-    // Sustained slowdowns only: the game alone has single slow frames
-    // (streaming), and a half share of in-between frames judders more than
-    // none. The interval average reacts within ~10 frames.
-    static unsigned s_slow_frames = 0;
-    s_slow_frames = s_game_interval_ns > kLogicFrameNs * 1.03 ? s_slow_frames + 1 : 0;
-    if (s_slow_frames > 20)
-        s_ratio = std::max(0.0, s_ratio - 0.05);
-    else if (s_game_interval_ns < kLogicFrameNs * 1.01)
-        s_ratio = std::min(1.0, s_ratio + 0.05);
-    // No in-between frame right after a hitch: those are loading frames that
-    // set up the ink map (uploads the capture does not repeat). Replaying
-    // them painted the whole tutorial level pink for good. The hitch clamp
-    // above no longer stops replays there by accident, so this does.
+    // The game must keep its 60 logic steps per second, and the pictures
+    // must stay evenly spaced: the controller changes the rate rarely and
+    // only between the evenly spaced levels of ladder().
+    //
+    // It plans with the render thread's time, the one the in-between frames
+    // take: per step, the frame's own work (80th percentile of the last 64
+    // frames) plus the level's in-between frames at their measured cost must
+    // fit in a step. Down when the current level stops fitting (several
+    // frames running), at once to the highest level that fits with margin, or
+    // one level when the game falls behind while the render thread is the
+    // busy one. Up when the next level fits with a wide margin for a while
+    // and the game keeps up; a level left again soon after a raise is retried
+    // later and later (1 s, doubling up to 20 s). A game that is slow on its
+    // own (render thread with time to spare) keeps its in-between frames:
+    // dropping them would not speed it up, only make it look worse.
+    // (Before 2026-11-19: down whenever the game's frames were slow for 20
+    // frames, back up only after a fast streak, one whole rate at a time - in
+    // the plaza it sat at 60 FPS for 70% of the time and moved 60/120/160.)
+    const Target target = current_target();
+    static std::vector<Level> s_ladder;
+    static double s_ladder_target = -1.0;
+    static bool s_ladder_lock = false;
+    if (target.rate != s_ladder_target || target.lock != s_ladder_lock) {
+        s_ladder = ladder(target.rate, target.lock);
+        s_ladder_target = target.rate;
+        s_ladder_lock = target.lock;
+        s_level = 0;
+    }
+    const unsigned levels = unsigned(s_ladder.size() - 1);
+    static double s_busy_hist[64]{};
+    static unsigned s_busy_n = 0;
+    if (s_last_complete_interval_ns > 0 && s_last_complete_interval_ns < 100e6)
+        s_busy_hist[s_busy_n++ % 64] = double(s_busy_last_ns);
+    double busy_p80 = 0;
+    {
+        const unsigned n = std::min(s_busy_n, 64u);
+        if (n) {
+            double sorted[64];
+            std::copy(s_busy_hist, s_busy_hist + n, sorted);
+            std::nth_element(sorted, sorted + (n * 4) / 5, sorted + n);
+            busy_p80 = sorted[std::min(n - 1, (n * 4) / 5)];
+        }
+    }
+    // Detect loading screens and hitches before running the controller so a
+    // loading transition never drops the rate or inflates s_raise_wait.
     static unsigned s_after_hitch = 0;
     if (s_last_complete_interval_ns > kLogicFrameNs * 3)
         s_after_hitch = 10; // > 50 ms
     else if (s_after_hitch)
         --s_after_hitch;
-    if (s_after_hitch && clamp_hitch) {
-        replay = false;
-        ++s_stats.skipped;
-    }
-    // No in-between frames on loading screens (few draws) and for a second
-    // after them: those frames set up state the next frames keep (exposure,
-    // ink map). Replayed - twice per frame at 180 FPS - they left Octo
-    // Valley completely black until the next loading screen.
-    // RBREW_INTERP_LOAD_GUARD=0: off.
-    static const bool load_guard = [] {
-        const char* v = std::getenv("RBREW_INTERP_LOAD_GUARD");
-        return !(v && v[0] == '0');
-    }();
+    static const bool load_guard = !env_off("RBREW_INTERP_LOAD_GUARD");
     static unsigned s_after_load = 0;
     if (rbrew_benchmark::frame_draws.load(std::memory_order_relaxed) < 300)
         s_after_load = 60;
     else if (s_after_load)
         --s_after_load;
+    const bool in_transition = (s_after_hitch && clamp_hitch) || (s_after_load && load_guard);
+
+    const size_t frame_commands = gx2vk::capture::replay_command_count();
+    const double replay_cost = s_replay_ns_per_cmd > 0 && frame_commands
+                                   ? s_replay_ns_per_cmd * double(frame_commands)
+                                   : (s_replay_avg_ns > 0 ? s_replay_avg_ns : 1.5e6);
+    auto load = [&](unsigned level) { return busy_p80 + s_ladder[level].cost * replay_cost; };
+    static unsigned s_over_frames = 0, s_slow_frames = 0, s_fit_frames = 0, s_since_raise = 100000,
+                    s_raise_wait = 45;
+    if (s_level > levels) s_level = levels;
+    const double step_budget = kLogicFrameNs;
+    if (in_transition) {
+        s_over_frames = s_slow_frames = 0;
+        if (s_after_load == 60) {
+            // Fresh scene load: start ready to climb cleanly instead of staying
+            // trapped at 60 FPS for 20 s after a heavy plaza frame.
+            s_raise_wait = 45;
+            s_fit_frames = 0;
+        }
+    } else {
+        s_over_frames = s_level < levels && load(s_level) > 0.94 * step_budget ? s_over_frames + 1 : 0;
+        s_slow_frames =
+            s_level < levels && s_game_interval_ns > kLogicFrameNs * 1.05 && load(s_level) > 0.78 * step_budget
+                ? s_slow_frames + 1
+                : 0;
+        s_fit_frames =
+            s_level > 0 && load(s_level - 1) < 0.84 * step_budget && s_game_interval_ns < kLogicFrameNs * 1.04
+                ? s_fit_frames + 1
+                : 0;
+        if (s_since_raise < 100000 && ++s_since_raise == 240) s_raise_wait = 45; // held for 4 s
+        if (s_over_frames > 10 || s_slow_frames > 24) {
+            unsigned to = s_level + 1;
+            if (s_over_frames > 10)
+                while (to < levels && load(to) > 0.88 * step_budget) ++to;
+            s_level = std::min(to, levels);
+            ++s_stats.level_downs;
+            s_over_frames = s_slow_frames = s_fit_frames = 0;
+            if (s_since_raise < 240) s_raise_wait = std::min(s_raise_wait * 2, 180u);
+            s_since_raise = 100000;
+        } else if (s_fit_frames >= s_raise_wait) {
+            if (load(0) < 0.70 * step_budget)
+                s_level = 0; // light scene (shooting range / menus): jump straight to target
+            else
+                --s_level;
+            s_fit_frames = 0;
+            s_since_raise = 0;
+        }
+    }
+    if (always) s_level = 0;
+    double rate = s_ladder[s_level].rate;
+    // RBREW_INTERP_RATE=<presents per step> (testing): this rate, no controller.
+    static const double forced_rate = [] {
+        const char* v = std::getenv("RBREW_INTERP_RATE");
+        return v && std::atof(v) >= 1.0 ? std::min(std::atof(v), double(kMaxPerStep - 2)) : 0.0;
+    }();
+    if (forced_rate > 0.0) rate = forced_rate;
+    // The GX2-level replay (RBREW_INTERP_VK=0) draws one in-between frame.
+    if (!s_vk_replay && rate > 1.0) rate = 2.0;
+    if (s_after_hitch && clamp_hitch && replay) {
+        replay = false;
+        ++s_stats.skipped;
+    }
     if (s_after_load && load_guard && replay) {
         replay = false;
         ++s_stats.skipped;
     }
-    // 180 FPS (two in-between frames) outside the plaza; the controller's
-    // share applies to both, so it gives up the second one first.
-    // RBREW_INTERP_FRAMES=1/2 forces the count (testing).
-    static const int forced_frames = [] {
-        const char* v = std::getenv("RBREW_INTERP_FRAMES");
-        return v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
-    }();
-    const unsigned wanted = !s_vk_replay    ? 1u
-                            : forced_frames ? unsigned(forced_frames)
-                            : rbrew_settings::g_fps180.load(std::memory_order_relaxed) && !gx2vk::capture::plaza() ? 2u
-                                                                                                                   : 1u;
-    s_replay_count = wanted;
-    if (replay && !always) {
-        s_credit = std::min(double(wanted), s_credit + s_ratio * wanted);
-        if (s_credit >= 1.0) {
-            s_replay_count = unsigned(s_credit);
-            s_credit -= s_replay_count;
-        } else {
-            replay = false;
-            ++s_stats.skipped;
-        }
-    }
-    if (!replay) {
+    s_status.target_fps = float(target.fps);
+    s_status.display_hz = float(target.hz);
+    s_status.capped = target.capped;
+    s_status.vrr = target.vrr;
+    s_status.locked = target.lock;
+    s_status.level_fps = float(rate * kStepsPerSecond);
+    s_status.active = replay && rate > 1.0;
+    if (!replay || rate <= 1.0) {
+        // This frame is presented as it is, now: pictures still waiting are
+        // older than it and are given up.
+        gx2vk::set_capture_hold(0);
+        drop_shots();
+        s_schedule_reset = true;
+        s_rate = 1.0;
+        ++s_stats.direct;
         drop_works(s_works);
         if (capturing())
             rotate();
@@ -807,7 +1360,82 @@ bool frame_complete(unsigned scan_index) {
         }
         return false;
     }
-    gx2_render_interp_hold(scan_index);
+    // The plan of this step: one picture per present interval, each at the
+    // position between N-1 and N where its present time falls. `s_phase` is
+    // the position of the next picture and runs on across steps, so any rate
+    // works, whole or not (165: 2.75 per step, positions on elevenths).
+    const double step_ns =
+        std::fabs(s_interval_ns - kLogicFrameNs) < 0.02 * kLogicFrameNs ? kLogicFrameNs : s_interval_ns;
+    const Grid grid = grid_of(rate);
+    const double advance = 1.0 / rate;
+    if (s_schedule_reset) {
+        s_schedule_reset = false;
+        s_anchor_ns = double(now);
+        s_jitter_ns = 0;
+        s_phase = grid.a ? grid.lo : advance;
+        s_phase_lo = grid.lo;
+        s_lock_offset_ns = 0;
+    } else {
+        // The schedule follows a smoothed clock of the game's frames, not
+        // each frame's own arrival: presents stay evenly spaced when a frame
+        // comes a little early or late.
+        const double predicted = s_anchor_ns + step_ns, error = double(now) - predicted;
+        if (std::fabs(error) > step_ns * 0.5)
+            s_anchor_ns = double(now);
+        else {
+            s_anchor_ns = predicted + 0.1 * error;
+            s_jitter_ns = s_jitter_ns * 0.95 + std::fabs(error) * 0.05;
+        }
+        // A changed rate: back onto its grid; the schedule's offset follows gently.
+        if (grid.a) s_phase = std::max(1.0, std::round(s_phase * grid.a)) / grid.a;
+        s_phase_lo += std::clamp(grid.lo - s_phase_lo, -0.02, 0.02);
+    }
+    s_rate = rate;
+    // RBREW_INTERP_LEAD_MS=<ms> (testing): fixed time from a frame's completion
+    // to its first picture, instead of the measured replay time.
+    static const double forced_lead_ns = [] {
+        const char* v = std::getenv("RBREW_INTERP_LEAD_MS");
+        return v && *v ? std::atof(v) * 1e6 : -1.0;
+    }();
+    const double lead_ns = forced_lead_ns >= 0 ? forced_lead_ns : s_lead_ns + std::min(2.0 * s_jitter_ns, 2e6);
+    s_plan.count = 0;
+    while (s_phase <= 1.0 + 1e-6) {
+        if (s_plan.count < kMaxPerStep) {
+            const double t = s_phase >= 1.0 - 1e-6 ? 1.0 : s_phase;
+            s_plan.t[s_plan.count] = float(t);
+            s_plan.due[s_plan.count] = uint64_t(s_anchor_ns + lead_ns + std::max(0.0, t - s_phase_lo) * step_ns);
+            ++s_plan.count;
+        }
+        s_phase += advance;
+    }
+    s_phase -= 1.0;
+    // Fixed refresh (no G-Sync), one picture per refresh: the presents are
+    // pulled to the middle between two vertical blanks, so every refresh
+    // gets exactly one new picture (MAILBOX shows the newest at the blank).
+    uint64_t period = 0, vblank = 0;
+    if (target.lock && s_level == 0 && forced_rate <= 0.0 && s_plan.count && gx2vk::display_vblank(period, vblank)) {
+        const double p = double(period);
+        double x = std::fmod(double(s_plan.due[0]) + s_lock_offset_ns - (double(vblank) + 0.5 * p), p);
+        if (x < 0) x += p;
+        if (x > 0.5 * p) x -= p; // how far after (before) the middle the first picture would go out
+        s_lock_offset_ns -= 0.15 * x;
+        if (s_lock_offset_ns > 0.5 * p) s_lock_offset_ns -= p;
+        if (s_lock_offset_ns < -0.5 * p) s_lock_offset_ns += p;
+        s_stats.lock_error_ms += std::fabs(x) / 1e6;
+        ++s_stats.lock_samples;
+    } else
+        s_lock_offset_ns *= 0.9;
+    for (unsigned i = 0; i < s_plan.count; ++i) s_plan.due[i] = uint64_t(double(s_plan.due[i]) + s_lock_offset_ns);
+    // Room for this step's pictures among the copies (a queue this long means
+    // the presents are far behind: the oldest are given up).
+    while (!s_shots.empty() && s_shots.size() + s_plan.count + 1 > kSlots - 1) {
+        s_shots.erase(s_shots.begin());
+        ++s_stats.dropped;
+    }
+    // Frame N itself: one of the pictures on a grid (its position 1), and
+    // what is shown when the in-between frames are discarded (camera cut).
+    s_plan.held_slot = take_slot();
+    gx2_render_interp_keep(scan_index, s_plan.held_slot, 0);
     s_scan_index = scan_index;
     s_replay_works.swap(s_works);
     drop_works(s_works);
@@ -815,90 +1443,176 @@ bool frame_complete(unsigned scan_index) {
     return true;
 }
 
-void service() {
-    if (s_pending_replay) {
-        s_pending_replay = false;
-        const uint64_t start = now_ns();
-        s_replaying = true;
-        s_occurrences.clear();
-        bool ok = true;
-        if (s_vk_replay) {
-            // N's upload data must outlive the in-between frames' GPU work.
-            gx2vk::retain_until_current_submission(s_frame_first_serial);
-            s_stats.set_binds += unsigned(gx2vk::capture::replay_set_binds());
-            // A camera cut or a very fast turn: many matrices jump and keep
-            // frame N while others of the same camera blend; the in-between
-            // frame then shows parts of two views (a whole quarter of the
-            // screen in Octo Valley). It is discarded; frame N simply stays
-            // on screen longer. RBREW_INTERP_CUT_GUARD=0: keep it.
-            static const bool cut_guard = [] {
-                const char* v = std::getenv("RBREW_INTERP_CUT_GUARD");
-                return !(v && v[0] == '0');
-            }();
-            auto cut = [] {
-                const unsigned all = s_blended_matrices + s_jumped_matrices;
-                return all >= 20 && s_jumped_matrices * 4 > all;
-            };
-            s_blended_matrices = s_jumped_matrices = 0;
-            for (unsigned i = 0; i < s_replay_count; ++i) {
-                if (i == 1 && cut_guard && cut()) break;
-                // 180 FPS: the second one is drawn now as well and kept,
-                // before the next frame's commands touch the renderer.
-                if (i == 1) {
-                    s_replaying = false;
-                    gx2_render_interp_present_scan(s_scan_index);
-                    s_replaying = true;
-                }
-                s_blend_t = float(i + 1) / float(s_replay_count + 1);
-                s_substituted.clear();
-                s_by_content.clear();
-                s_occurrences.clear();
-                gx2vk::capture::replay(&substitute);
+namespace {
+// The in-between frames of the step, drawn one after another right after
+// frame N, before the next frame's commands touch the renderer: each is
+// copied aside and waits for its present time.
+void run_replays() {
+    const uint64_t start = now_ns();
+    s_replaying = true;
+    s_occurrences.clear();
+    s_burst_waited_ns = 0;
+    bool ok = true;
+    unsigned made = 0;
+    const size_t queued_before = s_shots.size();
+    const unsigned presents_before = s_stats.presents;
+    if (s_vk_replay) {
+        s_stats.set_binds += unsigned(gx2vk::capture::replay_set_binds());
+        // A camera cut or a very fast turn: many matrices jump and keep
+        // frame N while others of the same camera blend; the in-between
+        // frame then shows parts of two views (a whole quarter of the
+        // screen in Octo Valley). The step's in-between frames are
+        // discarded; frame N is shown in their place.
+        // RBREW_INTERP_CUT_GUARD=0: keep them.
+        static const bool cut_guard = !env_off("RBREW_INTERP_CUT_GUARD");
+        auto cut = [] {
+            const unsigned all = s_blended_matrices + s_jumped_matrices;
+            return all >= 20 && s_jumped_matrices * 4 > all;
+        };
+        s_blended_matrices = s_jumped_matrices = 0;
+        bool replayed_n = false;
+        for (unsigned i = 0; i < s_plan.count; ++i) {
+            s_blend_t = s_plan.t[i];
+            prepare_view_fix(s_blend_t);
+            // Reuse raw frame N only when mouse did not move between Swap N-1
+            // and Swap N; otherwise replay t=1.0 rotated to Swap N so the
+            // camera never snaps backwards by 16.7 ms on exact frames.
+            if (s_plan.t[i] >= 1.0f && !s_fix.on) continue;
+            // Before each replay (the first too: the previous step's last
+            // picture is often due right now): pictures whose time has come,
+            // or comes during the replay, go out.
+            s_replaying = false;
+            present_due(true, 2);
+            s_replaying = true;
+            const uint64_t replay_start = now_ns();
+            // N's upload data must outlive every in-between frame's GPU work;
+            // presents between them close submissions.
+            gx2vk::retain_until_current_submission(s_frame_first_serial, 2 * (s_plan.count - i) + 6);
+            if (s_fix.on) {
+                ++s_stats.look;
+                s_stats.look_yaw += std::fabs(s_fix.yaw);
             }
-            s_blend_t = 0.5f;
+            s_substituted.clear();
+            s_by_content.clear();
+            s_occurrences.clear();
+            gx2vk::capture::replay(&substitute);
             if (cut_guard && cut()) {
                 ok = false;
                 ++s_stats.cuts;
+                break;
             }
-        } else
-            try {
-                // Publish finished occlusion queries meanwhile: the game reads the
-                // previous frame's results early in its frame (gx2_draw.cpp).
-                unsigned n = 0;
-                for (Gx2AsyncWork* work : s_replay_works) {
-                    work->run();
-                    if ((++n & 31) == 0) gx2_render_query_poll_completed();
-                }
-            } catch (...) {
-                ok = false;
-                ++s_stats.failed;
+            s_replaying = false;
+            const unsigned slot = take_slot();
+            gx2_render_interp_keep(s_scan_index, slot, made + 1);
+            s_replaying = true;
+            s_shots.push_back({slot, s_plan.due[i], s_plan.t[i]});
+            if (s_plan.t[i] >= 1.0f) replayed_n = true;
+            ++made;
+            const uint64_t done = now_ns();
+            const double took = double(done - replay_start);
+            s_replay_avg_ns = s_replay_avg_ns ? s_replay_avg_ns * 0.9 + took * 0.1 : took;
+            if (const size_t commands = gx2vk::capture::replay_command_count()) {
+                const double per = took / double(commands);
+                s_replay_ns_per_cmd = s_replay_ns_per_cmd ? s_replay_ns_per_cmd * 0.9 + per * 0.1 : per;
             }
-        s_replaying = false;
-        s_replay_cur = s_replay_prev = nullptr;
-        drop_works(s_replay_works);
-        if (ok && s_replay_count == 2)
-            gx2_render_interp_keep_mid(s_scan_index);
-        else if (ok)
-            gx2_render_interp_present_scan(s_scan_index);
-        const double took = double(now_ns() - start);
-        s_replay_avg_ns = s_replay_avg_ns ? s_replay_avg_ns * 0.8 + took * 0.2 : took;
-        ++s_stats.replays;
-        s_stats.replay_ms += took / 1e6;
-        // The held frame N goes out half a frame interval after the
-        // in-between frame (180 FPS: the second one after a third, N after
-        // two thirds), so presents are evenly spaced.
-        const uint64_t step = uint64_t(s_interval_ns / double(s_replay_count + 1));
-        s_mid = ok && s_replay_count == 2;
-        s_mid_due = now_ns() + step;
-        s_held = true;
-        s_held_due = now_ns() + step * (s_mid ? 2 : 1);
-        rotate();
+            s_stats.replay_ms += took / 1e6;
+            ++s_stats.replays;
+            if (made == 1) {
+                // From N's completion to its first picture: the schedule's lead.
+                const double lead = double(done - s_last_complete) * 1.1 + 150000.0;
+                s_lead_ns = std::clamp(s_lead_ns * 0.9 + lead * 0.1, 0.3e6, 8e6);
+            }
+        }
+        s_blend_t = 0.5f;
+        s_fix.on = false;
+        if (!ok) replayed_n = false;
+        if (ok && s_plan.count && s_plan.t[s_plan.count - 1] >= 1.0f && !replayed_n)
+            s_shots.push_back({s_plan.held_slot, s_plan.due[s_plan.count - 1], 1.0f});
+    } else {
+        try {
+            // Publish finished occlusion queries meanwhile: the game reads the
+            // previous frame's results early in its frame (gx2_draw.cpp).
+            s_blend_t = s_plan.t[0] < 1.0f ? s_plan.t[0] : 0.5f;
+            unsigned n = 0;
+            for (Gx2AsyncWork* work : s_replay_works) {
+                work->run();
+                if ((++n & 31) == 0) gx2_render_query_poll_completed();
+            }
+            s_replaying = false;
+            const unsigned slot = take_slot();
+            gx2_render_interp_keep(s_scan_index, slot, 1);
+            s_shots.push_back({slot, s_plan.due[0], s_plan.t[0]});
+            made = 1;
+            const double took = double(now_ns() - start);
+            s_replay_avg_ns = s_replay_avg_ns ? s_replay_avg_ns * 0.9 + took * 0.1 : took;
+            s_stats.replay_ms += took / 1e6;
+            ++s_stats.replays;
+            s_lead_ns = std::clamp(s_lead_ns * 0.9 + (took * 1.1 + 150000.0) * 0.1, 0.3e6, 8e6);
+        } catch (...) {
+            ok = false;
+            ++s_stats.failed;
+        }
+        s_blend_t = 0.5f;
     }
-    if (s_mid && now_ns() >= s_mid_due) present_mid_now();
-    if (s_held && now_ns() >= s_held_due) present_held_now();
+    s_replaying = false;
+    s_replay_cur = s_replay_prev = nullptr;
+    drop_works(s_replay_works);
+    // Frame N's host-visible buffers stay untouched until the GPU ran the
+    // last replay (replay_may_read): it is in the submission recorded now.
+    if (s_vk_replay && made) {
+        s_holds[s_hold_next] = {s_frame_first_serial, gx2vk::recording_serial() + 2};
+        s_hold_next = (s_hold_next + 1) % kHolds;
+    }
+    gx2vk::set_capture_hold(0);
+    const bool has_n = s_plan.count && s_plan.t[s_plan.count - 1] >= 1.0f;
+    if (!ok) {
+        // The step's in-between pictures that did not go out yet are given
+        // up; frame N takes the first one's time. (Pictures presented during
+        // the burst came off the front of the queue: older ones first.)
+        const size_t gone = std::min<size_t>(queued_before, s_stats.presents - presents_before);
+        const size_t keep = std::min(s_shots.size(), queued_before - gone);
+        s_stats.dropped += unsigned(s_shots.size() - keep);
+        s_shots.resize(keep);
+        s_shots.push_back({s_plan.held_slot, s_plan.due[0], 1.0f});
+    } else if (!s_vk_replay && has_n)
+        s_shots.push_back({s_plan.held_slot, s_plan.due[s_plan.count - 1], 1.0f});
+    rotate();
+}
+} // namespace
+
+bool replay_may_read(uint64_t last_serial) {
+    // Also protect buffers touched during the frame currently being captured
+    // or awaiting replay: a mid-frame poll() submit can complete last_serial
+    // before run_replays() runs and pushes s_holds.
+    if ((gx2vk::capture::enabled() || s_pending_replay || s_replaying) && last_serial >= s_frame_first_serial) {
+        ++s_stats.hazards;
+        return vb_guard();
+    }
+    const uint64_t done = gx2vk::known_completed_serial();
+    for (const Hold& hold : s_holds)
+        if (hold.until > done && last_serial >= hold.from && last_serial <= hold.until) {
+            ++s_stats.hazards;
+            return vb_guard();
+        }
+    return false;
+}
+
+void service() {
+    if (s_pending_replay) {
+        s_pending_replay = false;
+        run_replays();
+    }
+    present_due(false, 0);
+}
+
+void poll() {
+    if (s_shots.empty() || s_replaying || s_pending_replay) return;
+    if (now_ns() < effective_due(s_shots.front())) return;
+    present_due(false, 1);
 }
 
 uint64_t deadline_ns() {
-    return s_pending_replay ? 1 : s_mid ? s_mid_due : s_held ? s_held_due : 0;
+    if (s_pending_replay) return 1;
+    return s_shots.empty() ? 0 : std::max<uint64_t>(1, effective_due(s_shots.front()));
 }
 } // namespace gx2interp

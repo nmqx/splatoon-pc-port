@@ -10,7 +10,19 @@ using namespace ir;
 
 // Architectural integer CR writes also copy XER.SO. Keep this separate from
 // IR comparison temporaries, whose LT/GT/EQ bits serve arithmetic predicates.
+static bool g_assume_xer_so_clear = false;
+static uint64_t g_xer_so_writers = 0;
+void set_assume_xer_so_clear(bool on) {
+    g_assume_xer_so_clear = on;
+}
+uint64_t xer_so_writer_count() {
+    return g_xer_so_writers;
+}
 static void emit_cr_so(VReg field, IRBuilder& b, uint32_t ga) {
+    // --assume-xer-so-clear: XER starts at zero and the module has no
+    // instruction that can set SO (no OE=1 arithmetic, no mtxer: counted in
+    // g_xer_so_writers, the recompile fails otherwise), so SO is always 0.
+    if (g_assume_xer_so_clear) return;
     VReg so = b.create_move(VReg::xer(), ga);
     b.emit(Opcode::Shr, so, {reg(so), imm(31)}, ga);
     b.emit(Opcode::Or, field, {reg(field), reg(so)}, ga);
@@ -42,6 +54,7 @@ static void emit_carry_sum(const Instruction& insn, IRBuilder& b, IRFunction& f,
     xer = temp(Opcode::Or, {reg(xer), reg(temp(Opcode::Shl, {reg(carry), imm(29)}))});
     const bool xo_form = (insn.word >> 26) == 31;
     if (xo_form && insn.oe) {
+        ++g_xer_so_writers;
         VReg same_sign = temp(Opcode::Not, {reg(temp(Opcode::Xor, {reg(a), rhs}))});
         VReg changed_sign = temp(Opcode::Xor, {reg(a), reg(result)});
         VReg ov = temp(Opcode::And, {reg(same_sign), reg(changed_sign)});
@@ -54,8 +67,10 @@ static void emit_carry_sum(const Instruction& insn, IRBuilder& b, IRFunction& f,
     b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(result)}, ga);
     if ((xo_form && insn.rc) || insn.mnemonic == Mnemonic::ADDIC_) {
         emit_rc(VReg::gpr(insn.rD), b, ga);
-        VReg so = temp(Opcode::Shr, {reg(VReg::xer()), imm(31)});
-        b.emit(Opcode::Or, VReg::cr(0), {reg(VReg::cr(0)), reg(so)}, ga);
+        if (!g_assume_xer_so_clear) {
+            VReg so = temp(Opcode::Shr, {reg(VReg::xer()), imm(31)});
+            b.emit(Opcode::Or, VReg::cr(0), {reg(VReg::cr(0)), reg(so)}, ga);
+        }
     }
 }
 
@@ -437,7 +452,7 @@ bool lower_integer(const Instruction& insn, IRBuilder& b, IRFunction& f) {
 
     case Mnemonic::MFCTR: b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(VReg::ctr())}, ga); return true;
 
-    case Mnemonic::MTXER: b.emit(Opcode::Move, VReg::xer(), {reg(VReg::gpr(insn.rD))}, ga); return true;
+    case Mnemonic::MTXER: ++g_xer_so_writers; b.emit(Opcode::Move, VReg::xer(), {reg(VReg::gpr(insn.rD))}, ga); return true;
 
     case Mnemonic::MFXER: b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(VReg::xer())}, ga); return true;
 

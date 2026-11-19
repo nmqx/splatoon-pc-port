@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -36,6 +37,7 @@ struct Prev {
     PFN_vkCmdSetBlendConstants SetBlendConstants;
     PFN_vkCmdDraw Draw;
     PFN_vkCmdDrawIndexed DrawIndexed;
+    PFN_vkCmdDispatch Dispatch;
     PFN_vkCmdBeginRendering BeginRendering;
     PFN_vkCmdEndRendering EndRendering;
     PFN_vkCmdPipelineBarrier2 PipelineBarrier2;
@@ -132,9 +134,11 @@ std::atomic<bool> s_plaza{false};
 bool blend_target(uint64_t target) {
     return target && std::find(s_blend_targets.begin(), s_blend_targets.end(), target) != s_blend_targets.end();
 }
-// Replay: the pass a captured push belongs to may blend.
+// Replay: only 3D passes (with a depth attachment) on a blended scene target
+// may substitute uniforms. Depthless 2D/UI/post passes keep exact frame N.
 bool blend_pass(uint32_t pass) {
-    return pass < s_replay->passes.size() && blend_target(s_replay->passes[pass].target);
+    return pass < s_replay->passes.size() && s_replay->passes[pass].depth &&
+           blend_target(s_replay->passes[pass].target);
 }
 template <class F> void thunk(uint8_t* body, VkCommandBuffer cb) {
     (*reinterpret_cast<F*>(body))(cb);
@@ -166,7 +170,6 @@ CAP0(BindPipeline, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p), (
 CAP0(BindIndexBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t), (cb, b, o, t), (c, b, o, t))
 CAP0(SetCullMode, (VkCommandBuffer cb, VkCullModeFlags m), (cb, m), (c, m))
 CAP0(SetFrontFace, (VkCommandBuffer cb, VkFrontFace f), (cb, f), (c, f))
-CAP0(SetDepthTestEnable, (VkCommandBuffer cb, VkBool32 e), (cb, e), (c, e))
 CAP0(SetDepthWriteEnable, (VkCommandBuffer cb, VkBool32 e), (cb, e), (c, e))
 CAP0(SetDepthCompareOp, (VkCommandBuffer cb, VkCompareOp o), (cb, o), (c, o))
 CAP0(SetStencilTestEnable, (VkCommandBuffer cb, VkBool32 e), (cb, e), (c, e))
@@ -179,7 +182,39 @@ CAP0(SetStencilReference, (VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t v)
 CAP0(SetDepthBias, (VkCommandBuffer cb, float a, float b, float d), (cb, a, b, d), (c, a, b, d))
 CAP0(SetDepthBiasEnable, (VkCommandBuffer cb, VkBool32 e), (cb, e), (c, e))
 CAP0(SetPrimitiveRestartEnable, (VkCommandBuffer cb, VkBool32 e), (cb, e), (c, e))
+CAP0(Dispatch, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z), (c, x, y, z))
 #undef CAP0
+// Depth test state of the draws being captured. A draw without depth test
+// in a scene target (2D panels, screen-space quads) is passed to the
+// substitution with kNoDepthTest (gx2_vk_capture.h): one of several copies
+// of a program and mesh is then not matched with another copy (two panes of
+// a 2D layout blended into a shape of neither). RBREW_INTERP_BLEND_NODEPTH=1:
+// no such flag.
+bool blend_without_depth();
+bool s_depth_test = true;
+// A push is captured before its draw sets the depth state: its flag is
+// filled in at the draw that uses it.
+std::vector<uint8_t*> s_push_depth_flags;
+void note_draw_depth() {
+    const bool pass_has_depth = !s_capture->passes.empty() && s_capture->passes.back().depth;
+    const uint8_t value = (pass_has_depth && s_depth_test) || blend_without_depth() ? 1 : 0;
+    for (uint8_t* flag : s_push_depth_flags) *flag = value;
+    s_push_depth_flags.clear();
+}
+bool blend_without_depth() {
+    static const bool on = [] {
+        const char* v = std::getenv("RBREW_INTERP_BLEND_NODEPTH");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+VKAPI_ATTR void VKAPI_CALL c_SetDepthTestEnable(VkCommandBuffer cb, VkBool32 e) {
+    if (capturing()) {
+        s_depth_test = e != VK_FALSE;
+        cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdSetDepthTestEnable(c, e); }; });
+    }
+    prev.SetDepthTestEnable(cb, e);
+}
 VKAPI_ATTR void VKAPI_CALL c_EndRendering(VkCommandBuffer cb) {
     if (capturing()) cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdEndRendering(c); }; });
     s_pass_tag = 0;
@@ -189,6 +224,7 @@ VKAPI_ATTR void VKAPI_CALL c_EndRendering(VkCommandBuffer cb) {
 VKAPI_ATTR void VKAPI_CALL c_Draw(VkCommandBuffer cb, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
     if (capturing() && !s_tf_active) {
         if (!s_capture->passes.empty()) ++s_capture->passes.back().draws;
+        note_draw_depth();
         cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdDraw(c, v, i, fv, fi); }; });
     }
     prev.Draw(cb, v, i, fv, fi);
@@ -197,6 +233,7 @@ VKAPI_ATTR void VKAPI_CALL c_DrawIndexed(VkCommandBuffer cb, uint32_t n, uint32_
                                          uint32_t fin) {
     if (capturing() && !s_tf_active) {
         if (!s_capture->passes.empty()) ++s_capture->passes.back().draws;
+        note_draw_depth();
         cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdDrawIndexed(c, n, i, fi, vo, fin); }; });
     }
     prev.DrawIndexed(cb, n, i, fi, vo, fin);
@@ -336,7 +373,11 @@ VKAPI_ATTR void VKAPI_CALL c_PushDescriptorSet(VkCommandBuffer cb, VkPipelineBin
         else {
             const uint32_t unit = s_unit;
             const uint32_t pass = s_capture->passes.empty() ? UINT32_MAX : uint32_t(s_capture->passes.size() - 1);
-            cap(extra, [=](uint8_t* p) {
+            cap(extra + 16, [=](uint8_t* p) {
+                uint8_t* depth = p; // filled in by the draw (note_draw_depth)
+                *depth = 1;
+                s_push_depth_flags.push_back(depth);
+                p += 16;
                 VkWriteDescriptorSet* wx = const_cast<VkWriteDescriptorSet*>(put(p, writes, n));
                 for (uint32_t i = 0; i < n; ++i) {
                     auto& w = wx[i];
@@ -350,7 +391,9 @@ VKAPI_ATTR void VKAPI_CALL c_PushDescriptorSet(VkCommandBuffer cb, VkPipelineBin
                     w.pTexelBufferView = nullptr;
                 }
                 return
-                    [=](VkCommandBuffer c) { replay_push(c, bp, l, set, n, wx, blend_pass(pass) ? unit : UINT32_MAX); };
+                    [=](VkCommandBuffer c) { replay_push(c, bp, l, set, n, wx,
+                                       blend_pass(pass) ? (*depth ? unit : unit | kNoDepthTest) : UINT32_MAX);
+                    };
             });
         }
     }
@@ -364,10 +407,11 @@ VKAPI_ATTR void VKAPI_CALL c_BeginRendering(VkCommandBuffer cb, const VkRenderin
         if (!target && info->pDepthAttachment) target = info->pDepthAttachment->imageView;
         const uint64_t w = info->renderArea.extent.width, h = info->renderArea.extent.height;
         const bool screen = w >= 320 && h && (w * 9 > h * 16 ? w * 9 - h * 16 : h * 16 - w * 9) * 32 <= w * 9;
+        const bool has_depth = info->pDepthAttachment && info->pDepthAttachment->imageView != VK_NULL_HANDLE;
+        if (!has_depth) s_depth_test = false;
         s_pass_tag = uint32_t(s_capture->passes.size() + 1);
         s_capture->passes.push_back({uint64_t(reinterpret_cast<uintptr_t>(target)), 0, screen, uint32_t(w), uint32_t(h),
-                                     info->colorAttachmentCount > 0,
-                                     info->pDepthAttachment && info->pDepthAttachment->imageView != VK_NULL_HANDLE});
+                                     info->colorAttachmentCount > 0, has_depth});
         const bool simple = !info->pNext &&
                             std::all_of(info->pColorAttachments, info->pColorAttachments + info->colorAttachmentCount,
                                         [](const VkRenderingAttachmentInfo& a) { return !a.pNext; }) &&
@@ -537,6 +581,7 @@ void install() {
     H(SetBlendConstants);
     H(Draw);
     H(DrawIndexed);
+    H(Dispatch);
     H(BeginRendering);
     H(EndRendering);
     H(PipelineBarrier2);
@@ -573,11 +618,13 @@ bool plaza() {
     return s_plaza.load(std::memory_order_relaxed);
 }
 void finish_frame() {
+    s_push_depth_flags.clear();
     std::swap(s_capture, s_replay);
     s_capture->clear();
     s_unit = UINT32_MAX;
 }
 void discard() {
+    s_push_depth_flags.clear();
     s_capture->clear();
     s_replay->clear();
 }

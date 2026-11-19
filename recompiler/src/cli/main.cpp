@@ -12,6 +12,7 @@
 #include "../ir/ir_optimizer.hpp"
 #include "../codegen/cpp_emitter.hpp"
 #include "../codegen/naming.hpp"
+#include "../ppc/semantics/ppc_semantics.hpp"
 #include "../config/config.hpp"
 #include "../diagnostics/diagnostics.hpp"
 #include "rebrewu/logger.hpp"
@@ -442,6 +443,7 @@ int main(int argc, char** argv) {
     ir_module.is_rpx = true;
 
     uint32_t built_ok = 0, built_fail = 0;
+    ppc::set_assume_xer_so_clear(opts->assume_xer_so_clear);
     for (const auto& fb : boundaries) {
         auto func = cfg_builder.build(fb.start, fb.name);
         if (func) {
@@ -456,6 +458,12 @@ int main(int argc, char** argv) {
                 RBREW_LOG_STREAM(::rbrew::log::Level::Error, nullptr)
                     << "  build failed @ 0x" << std::hex << fb.start << ": " << cfg_builder.last_error() << "\n";
         }
+    }
+    if (opts->assume_xer_so_clear && ppc::xer_so_writer_count() != 0) {
+        RBREW_LOG_STREAM(::rbrew::log::Level::Error, nullptr)
+            << "--assume-xer-so-clear: " << std::dec << ppc::xer_so_writer_count()
+            << " instructions can set XER.SO (OE=1 arithmetic or mtxer); the option is not exact here.\n";
+        return EXIT_FAILURE;
     }
     if (opts->verbose)
         RBREW_LOG_STREAM(::rbrew::log::Level::Error, nullptr)

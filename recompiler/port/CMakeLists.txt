@@ -201,6 +201,7 @@ add_library(gambit_runtime STATIC
     os/stubs/stubs.cpp
     os/nsysnet/nsysnet.cpp
     hooks/gx2_camera_hooks.cpp
+    hooks/mouse_aim.cpp
     hooks/player_anim.cpp
     hooks/branch_tables.cpp
     hooks/broadcast_guard.cpp
@@ -233,6 +234,16 @@ endif()
 option(HYPER_OPTIMIZE "Aggressive CPU optimizations for guest code (zero-check memory, LTCG/LTO)" ON)
 if(HYPER_OPTIMIZE)
     message(STATUS "HYPER_OPTIMIZE enabled: zero-check guest memory, aggressive inlining")
+endif()
+# RBREW_FAST_LINK: same optimized guest code (zero-check memory, /O2, AVX2), but
+# without /GL and /LTCG. Code generation then runs in every cl.exe job in
+# parallel instead of in one mostly sequential LTCG link, and a change to one
+# file no longer regenerates the whole program. Use it to iterate; keep it OFF
+# for a release build.
+option(RBREW_FAST_LINK "Skip /GL and /LTCG (fast parallel build, quick relinks)" OFF)
+if(RBREW_FAST_LINK)
+    message(STATUS "RBREW_FAST_LINK enabled: no /GL or /LTCG, runtime IPO disabled")
+    set(RBREW_RUNTIME_IPO OFF CACHE BOOL "Enable MSVC Release interprocedural optimization of the host runtime" FORCE)
 endif()
 rbrew_gx2_backend(gambit_runtime PUBLIC)
 
@@ -314,7 +325,11 @@ if(MSVC)
     if(HYPER_OPTIMIZE)
         # Full inlining plus whole-program optimization on the generated parts.
         # /arch:AVX2 (Haswell+) brings MOVBE and BMI2 like -march=native above.
-        target_compile_options(gambit_generated PRIVATE /Ob2 /Oi /GT /GL /arch:AVX2)
+        if(RBREW_FAST_LINK)
+            target_compile_options(gambit_generated PRIVATE /Ob2 /Oi /GT /arch:AVX2)
+        else()
+            target_compile_options(gambit_generated PRIVATE /Ob2 /Oi /GT /GL /arch:AVX2)
+        endif()
     else()
         target_compile_options(gambit_generated PRIVATE /Ob1)
     endif()
@@ -406,7 +421,7 @@ if(MSVC)
         # (rebrewu_runtime.h); the executable needs no per-access TLS guard.
         target_compile_options(Gambit PRIVATE /Zc:tlsGuards-)
         target_link_options(Gambit PRIVATE "/MAP:$<TARGET_FILE_DIR:Gambit>/Splatoon.map")
-        if(HYPER_OPTIMIZE)
+        if(HYPER_OPTIMIZE AND NOT RBREW_FAST_LINK)
             # gambit_generated is compiled with /GL; link the whole game with LTCG.
             target_link_options(Gambit PRIVATE /LTCG)
         endif()

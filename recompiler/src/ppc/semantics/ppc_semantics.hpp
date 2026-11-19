@@ -23,6 +23,13 @@ namespace rebrewu::ppc {
 /// emit an Opcode::Undefined marker and continue or abort).
 bool lower_to_ir(const Instruction& insn, ir::IRBuilder& builder, ir::IRFunction& func);
 
+/// --assume-xer-so-clear: integer CR writes no longer copy XER.SO. Exact only
+/// when no lowered instruction can set SO; xer_so_writer_count() counts the
+/// ones that could (OE=1 arithmetic, mtxer), and the caller must reject a
+/// non-zero count.
+void set_assume_xer_so_clear(bool on);
+uint64_t xer_so_writer_count();
+
 /// Lower an integer arithmetic / logical instruction.
 bool lower_integer(const Instruction& insn, ir::IRBuilder& b, ir::IRFunction& f);
 

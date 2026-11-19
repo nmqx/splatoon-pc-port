@@ -1511,9 +1511,9 @@ static void set_uniform_reg(CPUState* cpu, bool is_pixel) {
     const uint32_t index = ARG0, count = ARG1, src = ARG2;
     if (gx2_dl_recording()) {
         if (!src || !count || count > 1024 || !rbrew_memory_accessible(MEM, src, uint64_t(count) * 4)) return;
-        std::vector<uint32_t> words(count);
+        uint32_t words[1024];
         for (uint32_t i = 0; i < count; ++i) words[i] = rbrew_read32(MEM, src + i * 4);
-        gx2_dl_record_uniform_words(is_pixel, index, std::move(words));
+        gx2_dl_record_uniform_words(is_pixel, index, std::span<const uint32_t>(words, count));
         return;
     }
     gx2_render_set_uniform_reg(is_pixel, index, src, count, MEM);

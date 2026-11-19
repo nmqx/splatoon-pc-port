@@ -43,14 +43,49 @@
 extern bool g_gx2_frame_trace_active;
 
 namespace {
+// Inline small-buffer container for per-command uniform words and descriptors:
+// avoids per-command heap allocations for all textures (156 B), samplers (12 B),
+// color/depth descriptors (~116 B) and <= 16-word uniform reg snapshots.
+template <typename T, size_t InlineN> class SmallBuffer {
+    uint32_t count_ = 0;
+    T inline_[InlineN]{};
+    std::vector<T> heap_;
+
+public:
+    size_t size() const noexcept { return count_; }
+    bool empty() const noexcept { return count_ == 0; }
+    T* data() noexcept { return count_ <= InlineN ? inline_ : heap_.data(); }
+    const T* data() const noexcept { return count_ <= InlineN ? inline_ : heap_.data(); }
+    const T* begin() const noexcept { return data(); }
+    const T* end() const noexcept { return data() + count_; }
+    size_t heap_bytes() const noexcept { return count_ > InlineN ? heap_.size() * sizeof(T) : 0; }
+    void resize(size_t n) {
+        count_ = uint32_t(n);
+        if (n > InlineN)
+            heap_.resize(n);
+        else if (!heap_.empty())
+            heap_.clear();
+    }
+    void assign(const T* first, const T* last) {
+        const size_t n = size_t(last - first);
+        resize(n);
+        if (n) std::memcpy(data(), first, n * sizeof(T));
+    }
+    bool operator==(const SmallBuffer& other) const noexcept {
+        if (count_ != other.count_) return false;
+        return count_ == 0 || std::memcmp(data(), other.data(), count_ * sizeof(T)) == 0;
+    }
+    bool operator!=(const SmallBuffer& other) const noexcept { return !(*this == other); }
+};
+
 struct Command {
-    Gx2CommandFn fn;
-    std::array<uint32_t, 8> r; // r3..r10
-    std::array<double, 8> f;   // f1..f8
+    Gx2CommandFn fn = nullptr;
+    std::array<uint32_t, 8> r{}; // r3..r10
+    std::array<double, 8> f{};   // f1..f8
     // fn == nullptr: shader constant snapshot (r[0] = is_pixel, r[1] = index).
-    std::vector<uint32_t> words;
+    SmallBuffer<uint32_t, 16> words;
     Gx2DescriptorFn descriptor_fn = nullptr;
-    std::vector<uint8_t> descriptor;
+    SmallBuffer<uint8_t, 160> descriptor;
 };
 struct OpenList {
     bool active = false;
@@ -240,7 +275,7 @@ RecordingTable s_recordings;
 std::vector<uint32_t> s_tracked;
 uint32_t recording_bytes(const std::vector<Command>& commands) {
     uint64_t bytes = sizeof(std::vector<Command>) + 64 + commands.size() * sizeof(Command);
-    for (const Command& c : commands) bytes += c.words.size() * sizeof(uint32_t) + c.descriptor.size();
+    for (const Command& c : commands) bytes += c.words.heap_bytes() + c.descriptor.heap_bytes();
     return uint32_t(std::min<uint64_t>(bytes, UINT32_MAX));
 }
 std::unordered_map<uint32_t, uint32_t> s_lists; // buffer address -> latest id
@@ -935,6 +970,24 @@ struct ReplayCpuGuard {
 std::shared_ptr<const BakedList> bake_commands(const std::vector<Command>& commands) {
     auto baked = std::make_shared<BakedList>();
     baked->ops.reserve(commands.size());
+    size_t word_total = 0, desc_total = 0, call_total = 0;
+    for (const Command& c : commands) {
+        if (!c.fn && !c.descriptor_fn)
+            word_total += c.words.size();
+        else if (c.descriptor_fn) {
+            if (!(c.descriptor_fn == s_hot_cmds.set_ps_sampler || c.descriptor_fn == s_hot_cmds.set_vs_sampler)) {
+                desc_total += c.descriptor.size();
+                if (!(c.descriptor_fn == s_hot_cmds.set_ps_tex || c.descriptor_fn == s_hot_cmds.set_vs_tex)) ++call_total;
+            }
+        } else if (c.fn != s_draw_indexed_ex_fn && c.fn != s_draw_indexed_ex2_fn && c.fn != s_draw_ex_fn &&
+                   c.fn != s_hot_cmds.set_attrib_buffer && c.fn != s_hot_cmds.set_vs_ubo &&
+                   c.fn != s_hot_cmds.set_ps_ubo && c.fn != s_hot_cmds.set_vs && c.fn != s_hot_cmds.set_ps) {
+            ++call_total;
+        }
+    }
+    if (word_total) baked->word_pool.reserve(word_total);
+    if (desc_total) baked->desc_pool.reserve(desc_total);
+    if (call_total) baked->call_pool.reserve(call_total);
     for (const Command& c : commands) {
         if (!c.fn && !c.descriptor_fn) {
             BakedOp op{};
@@ -1585,7 +1638,8 @@ void gx2_dl_record(Gx2CommandFn fn, const CPUState* cpu) {
     if (is_list_call(fn) && s_any_list_queries.load(std::memory_order_relaxed) && gx2_query_list_counting() &&
         !gx2_dl_list_open())
         count_list_queries(cpu->mem, cpu->r[3], cpu->r[4], 0);
-    Command c{fn, {}, {}, {}};
+    Command c{};
+    c.fn = fn;
     for (unsigned i = 0; i < 8; ++i) {
         c.r[i] = cpu->r[3 + i];
         c.f[i] = cpu->f[1 + i];
@@ -1593,10 +1647,11 @@ void gx2_dl_record(Gx2CommandFn fn, const CPUState* cpu) {
     push_command(std::move(c), cpu->mem, cpu->lr);
 }
 
-void gx2_dl_record_uniform_words(bool is_pixel, uint32_t index, std::vector<uint32_t> words) {
-    Command c{nullptr, {}, {}, std::move(words)};
+void gx2_dl_record_uniform_words(bool is_pixel, uint32_t index, std::span<const uint32_t> words) {
+    Command c{};
     c.r[0] = is_pixel;
     c.r[1] = index;
+    c.words.assign(words.data(), words.data() + words.size());
     push_command(std::move(c), nullptr, 0);
 }
 
@@ -1614,9 +1669,9 @@ void gx2_dl_record_descriptor(Gx2DescriptorFn fn, const CPUState* cpu, uint32_t 
 }
 
 void gx2_dl_record_snapshot(Gx2DescriptorFn fn, const CPUState* cpu, std::span<const uint8_t> bytes) {
-    Command c{nullptr, {}, {}, {}};
+    Command c{};
     c.descriptor_fn = fn;
-    c.descriptor.assign(bytes.begin(), bytes.end());
+    c.descriptor.assign(bytes.data(), bytes.data() + bytes.size());
     for (unsigned i = 0; i < 8; ++i) {
         c.r[i] = cpu->r[3 + i];
         c.f[i] = cpu->f[1 + i];
@@ -1693,7 +1748,7 @@ static void GX2EndDisplayList(CPUState* cpu) {
     list.active = false;
     list.buffer = list.capacity = 0;
     list.commands.clear();
-    if (list.commands.capacity() > 4096) std::vector<Command>().swap(list.commands); // an unusually long list
+    if (list.commands.capacity() > 65536) std::vector<Command>().swap(list.commands); // keep plaza (~13k cmds) capacity across frames
     const bool tagged = capacity >= 12 && rbrew_memory_accessible(MEM, buffer, 12);
     RegistryLock lock;
     s_guest_mem = MEM;

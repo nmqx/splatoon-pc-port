@@ -2745,6 +2745,7 @@ bool scan_copy_enabled() {
     return on;
 }
 } // namespace
+static void gx2r_shutdown_interp_images();
 void gx2r_shutdown_scan_images() {
     s_pending_present_capture.clear();
     for (auto& encoded : s_encoded) {
@@ -2754,6 +2755,7 @@ void gx2r_shutdown_scan_images() {
     }
     for (auto& copy : s_scan_copy) gx2vk::destroy_image(copy);
     gx2vk::destroy_image(s_present_raw);
+    gx2r_shutdown_interp_images();
 }
 void gx2r::capture_next_present(const std::string& path) {
     s_pending_present_capture = path;
@@ -3070,10 +3072,8 @@ static void frame_signature(gx2vk::Image&, uint32_t, uint32_t, bool) {}
 size_t gx2r_vertex_cache_entries(); // gx2_render_vk_draw.cpp
 uint64_t gx2r_vertex_cache_bytes();
 std::pair<uint64_t, uint64_t> gx2_dl_recording_counts(); // gx2_display_list.cpp
-// 120 FPS in-between frames (gx2_frame_interp.h). The held frame N is a
-// UNORM copy of the scan image (sRGB scan textures are blitted unconverted).
-gx2vk::Image s_interp_held;
-uint32_t s_interp_held_w = 0, s_interp_held_h = 0;
+// In-between frames (gx2_frame_interp.h). The pictures are UNORM copies of
+// the scan image (sRGB scan textures are blitted unconverted).
 static void interp_copy(gx2vk::Image& source, gx2vk::Image& target) {
     const VkFormat format =
         source.desc.format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : source.desc.format;
@@ -3095,51 +3095,80 @@ static void interp_copy(gx2vk::Image& source, gx2vk::Image& target) {
     vkCmdCopyImage(cb, source.image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     gx2vk::note_gpu_write(target);
 }
-void gx2_render_interp_hold(unsigned scan_index) {
-    end_rendering();
-    gx2vk::Image* image = S.scan_image[scan_index & 1];
-    s_interp_held_w = s_interp_held_h = 0;
-    if (!image || !image->image) return;
-    interp_copy(*image, s_interp_held);
-    s_interp_held_w = S.scan_w[scan_index & 1];
-    s_interp_held_h = S.scan_h[scan_index & 1];
+// The pictures of the in-between schedule (frame N and the frames drawn
+// between N-1 and N) wait here for their present time.
+struct InterpSlot {
+    gx2vk::Image image;
+    uint32_t w = 0, h = 0;
+    unsigned in_between = 0; // 0: frame N, else its number within the step
+    unsigned frame = 0;      // game frame counter when it was made
+};
+// RBREW_PRESENT_DUMP=<first>-<last> (with RBREW_FRAME_DUMP_DIR, tests): every
+// picture of the schedule in that range of presents, read back when it is
+// presented (not when it is made: reading it back at once waits for the GPU
+// and hides any hazard between the replay and the next frame's work).
+// Files pic_<present>_<frame>_<k>.bmp, k = 0 for frame N, else in-between k.
+static bool present_dump_range(uint64_t present, unsigned& first, unsigned& last) {
+    static unsigned lo = 1, hi = 0;
+    static const bool on = [] {
+        const char* v = std::getenv("RBREW_PRESENT_DUMP");
+        return v && std::sscanf(v, "%u-%u", &lo, &hi) == 2 && hi >= lo;
+    }();
+    first = lo;
+    last = hi;
+    return on && present >= lo && present <= hi;
 }
-void gx2_render_interp_present_scan(unsigned scan_index) {
+static InterpSlot s_interp_slots[gx2interp::kSlots];
+void gx2_render_interp_keep(unsigned scan_index, unsigned slot, unsigned in_between) {
     end_rendering();
+    if (slot >= gx2interp::kSlots) return;
+    InterpSlot& kept = s_interp_slots[slot];
+    kept.w = kept.h = 0;
     gx2vk::Image* image = S.scan_image[scan_index & 1];
-    const uint32_t w = S.scan_w[scan_index & 1], h = S.scan_h[scan_index & 1];
-    if (!image || !image->image || !w || !h) return;
-    gx2vk::Image* source = image;
-    if (image->desc.format == VK_FORMAT_R8G8B8A8_SRGB) {
-        interp_copy(*image, s_present_raw);
-        source = &s_present_raw;
+    if (!image || !image->image) return;
+    interp_copy(*image, kept.image);
+    if (!kept.image.image) return;
+    kept.w = S.scan_w[scan_index & 1];
+    kept.h = S.scan_h[scan_index & 1];
+    kept.in_between = in_between;
+    kept.frame = rbrew_benchmark::frame.load(std::memory_order_relaxed);
+    if (in_between) {
+        char prefix[16];
+        if (in_between == 1)
+            std::snprintf(prefix, sizeof(prefix), "interp");
+        else
+            std::snprintf(prefix, sizeof(prefix), "interp%u", in_between);
+        dump_frame(kept.image, kept.w, kept.h, prefix);
     }
-    dump_frame(*source, w, h, "interp");
-    gx2vk::present(*source, w, h);
 }
-void gx2_render_interp_present_held() {
+void gx2_render_interp_present(unsigned slot) {
+    // The open rendering instance is closed as part of the frame being
+    // captured (gx2vk::present pauses the capture for its own commands).
     end_rendering();
-    if (s_interp_held.image && s_interp_held_w && s_interp_held_h)
-        gx2vk::present(s_interp_held, s_interp_held_w, s_interp_held_h);
+    if (slot >= gx2interp::kSlots) return;
+    InterpSlot& kept = s_interp_slots[slot];
+    if (!kept.image.image || !kept.w || !kept.h) return;
+    unsigned first = 0, last = 0;
+    if (present_dump_range(gx2vk::present_count() + 1, first, last)) {
+        std::vector<uint8_t> raw;
+        const bool capturing = gx2vk::capture::enabled(); // the readback is not part of the frame
+        if (capturing) gx2vk::capture::set_enabled(false);
+        const bool read = gx2vk::read_image(kept.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, kept.w, kept.h, raw);
+        if (capturing) gx2vk::capture::set_enabled(true);
+        if (read) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "pic_%06llu_%05u_%u", (unsigned long long)(gx2vk::present_count() + 1),
+                          kept.frame, kept.in_between);
+            write_frame_bmp(kept.image.desc.format, kept.w, kept.h, raw.data(), name);
+        }
+    }
+    gx2vk::present(kept.image, kept.w, kept.h);
 }
-// 180 FPS mode: the second in-between frame is rendered right after the first
-// and kept until its turn (a third of a frame later).
-gx2vk::Image s_interp_mid;
-uint32_t s_interp_mid_w = 0, s_interp_mid_h = 0;
-void gx2_render_interp_keep_mid(unsigned scan_index) {
-    end_rendering();
-    gx2vk::Image* image = S.scan_image[scan_index & 1];
-    s_interp_mid_w = s_interp_mid_h = 0;
-    if (!image || !image->image) return;
-    interp_copy(*image, s_interp_mid);
-    s_interp_mid_w = S.scan_w[scan_index & 1];
-    s_interp_mid_h = S.scan_h[scan_index & 1];
-    dump_frame(s_interp_mid, s_interp_mid_w, s_interp_mid_h, "interp2");
-}
-void gx2_render_interp_present_mid() {
-    end_rendering();
-    if (s_interp_mid.image && s_interp_mid_w && s_interp_mid_h)
-        gx2vk::present(s_interp_mid, s_interp_mid_w, s_interp_mid_h);
+static void gx2r_shutdown_interp_images() {
+    for (auto& kept : s_interp_slots) {
+        gx2vk::destroy_image(kept.image);
+        kept.w = kept.h = 0;
+    }
 }
 
 void gx2_render_present(void* sdl_window, bool gamepad_mode) {

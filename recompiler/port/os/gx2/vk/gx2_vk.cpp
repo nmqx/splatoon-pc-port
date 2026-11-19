@@ -28,7 +28,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dwmapi.h> // DWM_TIMING_INFO (frame gen; the function is loaded at run time)
 #endif
+#include <cmath>
+#include <cstdarg>
+#include "../../../runtime/host_sleep.h"
 
 namespace gx2vk {
 namespace {
@@ -214,6 +218,7 @@ struct Deferred {
     std::function<void()> f;
 };
 std::deque<Deferred> s_deferred;
+uint64_t s_capture_hold_serial = 0; // while > 0, never destroy/recycle serials >= this
 bool s_dirty = false;
 uint64_t s_barriers = 0;
 
@@ -225,7 +230,9 @@ void poll_completed() {
     // scheduled CPU cleanup since the last completion was observed.
     if (s_completed < s_next_serial - 1 && vkGetSemaphoreCounterValue(s_device, s_timeline, &value) == VK_SUCCESS)
         s_completed = std::max(s_completed, value);
-    while (!s_deferred.empty() && s_deferred.front().serial <= s_completed) {
+    const uint64_t defer_limit =
+        s_capture_hold_serial ? std::min(s_completed, s_capture_hold_serial - 1) : s_completed;
+    while (!s_deferred.empty() && s_deferred.front().serial <= defer_limit) {
         auto f = std::move(s_deferred.front().f);
         s_deferred.pop_front();
         f();
@@ -284,8 +291,10 @@ struct Swapchain {
     unsigned slot = 0;
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     bool gsync = false; // the menu setting the swapchain was built for
+    bool framegen = false; // built for frame gen (FIFO, presented by its thread)
 };
 Swapchain s_swapchain;
+bool s_fg_fifo = false; // frame gen owns presentation: the swapchain is FIFO (gx2_vk_framegen.inl)
 uint64_t s_presents = 0;
 bool s_capture_presents = false;
 std::vector<uint8_t> s_last_present;
@@ -370,7 +379,10 @@ bool create_swapchain() {
     // once and the display's refresh follows it. MAILBOX keeps the fixed
     // refresh (no tearing without VRR).
     const bool gsync = rbrew_settings::g_gsync.load(std::memory_order_relaxed);
-    if (const char* forced = std::getenv("RBREW_VK_PRESENT_MODE"); forced && *forced) {
+    if (s_fg_fifo) {
+        // Frame gen: one picture per refresh from its presenter thread, paced
+        // by the display (FIFO; VRR still follows it).
+    } else if (const char* forced = std::getenv("RBREW_VK_PRESENT_MODE"); forced && *forced) {
         if (!std::strcmp(forced, "immediate") && has(VK_PRESENT_MODE_IMMEDIATE_KHR))
             mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
         else if (!std::strcmp(forced, "mailbox") && has(VK_PRESENT_MODE_MAILBOX_KHR))
@@ -381,7 +393,7 @@ bool create_swapchain() {
         mode = VK_PRESENT_MODE_MAILBOX_KHR;
     else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
         mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    if (mode == VK_PRESENT_MODE_FIFO_KHR)
+    if (mode == VK_PRESENT_MODE_FIFO_KHR && !s_fg_fifo)
         RBREW_LOG_WARN("vk", "WARNING: only FIFO presentation is available; presentation adds a refresh wait\n");
     uint32_t images = std::max(3u, capabilities.minImageCount);
     if (capabilities.maxImageCount) images = std::min(images, capabilities.maxImageCount);
@@ -413,6 +425,7 @@ bool create_swapchain() {
     s_swapchain.extent = extent;
     s_swapchain.mode = mode;
     s_swapchain.gsync = gsync;
+    s_swapchain.framegen = s_fg_fifo;
     vkGetSwapchainImagesKHR(s_device, created, &count, nullptr);
     s_swapchain.images.resize(count);
     vkGetSwapchainImagesKHR(s_device, created, &count, s_swapchain.images.data());
@@ -1157,6 +1170,9 @@ void end_command_batch() {
     if (!--record::s_batch_depth && record::s_head - record::s_published_head >= kPublishChunk) record::publish();
 }
 
+// Optical-flow frame generation (settings.ini frame_gen, RBREW_FRAMEGEN).
+#include "gx2_vk_framegen.inl"
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
@@ -1479,6 +1495,7 @@ bool init(SDL_Window* window, bool native_depth) {
         *tail = &e_clip_enable;
         tail = &e_clip_enable.pNext;
     }
+    fg::device_prepare(device_extensions, enable, tail, push_ext); // frame gen: VK_NV_optical_flow, if offered
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue_info.queueFamilyIndex = s_queue_family;
@@ -1490,7 +1507,10 @@ bool init(SDL_Window* window, bool native_depth) {
     device_info.pQueueCreateInfos = &queue_info;
     device_info.enabledExtensionCount = uint32_t(enable.size());
     device_info.ppEnabledExtensionNames = enable.data();
+    fg::device_queues(device_info, queue_info);
     result = vkCreateDevice(s_physical, &device_info, nullptr, &s_device);
+    if (result != VK_SUCCESS && fg::device_revert(enable, device_info, &queue_info))
+        result = vkCreateDevice(s_physical, &device_info, nullptr, &s_device);
     if (result != VK_SUCCESS) {
         RBREW_LOG_FATAL("vk", "FATAL: vkCreateDevice failed (%d)\n", int(result));
         return false;
@@ -1498,6 +1518,7 @@ bool init(SDL_Window* window, bool native_depth) {
     volkLoadDevice(s_device);
     record::install(); // split render thread: per-draw command recording on a second thread
     vkGetDeviceQueue(s_device, s_queue_family, 0, &s_queue);
+    fg::device_created();
 
     s_caps.push_descriptor = push_ext;
     s_caps.negative_one_to_one = e_depth_clip.depthClipControl != 0;
@@ -1564,6 +1585,7 @@ bool init(SDL_Window* window, bool native_depth) {
 void shutdown() {
     record::stop();
     s_format_properties.clear();
+    fg::shutdown_all();
     if (!s_device) return;
 #ifdef RBREW_TEXTURE_DIAGNOSTICS
     const auto diagnostic_wait = vkDeviceWaitIdle(s_device);
@@ -1853,13 +1875,20 @@ void defer(std::function<void()> f) {
 }
 // 120 FPS replay (gx2_vk_capture.h): frame N's spans and resources stay until
 // the submission now being recorded, which holds the in-between frame.
-void retain_until_current_submission(uint64_t since_serial) {
+// later_submissions: the in-between frames are drawn one after another with
+// presents (each a submission) between them; frame N's data must outlive the
+// last of them, not only the submission open now.
+void set_capture_hold(uint64_t since_serial) {
+    s_capture_hold_serial = since_serial;
+}
+void retain_until_current_submission(uint64_t since_serial, uint32_t later_submissions) {
     // Only what frame N used (its serials): retaining every chunk each frame
     // kept all of them busy and allocated new 32 MB chunks every frame.
+    const uint64_t until = s_next_serial + later_submissions;
     for (auto& chunk : s_chunks)
-        if (chunk.last_serial >= since_serial) chunk.last_serial = std::max(chunk.last_serial, s_next_serial);
+        if (chunk.last_serial >= since_serial) chunk.last_serial = std::max(chunk.last_serial, until);
     for (auto& entry : s_deferred)
-        if (entry.serial >= since_serial) entry.serial = std::max(entry.serial, s_next_serial);
+        if (entry.serial >= since_serial) entry.serial = std::max(entry.serial, until);
 }
 
 namespace {
@@ -2083,8 +2112,10 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
         // Retire the active chunk and pick a completed one (or make one).
         poll_completed();
         int next = -1;
+        const uint64_t chunk_limit =
+            s_capture_hold_serial ? std::min(s_completed, s_capture_hold_serial - 1) : s_completed;
         for (int i = 0; i < int(s_chunks.size()); ++i)
-            if (i != s_active_chunk && s_chunks[i].last_serial <= s_completed) {
+            if (i != s_active_chunk && s_chunks[i].last_serial <= chunk_limit) {
                 next = i;
                 break;
             }
@@ -2505,6 +2536,103 @@ VkPresentModeKHR present_mode() {
     return s_swapchain.mode;
 }
 
+// Presented pictures: the times of the last presents (render thread), for the
+// FPS counters. The game's own counter (SplatoonDiagnostics) counts its swaps,
+// 60 a second, also while in-between frames double or triple the presents.
+namespace {
+constexpr unsigned kPresentTimes = 1024;
+uint64_t s_present_times[kPresentTimes]{};
+uint64_t steady_ns() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
+void note_present() {
+    s_present_times[s_presents % kPresentTimes] = steady_ns();
+}
+} // namespace
+PresentRate present_rate(double window_seconds) {
+    PresentRate rate;
+    if (s_presents < 2) return rate;
+    const uint64_t newest = s_present_times[(s_presents - 1) % kPresentTimes];
+    const uint64_t now = steady_ns();
+    const uint64_t window = uint64_t(window_seconds * 1e9);
+    if (now - newest > window) return rate; // nothing presented lately
+    uint64_t later = newest, oldest = newest, worst = 0;
+    unsigned count = 0;
+    for (uint64_t back = 2; back <= s_presents && back <= kPresentTimes; ++back) {
+        const uint64_t t = s_present_times[(s_presents - back) % kPresentTimes];
+        if (now - t > window) break;
+        worst = std::max(worst, later - t);
+        later = oldest = t;
+        ++count;
+    }
+    if (!count || newest == oldest) return rate;
+    rate.fps = float(double(count) * 1e9 / double(newest - oldest));
+    rate.worst_ms = float(double(worst) / 1e6);
+    return rate;
+}
+
+// The display the window is on.
+double display_refresh_hz() {
+    static const double forced = [] {
+        const char* e = std::getenv("RBREW_DISPLAY_HZ");
+        return e && std::atof(e) >= 24.0 ? std::atof(e) : 0.0;
+    }();
+    if (forced > 0.0) return forced;
+    static double cached = 0.0;
+    static uint64_t checked = 0;
+    const uint64_t now = steady_ns();
+    if (checked && now - checked < 2000000000ull) return cached;
+    checked = now;
+    double hz = 0.0;
+    if (s_window) {
+        SDL_DisplayMode mode{};
+        const int display = SDL_GetWindowDisplayIndex(s_window);
+        if (display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 && mode.refresh_rate > 1)
+            hz = double(mode.refresh_rate);
+    }
+#if defined(_WIN32)
+    // The exact period (163.97 Hz, not 164) when DWM reports the same mode.
+    uint64_t period = 0, vblank = 0;
+    if (display_vblank(period, vblank) && period) {
+        const double exact = 1e9 / double(period);
+        if (hz <= 0.0 || std::fabs(exact - hz) < 1.0) hz = exact;
+    }
+#endif
+    cached = hz;
+    return hz;
+}
+bool display_vblank(uint64_t& period_ns, uint64_t& vblank_ns) {
+#if defined(_WIN32)
+    using Timing = HRESULT(WINAPI*)(HWND, DWM_TIMING_INFO*);
+    static const Timing timing = [] {
+        HMODULE m = LoadLibraryA("dwmapi.dll");
+        return m ? reinterpret_cast<Timing>(reinterpret_cast<void*>(GetProcAddress(m, "DwmGetCompositionTimingInfo")))
+                 : Timing(nullptr);
+    }();
+    static const int64_t frequency = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return int64_t(f.QuadPart);
+    }();
+    DWM_TIMING_INFO info{};
+    info.cbSize = sizeof(info);
+    if (!timing || frequency <= 0 || timing(nullptr, &info) != S_OK || !info.qpcRefreshPeriod) return false;
+    // steady_clock is the performance counter in nanoseconds.
+    const auto to_ns = [](uint64_t ticks) {
+        return (ticks / uint64_t(frequency)) * 1000000000ull + (ticks % uint64_t(frequency)) * 1000000000ull / uint64_t(frequency);
+    };
+    period_ns = to_ns(info.qpcRefreshPeriod);
+    vblank_ns = to_ns(info.qpcVBlank);
+    return period_ns > 1000000ull && period_ns < 50000000ull;
+#else
+    (void)period_ns;
+    (void)vblank_ns;
+    return false;
+#endif
+}
+
 static VkImageView swapchain_view(uint32_t index) {
     auto& views = s_swapchain.views;
     if (views.size() != s_swapchain.images.size()) views.resize(s_swapchain.images.size(), VK_NULL_HANDLE);
@@ -2538,18 +2666,24 @@ bool present(Image& source, uint32_t width, uint32_t height) {
     }
     leave_rendering();
     if (!s_surface) return false;
+    // Frame gen: its presenter thread shows this frame (and the ones made
+    // between); 0 = this present goes the normal way (frame gen off or paused).
+    if (const int framegen = fg::present_hook(source, width, height)) return framegen > 0;
     int w = 0, h = 0;
     SDL_Vulkan_GetDrawableSize(s_window, &w, &h);
     if (w <= 0 || h <= 0) return false;
     if (!s_swapchain.swapchain || uint32_t(w) != s_swapchain.extent.width || uint32_t(h) != s_swapchain.extent.height ||
-        s_swapchain.gsync != rbrew_settings::g_gsync.load(std::memory_order_relaxed)) {
+        s_swapchain.gsync != rbrew_settings::g_gsync.load(std::memory_order_relaxed) ||
+        s_swapchain.framegen != s_fg_fifo) {
         vkQueueWaitIdle(s_queue);
         if (!create_swapchain()) return false;
     }
     auto& slot_serial = s_swapchain.slot_serial[s_swapchain.slot];
     // Bound the frames in flight like a GPU driver does at swap; this waits
     // for GPU work three presents back, never for a display refresh.
+    const auto wait_start = std::chrono::steady_clock::now();
     if (slot_serial) wait_serial(slot_serial);
+    const auto wait_end = std::chrono::steady_clock::now();
     VkSemaphore acquired = s_swapchain.acquired[s_swapchain.slot];
     uint32_t index = 0;
     VkResult result =
@@ -2560,6 +2694,7 @@ bool present(Image& source, uint32_t width, uint32_t height) {
         result = vkAcquireNextImageKHR(s_device, s_swapchain.swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index);
     }
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return false;
+    const auto acquire_end = std::chrono::steady_clock::now();
     VkCommandBuffer cb = cmd();
     barrier_if_dirty();
     VkImage target = s_swapchain.images[index];
@@ -2592,16 +2727,20 @@ bool present(Image& source, uint32_t width, uint32_t height) {
     } else {
         vkCmdClearColorImage(cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     }
-    // RBREW_PRESENT_LOG=<file> (diagnostics): one line per present, microseconds.
+    // RBREW_PRESENT_LOG=<file> (diagnostics): one line per present, microseconds:
+    // the time, then how long this present waited for the GPU (frames in
+    // flight) and for the swapchain image.
     static FILE* present_log = [] {
         const char* p = std::getenv("RBREW_PRESENT_LOG");
         return p && *p ? std::fopen(p, "w") : nullptr;
     }();
     if (present_log) {
-        std::fprintf(present_log, "%lld\n",
-                     (long long)std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::steady_clock::now().time_since_epoch())
-                         .count());
+        using us = std::chrono::microseconds;
+        std::fprintf(present_log, "%lld %lld %lld\n",
+                     (long long)std::chrono::duration_cast<us>(std::chrono::steady_clock::now().time_since_epoch())
+                         .count(),
+                     (long long)std::chrono::duration_cast<us>(wait_end - wait_start).count(),
+                     (long long)std::chrono::duration_cast<us>(acquire_end - wait_end).count());
         if ((s_presents & 63) == 0) std::fflush(present_log);
     }
     // Captured presents feed exact image tests: they never carry an overlay.
@@ -2674,6 +2813,7 @@ bool present(Image& source, uint32_t width, uint32_t height) {
     present.pSwapchains = &s_swapchain.swapchain;
     present.pImageIndices = &index;
     result = vkQueuePresentKHR(s_queue, &present);
+    note_present();
     ++s_presents;
     // Heartbeat in the diagnostics event log: shows whether the window still
     // gets pictures when the screen looks frozen.

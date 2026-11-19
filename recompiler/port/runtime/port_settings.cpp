@@ -98,13 +98,26 @@ bool env_off(const char* name) {
     return v && v[0] == '0';
 }
 
+// frame_rate in settings.ini and RBREW_FRAME_RATE: a number, or "display"
+// (also "ecran", "auto") for one picture per display refresh.
+int parse_frame_rate(const char* text) {
+    while (*text == ' ' || *text == 9) ++text;
+    if (!std::strncmp(text, "display", 7) || !std::strncmp(text, "ecran", 5) || !std::strncmp(text, "auto", 4))
+        return kFrameRateDisplay;
+    const int number = std::atoi(text);
+    return number == kFrameRateDisplay ? 60 : number;
+}
+
 void publish(const Values& v) {
     g_plaza_60fps.store(v.plaza_60fps, std::memory_order_relaxed);
-    g_fps120.store(v.frame_rate >= 120, std::memory_order_relaxed);
+    g_fps120.store(v.frame_rate >= 120 || v.frame_rate == kFrameRateDisplay, std::memory_order_relaxed);
     g_fps180.store(v.frame_rate == 180, std::memory_order_relaxed);
+    g_frame_rate.store(v.frame_rate, std::memory_order_relaxed);
     g_fps30.store(v.frame_rate == 30, std::memory_order_relaxed);
     g_shader_quality.store(v.shader_quality, std::memory_order_relaxed);
     g_mouse_direct.store(v.mouse_direct, std::memory_order_relaxed);
+    g_mouse_camera.store(v.mouse_camera, std::memory_order_relaxed);
+    g_frame_gen.store(v.frame_gen, std::memory_order_relaxed);
     g_gsync.store(v.gsync, std::memory_order_relaxed);
     g_gyro.store(v.gyro, std::memory_order_relaxed);
     g_gyro_invert_pitch.store(v.gyro_invert_pitch, std::memory_order_relaxed);
@@ -144,16 +157,14 @@ void normalize(Values& v) {
     v.highlight_softness = std::clamp(v.highlight_softness, 0, 100);
     v.sharpness = std::clamp(v.sharpness, 0, 200);
     v.clarity = std::clamp(v.clarity, 0, 200);
-    if (v.shader_quality != kShadersOff) {
-        v.frame_rate = 60;
-        v.plaza_60fps = true;
-    }
     v.resolution = std::clamp(v.resolution, 0, kResolutionCount - 1);
     v.gyro_sensitivity = std::clamp(v.gyro_sensitivity, 25, 300);
     v.mouse_sensitivity = std::clamp(v.mouse_sensitivity, 25, 400);
     v.volume = std::clamp(v.volume, 0, 100);
-    if (v.frame_rate != 30 && v.frame_rate != 120 && v.frame_rate != 180) v.frame_rate = 60;
-    v.fps120 = v.frame_rate >= 120;
+    if (v.frame_rate != 30 && v.frame_rate != 120 && v.frame_rate != 165 && v.frame_rate != 180 &&
+        v.frame_rate != 240 && v.frame_rate != kFrameRateDisplay)
+        v.frame_rate = 60;
+    v.fps120 = v.frame_rate >= 120 || v.frame_rate == kFrameRateDisplay;
     for (int i = 0; i < kActionCount; ++i) {
         const int key = v.keys[i], button = v.pad[i];
         if (key < kUnbound || (key >= 512 && key < kMouseBase) || key > kMouseBase + 5) v.keys[i] = kUnbound;
@@ -217,7 +228,8 @@ void write(const Values& v) {
     out << "# Splatoon PC port settings (ESC menu)\n"
         << "resolution=" << kResolutionNames[v.resolution] << "\n"
         << "plaza_60fps=" << v.plaza_60fps << "\n"
-        << "frame_rate=" << v.frame_rate << "\n"
+        << "frame_rate=" << (v.frame_rate == kFrameRateDisplay ? std::string("display") : std::to_string(v.frame_rate))
+        << "\n"
         << "gsync=" << v.gsync << "\n"
         << "fullscreen=" << v.fullscreen << "\n"
         << "fps_overlay=" << v.fps_overlay << "\n"
@@ -246,6 +258,8 @@ void write(const Values& v) {
         << "cloud_speed=" << v.cloud_speed << "\n"
         << "wind_direction=" << v.wind_direction << "\n"
         << "mouse_direct=" << v.mouse_direct << "\n"
+        << "mouse_camera=" << v.mouse_camera << "\n"
+        << "frame_gen=" << v.frame_gen << "\n"
         << "camera_distance=" << v.camera_distance << "\n"
         << "camera_height=" << v.camera_height << "\n"
         << "realistic_look=" << v.realistic_look << "\n"
@@ -293,7 +307,7 @@ void load() {
         else if (key == "fps120")
             v.fps120 = number != 0; // before frame_rate existed
         else if (key == "frame_rate") {
-            v.frame_rate = number;
+            v.frame_rate = parse_frame_rate(value.c_str());
             saw_frame_rate = true;
         } else if (key == "gsync")
             v.gsync = number != 0;
@@ -351,6 +365,10 @@ void load() {
             v.wind_direction = number;
         else if (key == "mouse_direct")
             v.mouse_direct = number != 0;
+        else if (key == "mouse_camera")
+            v.mouse_camera = number != 0;
+        else if (key == "frame_gen")
+            v.frame_gen = number != 0;
         else if (key == "camera_distance")
             v.camera_distance = number;
         else if (key == "camera_height")
@@ -427,6 +445,8 @@ void load() {
     if (env_set("RBREW_CAMERA_DISTANCE")) v.camera_distance = std::atoi(std::getenv("RBREW_CAMERA_DISTANCE"));
     if (env_set("RBREW_CAMERA_HEIGHT")) v.camera_height = std::atoi(std::getenv("RBREW_CAMERA_HEIGHT"));
     if (env_set("RBREW_MOUSE_DIRECT")) v.mouse_direct = std::getenv("RBREW_MOUSE_DIRECT")[0] == '1';
+    if (env_set("RBREW_MOUSE_CAMERA")) v.mouse_camera = std::getenv("RBREW_MOUSE_CAMERA")[0] == '1';
+    if (env_set("RBREW_FRAMEGEN")) v.frame_gen = !env_off("RBREW_FRAMEGEN");
     if (env_set("RBREW_CLOUD_SPEED")) v.cloud_speed = std::atoi(std::getenv("RBREW_CLOUD_SPEED"));
     if (env_set("RBREW_FOCUS_BLUR")) v.focus_blur = std::atoi(std::getenv("RBREW_FOCUS_BLUR"));
     if (env_set("RBREW_VIGNETTE")) v.vignette = std::atoi(std::getenv("RBREW_VIGNETTE"));
@@ -443,7 +463,8 @@ void load() {
     if (env_set("RBREW_PLAZA_60FPS")) v.plaza_60fps = !env_off("RBREW_PLAZA_60FPS");
     if (const char* f = std::getenv("RBREW_FPS120"); f && *f)
         v.frame_rate = !std::strcmp(f, "interp") ? (v.frame_rate == 180 ? 180 : 120) : 60;
-    if (const char* f = std::getenv("RBREW_FRAME_RATE"); f && *f) v.frame_rate = std::atoi(f); // 30, 60, 120, 180
+    // 30, 60, 120, 165, 180, 240 or "display"
+    if (const char* f = std::getenv("RBREW_FRAME_RATE"); f && *f) v.frame_rate = parse_frame_rate(f);
     normalize(v);
     if (const char* m = std::getenv("RBREW_VK_PRESENT_MODE"); m && *m) v.gsync = !std::strcmp(m, "immediate");
     if (env_set("RBREW_FPS_OVERLAY")) v.fps_overlay = !env_off("RBREW_FPS_OVERLAY");

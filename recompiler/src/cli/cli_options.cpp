@@ -138,6 +138,8 @@ std::optional<CliOptions> parse(int argc, char** argv) {
             opts.manifest_dirs.emplace_back(argv[++i]);
         } else if (arg == "--emit-dir" && i + 1 < argc) {
             opts.manifest_emit_dir = argv[++i];
+        } else if (arg == "--assume-xer-so-clear") {
+            opts.assume_xer_so_clear = true;
         } else if (arg == "--allow-image-mismatch") {
             opts.allow_image_mismatch = true;
         } else if ((arg == "--functions-per-file" || arg == "-F") && i + 1 < argc) {

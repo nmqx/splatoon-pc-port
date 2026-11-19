@@ -16,7 +16,9 @@
 #include "gx2_weather_collision.h"
 #include "gx2_weather_shaders.h"
 #include "gx2_env_light.h"
+#include "gx2_frame_interp.h"
 #include "vk/gx2_render_vk_state.h"
+#include "vk/gx2_vk_capture.h"
 #include "vk/gx2_vk_shader.h"
 #include "../../runtime/port_settings.h"
 #include "../../runtime/native_control_defaults.h"
@@ -186,19 +188,20 @@ bool prepare() {
 }
 
 VkDescriptorSet allocate_set() {
+    constexpr unsigned kPoolSets = 256;
     const auto device = gx2vk::device();
-    if (s_pool_sets == 64) {
+    if (s_pool_sets == kPoolSets) {
         const auto retired = s_pool;
         gx2vk::defer([device, retired] { vkDestroyDescriptorPool(device, retired, nullptr); });
         s_pool = VK_NULL_HANDLE;
         s_pool_sets = 0;
     }
     if (!s_pool) {
-        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64 * 17},
-                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 * 3},
-                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64}};
+        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kPoolSets * 17},
+                                              {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kPoolSets * 3},
+                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kPoolSets}};
         VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        info.maxSets = 64;
+        info.maxSets = kPoolSets;
         info.poolSizeCount = 3;
         info.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(device, &info, nullptr, &s_pool) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -755,7 +758,17 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
         !gx2vk::format_supports(color.desc.format, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT))
         return false;
     gx2r::end_rendering();
+    struct PauseCapture {
+        bool was = gx2vk::capture::enabled();
+        PauseCapture() {
+            if (was) gx2vk::capture::set_enabled(false);
+        }
+        ~PauseCapture() {
+            if (was) gx2vk::capture::set_enabled(true);
+        }
+    };
     if (s_cover_loading.valid() && s_cover_loading.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        PauseCapture pause;
         try {
             if (!set_rain_cover(s_cover_loading.get()))
                 RBREW_LOG_WARN("weather", "Collision cover unavailable; rain stays off");
@@ -772,7 +785,12 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
     f.camera = camera;
     f.settings = settings;
     const uint32_t w = color.desc.width, h = color.desc.height;
-    update(f, w, h);
+    {
+        // LUTs and the world-space cloud dome update once per game frame;
+        // in-between frames reuse them instead of dispatching clouds 3x.
+        PauseCapture pause;
+        update(f, w, h);
+    }
     ++s_frame_index;
     Params p{};
     fill(p, f, w, h);
@@ -902,7 +920,11 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
         }();
         s_history_valid =
             s_history_valid && s_history && s_next_history && s_history.desc.width == w && s_history.desc.height == h;
-        if (taa_enabled && settings.antialiasing && !(settings.camera_motion && settings.cinema_mode) &&
+        // Skip temporal TAA accumulation while 120/165 FPS in-between replay is
+        // capturing: replaying TAA with frame N's camera matrices on a blended
+        // in-between view ghosts against s_history (FXAA + AO + bloom + sky/clouds
+        // + colour grade all stay active on every in-between frame).
+        if (taa_enabled && !gx2interp::capturing() && settings.antialiasing && !(settings.camera_motion && settings.cinema_mode) &&
             make_image(s_history, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1,
                        kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
             make_image(s_next_history, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1, kStorageSampled) &&

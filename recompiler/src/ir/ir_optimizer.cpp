@@ -348,7 +348,11 @@ bool is_bit0_value(const std::vector<IRInstr>& instrs, const IROperand& operand,
         if (def.opcode == Opcode::Shr && def.operands.size() == 2) {
             const auto* src = std::get_if<RegOp>(&def.operands[0]);
             const auto* amount = std::get_if<ImmOp>(&def.operands[1]);
-            return src && src->reg.kind == RegKind::XER && amount && amount->value == 31;
+            if (!amount || amount->value != 31 || !src) return false;
+            if (src->reg.kind == RegKind::XER) return true;
+            // emit_cr_so: `t = xer; t = t >> 31` (the shift reads its own
+            // temp): any 32-bit value shifted right by 31 carries bit 0 only.
+            return src->reg.kind == RegKind::Temp;
         }
         if (def.opcode == Opcode::And && def.operands.size() == 2) {
             const auto* mask = std::get_if<ImmOp>(&def.operands[1]);

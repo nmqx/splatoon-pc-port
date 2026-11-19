@@ -16,6 +16,7 @@
 #include "../../runtime/splatoon_diagnostics.h"
 #include "../../nn_nfp/nn_nfp.h"
 #include "../gx2_perf.h"
+#include "../gx2_frame_interp.h"
 
 #include <imgui.h>
 #include <imgui_impl_sdl2.h>
@@ -101,39 +102,40 @@ int s_capture_action = 0;
 MenuPage s_focused_page = MenuPage::Keyboard;
 int s_focused_action = -1; // binding row focused for keyboard/gamepad Clear
 
-const char* const kResolutionLabels[rs::kResolutionCount] = {"720p (console)", "1080p", "1440p", "Display"};
+const char* const kResolutionLabels[rs::kResolutionCount] = {"720p (console)", "1080p", "1440p", "Écran"};
 // GamePad input, with what it does in Splatoon where it is fixed.
-const char* const kActionLabels[rs::kActionCount] = {"A  (Confirm)",
-                                                     "B ",
-                                                     "X (Jump)",
-                                                     "Y",
+const char* const kActionLabels[rs::kActionCount] = {"A  (valider)",
+                                                     "B  (retour)",
+                                                     "X  (saut)",
+                                                     "Y  (recentrer la caméra)",
                                                      "L",
-                                                     "R  (sub weapon)",
-                                                     "ZL  (squid form)",
-                                                     "ZR  (shoot)",
-                                                     "+  (Plus)",
-                                                     "-  (Minus)",
+                                                     "R  (arme secondaire)",
+                                                     "ZL  (calamar)",
+                                                     "ZR  (tirer)",
+                                                     "+",
+                                                     "-",
                                                      "HOME",
-                                                     "D-pad up",
-                                                     "D-pad down",
-                                                     "D-pad left",
-                                                     "D-pad right",
-                                                     "Left stick click",
-                                                     "Right stick click",
-                                                     "Move forward",
-                                                     "Move back",
-                                                     "Move left",
-                                                     "Move right"};
+                                                     "Croix haut",
+                                                     "Croix bas",
+                                                     "Croix gauche",
+                                                     "Croix droite",
+                                                     "Clic stick gauche",
+                                                     "Clic stick droit  (arme spéciale)",
+                                                     "Avancer",
+                                                     "Reculer",
+                                                     "Gauche",
+                                                     "Droite"};
 
 std::string key_name(int binding) {
     if (binding == rs::kUnbound) return "-";
     if (binding >= rs::kMouseBase) {
         switch (binding - rs::kMouseBase) {
-        case SDL_BUTTON_LEFT: return "Mouse left";
-        case SDL_BUTTON_MIDDLE: return "Mouse middle";
-        case SDL_BUTTON_RIGHT: return "Mouse right";
-        case SDL_BUTTON_X1: return "Mouse 4";
-        default: return "Mouse 5";
+        case SDL_BUTTON_LEFT: return "Clic gauche";
+        case SDL_BUTTON_MIDDLE: return "Clic molette";
+        case SDL_BUTTON_RIGHT: return "Clic droit";
+        case SDL_BUTTON_X1: return "Souris 4 (arrière)";
+        case SDL_BUTTON_X2: return "Souris 5 (avant)";
+        default: return "Souris " + std::to_string(binding - rs::kMouseBase);
         }
     }
     const char* name = SDL_GetScancodeName(SDL_Scancode(binding));
@@ -340,10 +342,28 @@ void build_performance_window(const diag::OverlayMetrics& metrics, VkExtent2D ex
         ImGui::End();
         return;
     }
+    // The game's counter is its swaps: 60 a second, also while the in-between
+    // frames (gx2_frame_interp.h) present two to four pictures per step. Both
+    // are shown: pictures really presented, and game steps.
     const float fps = metrics.avg_fps > 0.0f ? metrics.avg_fps : metrics.current_fps;
-    ImGui::TextColored(fps_color(fps), "%.0f FPS", fps > 0.0f ? fps : 0.0f);
+    const gx2vk::PresentRate presented = gx2vk::present_rate(1.0);
+    const float shown = presented.fps > 0.0f ? presented.fps : fps;
+    ImGui::TextColored(fps_color(fps), "%.0f FPS presented", shown > 0.0f ? shown : 0.0f);
     ImGui::SameLine();
     ImGui::TextDisabled("(F3 toggles)");
+    ImGui::Text("Game    %.1f steps/s", fps > 0.0f ? fps : 0.0f);
+    if (presented.fps > 0.0f) ImGui::Text("Longest gap %.1f ms (last second)", presented.worst_ms);
+    {
+        const gx2interp::Status interp = gx2interp::status();
+        if (interp.active)
+            ImGui::Text("In-between frames: %.0f/s now, target %.0f%s", interp.level_fps, interp.target_fps,
+                        interp.capped ? " (display limit)" : "");
+        else if (gx2interp::mode_enabled())
+            ImGui::TextDisabled("In-between frames: paused (target %.0f)", interp.target_fps);
+        if (interp.display_hz > 0.0f)
+            ImGui::TextDisabled("Display %.1f Hz%s", interp.display_hz,
+                                interp.vrr ? ", variable refresh" : interp.locked ? ", one picture per refresh" : "");
+    }
     ImGui::Separator();
     ImGui::Text("Frame  %.2f ms (avg)", fps > 0.0f ? 1000.0f / fps : 0.0f);
     ImGui::Text("1%% low %.0f FPS", metrics.low_1pct_fps);
@@ -468,13 +488,29 @@ void build_simple_overlay(const diag::OverlayMetrics& metrics) {
         ImGui::End();
         return;
     }
-    const float fps = metrics.current_fps > 0.0f ? metrics.current_fps : metrics.avg_fps;
+    // Two numbers: pictures really presented per second (counted at the
+    // present itself) and game steps per second (the game's swaps). With the
+    // in-between frames on, the first is 120 to 240 while the second stays 60.
+    const float game = metrics.current_fps > 0.0f ? metrics.current_fps : metrics.avg_fps;
+    const gx2vk::PresentRate presented = gx2vk::present_rate(0.5);
+    const float fps = presented.fps > 0.0f ? presented.fps : game;
+    const gx2interp::Status interp = gx2interp::status();
     s_max_fps = std::max(s_max_fps, fps);
     if (fps > 0.0f)
-        ImGui::TextColored(fps_color(fps), "%.0f FPS", fps);
+        ImGui::TextColored(fps_color(game), "%.0f FPS", fps);
     else
         ImGui::TextDisabled("-- FPS");
-    ImGui::Text("%.2f ms", metrics.frame_time_ms);
+    if (interp.active)
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.0f, 1.0f), "images réelles x%.2f", game > 1.0f ? fps / game : 0.0f);
+    else if (gx2interp::mode_enabled())
+        ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.35f, 1.0f), "images en plus : en pause");
+    if (game > 0.0f)
+        ImGui::TextColored(fps_color(game), "jeu %.0f pas/s", game);
+    else
+        ImGui::TextDisabled("jeu -- pas/s");
+    if (interp.active && interp.level_fps + 1.0f < interp.target_fps)
+        ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.35f, 1.0f), "réduit (cible %.0f)", interp.target_fps);
+    ImGui::Text("%.2f ms", fps > 0.0f ? 1000.0f / fps : metrics.frame_time_ms);
     if (s_max_fps > 0.0f)
         ImGui::Text("max %.0f FPS", s_max_fps);
     else
@@ -526,7 +562,7 @@ void build_controls_page(MenuPage page) {
         ImGui::SameLine(220);
         const int binding = keyboard ? v.keys[action] : v.pad[action];
         const bool capturing = s_capture && s_capture_page == page && s_capture_action == action;
-        const std::string label = capturing ? "press ..." : keyboard ? key_name(binding) : pad_name(binding);
+        const std::string label = capturing ? "appuie ..." : keyboard ? key_name(binding) : pad_name(binding);
         if (ImGui::Button(label.c_str(), ImVec2(180, 0))) {
             s_capture = true;
             s_capture_page = page;
@@ -540,18 +576,18 @@ void build_controls_page(MenuPage page) {
         if (ImGui::SmallButton("x")) bind_action(page, action, rs::kUnbound);
         ImGui::PopID();
     }
-    if (ImGui::Button("Reset to defaults")) {
+    if (ImGui::Button("Par défaut")) {
         auto defaults = rs::get();
         rs::default_bindings(defaults.keys, defaults.pad);
         rs::set(defaults);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Back")) {
+    if (ImGui::Button("Retour")) {
         s_menu_page = MenuPage::Main;
         s_capture = false;
     }
-    ImGui::TextDisabled("%s", keyboard ? "Enter: change    Delete: clear    Esc: close"
-                                       : "Cross: change    Square: clear    Circle: back");
+    ImGui::TextDisabled("%s", keyboard ? "Clic ou Entrée : changer (touche, clic, clic molette, boutons latéraux)    Suppr : effacer"
+                                       : "Croix/A : changer    Carre/X : effacer    Rond/B : retour");
 }
 
 // The emulated GamePad touchpoint: a file browser for amiibo dumps (.bin).
@@ -651,10 +687,10 @@ void build_settings_window() {
     bool open = true;
     // One window ID for every page (the title shows the page).
     const char* title = s_graphics_page != gx2_graphics_menu::Page::None ? gx2_graphics_menu::title(s_graphics_page)
-                        : s_menu_page == MenuPage::Main                  ? "Settings"
-                        : s_menu_page == MenuPage::Keyboard              ? "Keyboard & mouse controls"
+                        : s_menu_page == MenuPage::Main                  ? "Paramètres"
+                        : s_menu_page == MenuPage::Keyboard              ? "Touches clavier et souris"
                         : s_menu_page == MenuPage::Amiibo                ? "amiibo"
-                                                                         : "Controller controls";
+                                                                         : "Boutons manette";
     const std::string window = std::string(title) + "###settings";
     if (!ImGui::Begin(window.c_str(), &open)) {
         ImGui::End();
@@ -680,53 +716,120 @@ void build_settings_window() {
     }
     auto v = rs::get();
     bool dirty = false;
-    if (ImGui::Button("Resume")) set_menu_open(false);
+    if (ImGui::Button("Reprendre")) set_menu_open(false);
     if (rbrew_nfp::searching()) {
         ImGui::SameLine();
-        if (ImGui::Button("Scan amiibo")) s_menu_page = MenuPage::Amiibo;
+        if (ImGui::Button("Scanner un amiibo")) s_menu_page = MenuPage::Amiibo;
     }
-    if (const auto page = gx2_graphics_menu::build_main_rows(v, dirty); page != gx2_graphics_menu::Page::None)
-        s_graphics_page = page;
+
+    ImGui::SeparatorText("Affichage");
     int resolution = v.resolution;
-    if (ImGui::Combo("Render resolution", &resolution, kResolutionLabels, rs::kResolutionCount)) {
+    if (ImGui::Combo("Résolution de rendu", &resolution, kResolutionLabels, rs::kResolutionCount)) {
         v.resolution = resolution;
         dirty = true;
     }
     if (v.resolution != rs::active_resolution()) {
         ImGui::SameLine();
-        ImGui::TextDisabled("(after restart)");
+        ImGui::TextDisabled("(au prochain lancement)");
     }
-    dirty |= ImGui::Checkbox("Plaza 60 FPS", &v.plaza_60fps);
     bool fullscreen = s_fullscreen_mirror.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Fullscreen", &fullscreen)) {
+    if (ImGui::Checkbox("Plein écran (F11)", &fullscreen)) {
         s_fullscreen_value.store(fullscreen, std::memory_order_relaxed);
         s_fullscreen_requested.store(true, std::memory_order_relaxed);
         v.fullscreen = fullscreen;
         dirty = true;
     }
-    bool overlay = visible();
-    if (ImGui::Checkbox("Performance overlay (F3)", &overlay)) {
-        set_visible(overlay);
-        v.fps_overlay = overlay;
-        dirty = true;
+    dirty |= ImGui::Checkbox("G-Sync / FreeSync", &v.gsync);
+    {
+        // Real in-between frames (gx2_frame_interp.h): the scene is drawn again
+        // with every transform between two game steps, at the chosen rate.
+        // The realistic shaders may stay on (user's choice, 2026-11-19): their
+        // sky, clouds and picture effects are then shown as in the game's own
+        // frame in the in-between frames (not re-aimed). The optical-flow
+        // frame gen replaces them when on. Each label says what this display
+        // will show.
+        static const int kRateValues[] = {60, 120, 165, 180, 240, rs::kFrameRateDisplay};
+        constexpr int kRateCount = int(sizeof(kRateValues) / sizeof(kRateValues[0]));
+        static char labels[kRateCount][96];
+        const char* items[kRateCount];
+        int rate = 0;
+        for (int i = 0; i < kRateCount; ++i) {
+            const int value = kRateValues[i];
+            if (value == v.frame_rate) rate = i;
+            if (value == 60)
+                std::snprintf(labels[i], sizeof(labels[i]), "60");
+            else {
+                const gx2interp::Status shown = gx2interp::describe(value, v.gsync);
+                if (value == rs::kFrameRateDisplay) {
+                    if (shown.display_hz > 0.0f)
+                        std::snprintf(labels[i], sizeof(labels[i]), "Écran (%.0f vraies images, écran %.0f Hz)",
+                                      shown.target_fps, shown.display_hz);
+                    else
+                        std::snprintf(labels[i], sizeof(labels[i]), "Écran (une image par rafraîchissement)");
+                } else if (shown.capped)
+                    std::snprintf(labels[i], sizeof(labels[i]), "%d (vraies images, %.0f sur cet écran)", value,
+                                  shown.target_fps);
+                else
+                    std::snprintf(labels[i], sizeof(labels[i]), "%d (vraies images)", value);
+            }
+            items[i] = labels[i];
+        }
+        ImGui::BeginDisabled(v.frame_gen);
+        if (ImGui::Combo("Images par seconde", &rate, items, kRateCount)) {
+            v.frame_rate = kRateValues[rate];
+            v.fps120 = v.frame_rate != 60;
+            dirty = true;
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Le jeu garde ses 60 pas de logique par seconde ; chaque image en plus est\n"
+                              "redessinée par le jeu aux positions intermédiaires (pas d'images inventées).\n"
+                              "Écran : une image par rafraîchissement (avec G-Sync : juste en dessous).\n"
+                              "Au-dessus de ce que l'écran affiche, le port s'arrête à la limite de l'écran.\n"
+                              "Coûte du CPU : le port baisse la cadence quand le jeu ne suit plus.\n"
+                              "Avec les graphismes améliorés, le ciel, les nuages et les effets d'image\n"
+                              "des images intermédiaires restent ceux de l'image du jeu.");
+        // The realistic shaders (sky, clouds, picture effects): one checkbox,
+        // since this menu has no graphics page.
+        static int last_quality = rs::kShadersHigh;
+        if (v.shader_quality != rs::kShadersOff) last_quality = v.shader_quality;
+        bool shaders = v.shader_quality != rs::kShadersOff;
+        if (ImGui::Checkbox("Graphismes améliorés", &shaders)) {
+            v.shader_quality = shaders ? last_quality : rs::kShadersOff;
+            dirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Ciel, nuages, lumière et effets d'image du port. Décoché : le jeu d'origine,\n"
+                              "plus léger pour le CPU.");
     }
+    dirty |= ImGui::Checkbox("Frame gen par flux optique (expérimental)", &v.frame_gen);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Le GPU invente les images entre deux images du jeu (NVIDIA RTX 30 et plus).\n"
+                          "Artefacts quand la caméra bouge vite. Remplace le mode 120/180.");
+    dirty |= ImGui::Checkbox("Plaza à 60 FPS", &v.plaza_60fps);
     bool simple = simple_overlay();
-    if (ImGui::Checkbox("Simple FPS overlay", &simple)) {
+    if (ImGui::Checkbox("Compteur FPS", &simple)) {
         set_simple_overlay(simple);
         v.simple_overlay = simple;
         dirty = true;
     }
-    dirty |= ImGui::Checkbox("Controller gyro", &v.gyro);
-    dirty |= ImGui::SliderInt("Gyro sensitivity", &v.gyro_sensitivity, 25, 300, "%d %%");
-    dirty |= ImGui::Checkbox("Invert gyro up/down", &v.gyro_invert_pitch);
-    dirty |= ImGui::SliderInt("Mouse sensitivity", &v.mouse_sensitivity, 25, 400, "%d %%");
-    dirty |= ImGui::SliderInt("Volume", &v.volume, 0, 100, "%d %%");
-    dirty |= ImGui::Checkbox("Confirm before quitting", &v.confirm_quit);
-    if (ImGui::Button("Keyboard & mouse controls")) s_menu_page = MenuPage::Keyboard;
-    if (ImGui::Button("Controller controls")) s_menu_page = MenuPage::Controller;
-    if (ImGui::Button("Quit game")) {
-        open_quit_confirmation();
+
+    ImGui::SeparatorText("Commandes");
+    dirty |= ImGui::SliderInt("Sensibilité souris", &v.mouse_sensitivity, 25, 400, "%d %%");
+    dirty |= ImGui::Checkbox("Gyro de la manette", &v.gyro);
+    if (v.gyro) {
+        dirty |= ImGui::SliderInt("Sensibilité gyro", &v.gyro_sensitivity, 25, 300, "%d %%");
+        dirty |= ImGui::Checkbox("Inverser le gyro haut/bas", &v.gyro_invert_pitch);
     }
+    if (ImGui::Button("Touches clavier et souris")) s_menu_page = MenuPage::Keyboard;
+    ImGui::SameLine();
+    if (ImGui::Button("Boutons manette")) s_menu_page = MenuPage::Controller;
+
+    ImGui::SeparatorText("Son");
+    dirty |= ImGui::SliderInt("Volume", &v.volume, 0, 100, "%d %%");
+
+    ImGui::Separator();
+    if (ImGui::Button("Quitter le jeu")) open_quit_confirmation();
     if (dirty) rs::set(v);
     ImGui::End();
     if (!open) set_menu_open(false);
@@ -747,15 +850,15 @@ void build_quit_confirmation_popup() {
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
         s_quit_confirm_open.store(true, std::memory_order_relaxed);
 
-        ImGui::Text("Are you sure you want to quit?");
+        ImGui::Text("Quitter le jeu ?");
         ImGui::Spacing();
-        ImGui::Checkbox("Don't ask again", &s_dont_ask_again);
+        ImGui::Checkbox("Ne plus demander", &s_dont_ask_again);
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
 
         const float button_width = 120.0f;
-        if (ImGui::Button("Quit", ImVec2(button_width, 0))) {
+        if (ImGui::Button("Quitter", ImVec2(button_width, 0))) {
             if (s_dont_ask_again) {
                 auto settings = rs::get();
                 settings.confirm_quit = false;
@@ -767,7 +870,7 @@ void build_quit_confirmation_popup() {
         }
 
         ImGui::SameLine();
-        const bool cancel_clicked = ImGui::Button("Cancel", ImVec2(button_width, 0));
+        const bool cancel_clicked = ImGui::Button("Annuler", ImVec2(button_width, 0));
         ImGui::SetItemDefaultFocus();
 
         const bool cancel_requested =
