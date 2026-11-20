@@ -42,6 +42,28 @@ else()
 endif()
 set(HAVE_MINIAUDIO ON)
 
+# Static zlib (symbols prefixed z_ with Z_PREFIX) for the game's own zlib125 imports
+# (os/stubs/zlib_guest.cpp): the executable must not depend on libz.dll, the updater ships
+# Splatoon.exe alone. Source: the zlib tarball vcpkg already downloaded, else the release on GitHub.
+file(GLOB _rbrew_zlib_tarballs "${CMAKE_CURRENT_SOURCE_DIR}/../../build/vcpkg/downloads/madler-zlib-*.tar.gz")
+if(_rbrew_zlib_tarballs)
+    list(GET _rbrew_zlib_tarballs 0 _rbrew_zlib_url)
+else()
+    set(_rbrew_zlib_url "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz")
+endif()
+include(FetchContent)
+FetchContent_Declare(rbrew_zlib URL "${_rbrew_zlib_url}" SOURCE_SUBDIR "__none__")
+FetchContent_MakeAvailable(rbrew_zlib)
+set(_rbrew_zlib_sources)
+foreach(_name adler32 compress crc32 deflate infback inffast inflate inftrees trees uncompr zutil)
+    list(APPEND _rbrew_zlib_sources "${rbrew_zlib_SOURCE_DIR}/${_name}.c")
+endforeach()
+enable_language(C)
+add_library(rbrew_zlib_static STATIC ${_rbrew_zlib_sources})
+target_compile_definitions(rbrew_zlib_static PUBLIC Z_PREFIX)
+set_target_properties(rbrew_zlib_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set(RBREW_ZLIB_HEADER "${rbrew_zlib_SOURCE_DIR}/zlib.h")
+
 add_subdirectory(third_party/cemu_shader)
 
 # Manifest
@@ -202,6 +224,7 @@ add_library(gambit_runtime STATIC
     os/vpad/vpad.cpp
     os/padscore/padscore.cpp
     os/stubs/stubs.cpp
+    os/stubs/zlib_guest.cpp
     os/nsysnet/nsysnet.cpp
     hooks/gx2_camera_hooks.cpp
     hooks/mouse_aim.cpp
@@ -268,6 +291,8 @@ target_link_libraries(gambit_runtime PUBLIC
 # Dear ImGui (docking branch, fetched at configure time): the performance
 # overlay backend. PRIVATE: only the GX2 Vulkan layer uses it.
 target_link_libraries(gambit_runtime PRIVATE imgui)
+target_link_libraries(gambit_runtime PRIVATE rbrew_zlib_static)
+set_source_files_properties(os/stubs/zlib_guest.cpp PROPERTIES COMPILE_DEFINITIONS "RBREW_ZLIB_HEADER=\"${RBREW_ZLIB_HEADER}\"")
 
 if(WIN32)
     target_link_libraries(gambit_runtime PUBLIC ws2_32 winmm)

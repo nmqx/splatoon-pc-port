@@ -961,7 +961,9 @@ static void MICClose(CPUState* cpu) {
 // ---------------------------------------------------------------------------
 #include "stubs_addrs.h"
 
+void zlib_guest_register(CPUState* cpu); // zlib_guest.cpp
 void stubs_register(CPUState* cpu) {
+    zlib_guest_register(cpu);
 #define REG(name) rbrew_register_func(cpu, ADDR_##name, name)
 #define REG_AT(addr_sym, fn) rbrew_register_func(cpu, ADDR_##addr_sym, fn)
 
