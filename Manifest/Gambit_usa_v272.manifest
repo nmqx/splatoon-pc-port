@@ -2263,10 +2263,18 @@ hash = 0xFFB4A7264415BA63
 [hooks]
 # Guest function entries wrapped so the port can attach opt-in host hooks.
 # Without a registered hook, a wrapper calls the original body directly.
-hash = 0x46494373E607F598
+hash = 0x6068E9CEDE54528A
 0x028E6CFC = hook  # sead::LookAtCamera::doUpdateMatrix (v16 0281ADB4; gx2_env_light.cpp)
 0x0200E410 = hook  # agl camera: set field of view in degrees (v16 0200F24C)
 0x0285C3A0 = hook  # message broadcast loop guard (v288 0285C3D0; hooks/broadcast_guard.cpp)
+# Online diagnostics (hooks/trace_hooks.cpp, RBREW_TRACE_FUNCS); without a registered hook they call the original.
+0x028C2218 = hook  # lobby: schedule usable (v16 027F6838)
+0x028C63A4 = hook  # lobby: online check (v16 027FA9BC)
+0x027F6284 = hook  # lobby state cSleep (v16 027464C4)
+0x027F62FC = hook  # lobby state cPlazaOffline (v16 0274653C)
+0x021BF5F0 = hook  # VSSetting parser (v16 02184868)
+0x0285E2CC = hook  # BOSS news task step (v16 027937B0)
+0x0285F3F0 = hook  # BOSS task re-register (v16 027948D4)
 
 [patches]
 # 0xADDR = instruction, applied when this manifest is used to recompile

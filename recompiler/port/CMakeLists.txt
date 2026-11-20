@@ -161,6 +161,9 @@ if(RBREW_PLT_GENERATED)
         BYPRODUCTS ${RBREW_PLT_FILES}
         COMMAND "${Python3_EXECUTABLE}" "${RBREW_PLT_RESOLVER}" emit
                 --manifest "${RBREW_MANIFEST_PATH}" --out "${CMAKE_CURRENT_SOURCE_DIR}"
+        # game_revision.h / game_branch_tables.h too: they are shared by the build trees like the PLT headers.
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_revision_header.py"
+                --manifest "${RBREW_MANIFEST_PATH}" --out-dir "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
         COMMENT "PLT addresses from ${RBREW_MANIFEST_PATH}"
         VERBATIM)
 endif()
@@ -205,6 +208,7 @@ add_library(gambit_runtime STATIC
     hooks/player_anim.cpp
     hooks/branch_tables.cpp
     hooks/broadcast_guard.cpp
+    hooks/trace_hooks.cpp
     loader/gambit_loader.cpp
     loader/native_console_profile.cpp
     runtime/splatoon_diagnostics.cpp

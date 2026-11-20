@@ -25,11 +25,18 @@ struct Input {
     float lx = 0, ly = 0, rx = 0, ry = 0;
     unsigned touched = 0, x = 0, y = 0; // GamePad pixels, 854x480
 };
-inline std::vector<Input> read_inputs(std::istream& stream) {
+// A line "relative" makes the frames count from the frame the file was (re)loaded at, so a test
+// can steer a running game by rewriting the script (it is re-read about once a second).
+inline std::vector<Input> read_inputs(std::istream& stream, bool* relative = nullptr) {
     std::vector<Input> inputs;
     std::string line;
     while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
+        if (line == "relative") {
+            if (relative) *relative = true;
+            continue;
+        }
         Input input;
         std::istringstream row(line);
         if (!(row >> std::dec >> input.frame >> std::hex >> input.buttons >> std::dec >> input.lx >> input.ly >>
@@ -63,11 +70,19 @@ inline bool scripted_input(Input& input) {
         const auto stamp = std::filesystem::last_write_time(path, error);
         if (!error && stamp != modified) {
             std::ifstream file(path);
-            auto updated = read_inputs(file);
+            bool relative = false;
+            auto updated = read_inputs(file, &relative);
             if (!updated.empty()) {
+                if (relative)
+                    for (Input& i : updated) i.frame += frame.load(std::memory_order_relaxed);
                 inputs = std::move(updated);
                 modified = stamp;
             }
+        }
+        // <script>.now: the current frame, for a test that steers the game.
+        if (FILE* now = std::fopen((std::string(path) + ".now").c_str(), "w")) {
+            std::fprintf(now, "%u\n", frame.load(std::memory_order_relaxed));
+            std::fclose(now);
         }
     }
     if (inputs.empty()) return false;
