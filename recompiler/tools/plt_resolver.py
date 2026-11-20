@@ -592,7 +592,9 @@ def run_rebrewu(binary, args):
     result = subprocess.run([binary] + args, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit("rebrewu %s failed:\n%s" % (" ".join(args), result.stderr.strip()))
-    return result.stdout
+    # The logger writes to stderr and prefixes some lines with their level ("[INFO] ").
+    text = result.stdout + "\n" + result.stderr
+    return "\n".join(re.sub(r"^\[[A-Z]+\]\s+", "", line) for line in text.splitlines())
 
 
 IMPORT_RE = re.compile(r"^([^!]+)!(\S+)\s+stub=0x([0-9A-Fa-f]+)$")

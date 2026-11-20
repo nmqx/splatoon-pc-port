@@ -1,5 +1,7 @@
 #pragma once
-#include "game_revision.h"
+// game_revision.h (per-revision addresses) is NOT included here: the generated game code includes
+// this header, and a revision switch would otherwise recompile every generated part. Port files
+// that need RBREW_GAME_* include runtime/game_revision.h themselves.
 #include "rbrew_diagnostics.h"
 // =============================================================================
 // RebrewU Runtime — Wii U → PC

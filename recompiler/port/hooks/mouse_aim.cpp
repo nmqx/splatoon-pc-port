@@ -42,6 +42,7 @@
 #include "mouse_aim.h"
 #include "gx2_camera_hooks.h"
 #include "../runtime/rebrewu_runtime.h"
+#include "../runtime/game_revision.h"
 #include "../runtime/native_control_defaults.h"
 #include "../runtime/port_settings.h"
 #include "../os/gx2/gx2_render.h"
@@ -67,8 +68,9 @@
 
 namespace rbrew_aim {
 namespace {
-constexpr uint32_t kThunk = 0x02D0F000u;       // free slot after the last import stub (0x02D0E098)
-constexpr uint32_t kCameraInput = 0x025D4A2Cu; // the function the patched call used to reach
+// From the manifest [globals]: v16 0x02D0F000 / 0x025D4A2C, v272 0x02DDF000 / 0x026621E8.
+constexpr uint32_t kThunk = RBREW_GAME_MOUSE_AIM_THUNK;    // free slot after the last import stub
+constexpr uint32_t kCameraInput = RBREW_GAME_CAMERA_INPUT; // the function the patched call used to reach
 constexpr uint32_t kDir = 0x1B8, kDirSmooth = 0x1E0, kStickYaw = 0x1F4, kPitch = 0xFC;
 constexpr uint32_t kPitchMax = 0x1F8, kPitchMid = 0x1FC, kPitchMin = 0x200, kLocked = 0x23C;
 // The camera's input weight: 025D4A2C sets it to 0 while the player may not
@@ -474,7 +476,7 @@ void dump_objects(const uint8_t* mem, uint32_t self, const char* tag) {
     }
 }
 int motion_option(const uint8_t* mem) {
-    const uint32_t manager = rbrew_read32(const_cast<uint8_t*>(mem), 0x101C1D34u);
+    const uint32_t manager = rbrew_read32(const_cast<uint8_t*>(mem), RBREW_GAME_CONTROL_MANAGER);
     if (!manager || uint64_t(manager) + 0x184 > WIIU_MEM_SIZE || !rbrew_memory_accessible(mem, manager + 0x17C, 8))
         return -1;
     return mem[manager + 0x182];
@@ -489,7 +491,7 @@ bool autotest_frame(uint8_t* mem, TestPad& pad) {
     ++t->n;
     if (t->motion >= 0) {
         // After vpad_apply_motion_policy (earlier in this VPADRead), before the game reads it.
-        const uint32_t manager = rbrew_read32(mem, 0x101C1D34u);
+        const uint32_t manager = rbrew_read32(mem, RBREW_GAME_CONTROL_MANAGER);
         if (manager && uint64_t(manager) + 0x184 <= WIIU_MEM_SIZE && rbrew_memory_accessible(mem, manager + 0x17C, 8))
             rbrew_write8(mem, manager + 0x182, uint8_t(t->motion));
     }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rebrewu_runtime.h"
+#include "game_revision.h"
 #include <filesystem>
 #include <fstream>
 #include <span>
@@ -108,8 +109,8 @@ inline FileResult apply_save_file(const std::filesystem::path& path) noexcept {
 inline int active_scene_type(uint8_t* mem, int* id = nullptr) {
     if (id) *id = -1;
     if (!mem) return -1;
-    const uint32_t scene_manager = rbrew_read32(mem, 0x101C9578u);
-    const uint32_t scene_types = rbrew_read32(mem, 0x101C0F28u);
+    const uint32_t scene_manager = rbrew_read32(mem, RBREW_GAME_SCENE_MANAGER); // v16 0x101C9578
+    const uint32_t scene_types = rbrew_read32(mem, RBREW_GAME_SCENE_TYPES);     // v16 0x101C0F28
     if (!scene_manager || !scene_types || uint64_t(scene_manager) + 0x160 > WIIU_MEM_SIZE ||
         uint64_t(scene_types) + 0x118 > WIIU_MEM_SIZE || !rbrew_memory_accessible(mem, scene_manager + 0x15C, 4) ||
         !rbrew_memory_accessible(mem, scene_types + 0x18, 0x100))
@@ -136,7 +137,7 @@ inline void apply_live(uint8_t* mem) {
     // at *(save_manager + 0xC) + 0x14. Keep that cached save image at
     // neutral sensitivity; the player's motion choice is preserved.
     const uint8_t* saved = nullptr;
-    constexpr uint32_t kSaveManager = 0x101C9564u;
+    constexpr uint32_t kSaveManager = RBREW_GAME_SAVE_MANAGER; // v16 0x101C9564
     const uint32_t save_manager = rbrew_read32(mem, kSaveManager);
     if (save_manager && uint64_t(save_manager) + 0x10 <= WIIU_MEM_SIZE &&
         rbrew_memory_accessible(mem, save_manager + 0x0C, 4)) {
@@ -147,7 +148,7 @@ inline void apply_live(uint8_t* mem) {
         }
     }
 
-    constexpr uint32_t kControlManager = 0x101C1D34u;
+    constexpr uint32_t kControlManager = RBREW_GAME_CONTROL_MANAGER; // v16 0x101C1D34
     const uint32_t manager = rbrew_read32(mem, kControlManager);
     if (!manager || uint64_t(manager) + 0x184 > WIIU_MEM_SIZE || !rbrew_memory_accessible(mem, manager + 0x17C, 8))
         return;

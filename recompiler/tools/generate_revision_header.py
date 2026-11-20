@@ -62,6 +62,9 @@ def render(base, update):
     lines.append('}')
     for key, value in globals_.items():
         lines.append(f'constexpr uint32_t RBREW_GAME_{key.upper()} = 0x{value:08X}u;')
+    # A port feature whose address a revision does not define is compiled out with #ifdef.
+    for key in globals_:
+        lines.append(f'#define RBREW_GAME_HAS_{key.upper()} 1')
     return '\n'.join(lines) + '\n'
 
 

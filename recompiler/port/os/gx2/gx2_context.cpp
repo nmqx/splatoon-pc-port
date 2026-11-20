@@ -1,4 +1,5 @@
 #include "../../runtime/rbrew_diagnostics.h"
+#include "../../runtime/game_revision.h"
 #include "../../runtime/texture_diagnostics.h"
 // GX2 context and initialization
 // GX2Init, GX2Shutdown, GX2SetContextState, GX2DrawDone, swap chain
@@ -688,7 +689,11 @@ static void GX2WaitForVsync(CPUState* cpu) {
         const char* v = std::getenv("RBREW_GAME_30FPS");
         return !(v && v[0] == '0');
     }();
-    const bool pacer = cpu && cpu->lr == 0x02796D7Cu;
+#ifdef RBREW_GAME_HAS_PACER_VSYNC_RETURN
+    const bool pacer = cpu && cpu->lr == RBREW_GAME_PACER_VSYNC_RETURN; // v16 0x02796D7C
+#else
+    const bool pacer = false;
+#endif
     // The pacer's object is in r31 (callee-saved) here: remember where its
     // 30 FPS-mode flag lives so GX2SwapScanBuffers can switch the game to its
     // 60 FPS mode (RBREW_GAME_60FPS_MODE).
@@ -912,7 +917,7 @@ void plaza_mode_sync(CPUState* cpu) {
     s_plaza_sync_original(cpu);
 }
 void install_plaza_60fps(CPUState* cpu) {
-#if RBREW_GAME_REVISION == 288
+#if !defined(RBREW_GAME_HAS_PLAZA_MODE_SYNC)
     (void)cpu; // revision 288 registers its own callsite (plaza_frame_rate_register)
     return;
 #else
@@ -921,7 +926,7 @@ void install_plaza_60fps(CPUState* cpu) {
         return !(v && v[0] == '0');
     }();
     static bool installed = false;
-    constexpr uint32_t kSync = 0x02A092A8u;
+    constexpr uint32_t kSync = RBREW_GAME_PLAZA_MODE_SYNC; // v16 0x02A092A8, v272 0x02AD5C44
     if (!enabled || installed || !cpu || (kSync >> 2) >= cpu->dispatch_size || !cpu->dispatch_table[kSync >> 2]) return;
     installed = true;
     s_plaza_sync_original = cpu->dispatch_table[kSync >> 2];

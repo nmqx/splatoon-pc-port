@@ -2059,3 +2059,18 @@ heap_alloc_ex_slot   = 0x02D0B900
 heap_free_slot       = 0x02D0B908
 fopen_max_slot       = 0x02D0B948
 blank_stub = 0x02D051A0
+# Port additions (hooks/mouse_aim.cpp, os/gx2/gx2_context.cpp, gx2_camera_hooks.cpp, gx2_env_light.cpp,
+# runtime/native_control_defaults.h). Every revision that supports a feature defines its addresses here.
+mouse_aim_thunk      = 0x02D0F000
+mouse_aim_callsite   = 0x025DB0D8
+camera_input         = 0x025D4A2C
+plaza_mode_sync      = 0x02A092A8
+pacer_vsync_return   = 0x02796D7C
+look_at_camera_update = 0x0281ADB4
+camera_set_fov       = 0x0200F24C
+control_manager      = 0x101C1D34
+save_manager         = 0x101C9564
+scene_manager        = 0x101C9578
+scene_types          = 0x101C0F28
+param_vtable_bool    = 0x10142660
+param_vtable_float   = 0x10143468

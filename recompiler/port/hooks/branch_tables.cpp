@@ -1,4 +1,4 @@
-// branch_tables.cpp - branch-table jumps of Splatoon v288.
+// branch_tables.cpp - branch-table jumps of the Splatoon updates (v272, v288).
 //
 // Three game functions (022302D8, 02B32454, 0228BD98) pick a case with `bctr` into a table of `b`
 // instructions. RebrewU translated only the first slot, so any other case dispatched to an
@@ -8,6 +8,7 @@
 // by gambit_tables_register(); this file points each table slot at the block it branches to, from the
 // manifest `[branch_tables]` section (generated header game_branch_tables.h).
 #include "../runtime/rebrewu_runtime.h"
+#include "../runtime/game_revision.h"
 #include "../os/vpad/vpad_addrs.h"
 #include "../runtime/game_branch_tables.h"
 #include <cstdio>
@@ -29,7 +30,8 @@ extern "C" __attribute__((weak)) void gambit_tables_register(CPUState*) {}
 #endif
 
 void branch_tables_install(CPUState* cpu) {
-#if RBREW_GAME_REVISION == 288
+    // Every revision with a `[branch_tables]` section (v272, v288); v16 has none.
+    if (kRbrewBranchTableCount == 0) return;
     gambit_tables_register(cpu);
     unsigned linked = 0;
     for (unsigned index = 0; index < kRbrewBranchTableCount; ++index) {
@@ -46,7 +48,4 @@ void branch_tables_install(CPUState* cpu) {
         }
     }
     RBREW_LOG_INFO("branch-tables", "%u table slots linked to their case blocks\n", linked);
-#else
-    (void)cpu;
-#endif
 }

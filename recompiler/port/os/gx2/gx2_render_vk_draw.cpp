@@ -1,4 +1,5 @@
 #include <utility>
+#include "../../runtime/game_revision.h"
 #include "../../runtime/rbrew_diagnostics.h"
 #include "gx2_texture_diagnostics.h"
 // gx2_render_vk_draw.cpp - Vulkan draw submission for GX2: translated
@@ -2890,7 +2891,7 @@ VkPipeline get_pipeline(const PipelineRequest& r) {
         }
         s_last_pipeline_lookup.remember(key.view(), entry);
     }
-#if RBREW_GAME_REVISION == 288
+#if RBREW_GAME_REVISION != 16 // the updates (v272, v288)
     // A demand draw must never be dropped while its pipeline compiles: one-time
     // targets such as pre-painted ink would lose their stamp for the whole session.
 #else
@@ -5516,7 +5517,7 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
                    recurring_target(S.framebuffer);
     Program* prog = resolve_active_program(mem);
     bool drawn = false;
-#if RBREW_GAME_REVISION == 288
+#if RBREW_GAME_REVISION != 16 // the updates (v272, v288)
     if (prog && !prog->compiled.ready()) {
         if (s_compile_queue) s_compile_queue->promote(prog->compiled.pending);
         (void)await_compile(prog->compiled);

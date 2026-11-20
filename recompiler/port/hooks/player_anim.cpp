@@ -17,6 +17,7 @@
 // Addresses and layouts were reverse-engineered from the v16 executable and
 // one recorded trace (docs/player-anim-trace.md); names are descriptive.
 #include "../runtime/rebrewu_runtime.h"
+#include "../runtime/game_revision.h"
 #include <array>
 #include <chrono>
 #include <cstdarg>
@@ -378,8 +379,10 @@ void player_anim_test_advance_idle(double seconds) {
 #endif
 
 void player_anim_register() {
-#if RBREW_GAME_REVISION == 288
-    // These optional hooks have only been validated for the base RPX.
+#if RBREW_GAME_REVISION != 16
+    // These optional hooks have only been validated for the base RPX (v16): the update
+    // changed the motion object and the animation table (not ported to v272).
+    RBREW_LOG_INFO("anim", "player animation hooks (idle look-around) disabled on revision %d\n", RBREW_GAME_REVISION);
     return;
 #endif
     const char* lookaround = std::getenv("RBREW_IDLE_LOOKAROUND");

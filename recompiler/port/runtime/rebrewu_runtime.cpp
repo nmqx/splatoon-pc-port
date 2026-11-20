@@ -1,5 +1,6 @@
 #include "rbrew_diagnostics.h"
 #include "rebrewu_runtime.h"
+#include "game_revision.h"
 #include "rebrewu_memory_observer.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -250,7 +251,7 @@ int32_t rbrew_run_entry(CPUState* cpu, uint32_t entry, uint32_t argc, uint32_t a
 // and last caller LR, printed as 5-second deltas by a detached host thread.
 // Read-only diagnostics; guest state is never touched.
 namespace {
-constexpr uint32_t plt_profile_begin = 0x02D00000u, plt_profile_end = 0x02D10000u;
+constexpr uint32_t plt_profile_begin = RBREW_GAME_PLT_BEGIN, plt_profile_end = RBREW_GAME_PLT_END;
 constexpr uint32_t plt_profile_slots = (plt_profile_end - plt_profile_begin) >> 2;
 struct ProfiledThread {
     const CPUState* cpu{};
@@ -367,7 +368,7 @@ const bool dispatch_instrumented = [] {
 extern "C" RBREW_HOST_API const bool rbrew_dispatch_plain = !dispatch_instrumented;
 namespace {
 void import_trace(CPUState* cpu, uint32_t guest_addr) {
-    if (!import_trace_path || guest_addr < 0x02D00000u || guest_addr >= 0x02E00000u) return;
+    if (!import_trace_path || guest_addr < RBREW_GAME_PLT_BEGIN || guest_addr >= RBREW_GAME_PLT_END) return;
     struct Slot {
         uint64_t calls = 0;
         double first = 0, last = 0;

@@ -5,6 +5,7 @@
 #include "../os/gx2/gx2_render.h"
 #include "../runtime/port_settings.h"
 #include "../runtime/rebrewu_runtime.h"
+#include "../runtime/game_revision.h"
 #include "rebrewu/logger.hpp"
 #include <algorithm>
 #include <array>
@@ -363,8 +364,8 @@ void register_hooks() {
         const char* v = std::getenv("RBREW_CAMERA_HOOK");
         return v && v[0] == '0';
     }();
-    if (!off && !rbrew_set_guest_hook(0x0281ADB4u, camera_hook)) RBREW_LOG_WARN("camera", "look-at hook unavailable");
-    if (!off && !rbrew_set_guest_hook(0x0200F24Cu, fov_hook))
+    if (!off && !rbrew_set_guest_hook(RBREW_GAME_LOOK_AT_CAMERA_UPDATE, camera_hook)) // v16 0x0281ADB4 RBREW_LOG_WARN("camera", "look-at hook unavailable");
+    if (!off && !rbrew_set_guest_hook(RBREW_GAME_CAMERA_SET_FOV, fov_hook)) // v16 0x0200F24C
         RBREW_LOG_WARN("camera", "field of view hook unavailable");
 }
 

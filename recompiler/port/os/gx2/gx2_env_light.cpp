@@ -5,6 +5,7 @@
 #include "../../hooks/gx2_guest_memory.h"
 #include "../../runtime/port_settings.h"
 #include "../../runtime/rebrewu_runtime.h"
+#include "../../runtime/game_revision.h"
 #include "../../runtime/native_control_defaults.h"
 #include "rebrewu/logger.hpp"
 #include <atomic>
@@ -30,7 +31,7 @@ using gx2sky::smoothstep;
 using gx2sky::Vec3;
 
 // agl::utl::Parameter vtables in AGMP v16 (image addresses, fixed).
-constexpr uint32_t kVtBool = 0x10142660u, kVtFloat = 0x10143468u;
+constexpr uint32_t kVtBool = RBREW_GAME_PARAM_VTABLE_BOOL, kVtFloat = RBREW_GAME_PARAM_VTABLE_FLOAT; // v16 0x10142660, 0x10143468
 constexpr uint32_t kVtableLo = 0x10000000u, kVtableHi = 0x10200000u;
 
 constexpr uint32_t crc32(const char* text) {

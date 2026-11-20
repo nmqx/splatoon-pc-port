@@ -11,6 +11,7 @@
 //  6. Call the game's entry point
 
 #include "runtime/rebrewu_runtime.h"
+#include "runtime/game_revision.h"
 #include "runtime/host_process.h"
 #include "runtime/discord_rpc.h"
 #include "runtime/splatoon_diagnostics.h"
@@ -552,7 +553,7 @@ int main(int argc, char** argv) {
         const char* report = rbrew_diagnostic_env("RBREW_STUB_REPORT");
         FILE* out = report && *report ? fopen(report, "w") : nullptr;
         unsigned blank = 0;
-        for (uint32_t addr = 0x02D05000u; addr < 0x02D10000u; addr += 4)
+        for (uint32_t addr = RBREW_GAME_PLT_BEGIN; addr < RBREW_GAME_PLT_END; addr += 4)
             if (cpu_reg.dispatch_table[addr >> 2] == blank_stub) {
                 if (out) RBREW_LOGF(out, "%08X\n", addr);
                 if (HostFunc logger = blank_import_logger(blank, addr)) cpu_reg.dispatch_table[addr >> 2] = logger;
@@ -606,7 +607,7 @@ int main(int argc, char** argv) {
     //   node + 0 : next free node
     //   node + 4 : prev free node
     {
-        static constexpr uint32_t ALLOC_BASE = 0x101D2554u;
+        static constexpr uint32_t ALLOC_BASE = RBREW_GAME_ALLOCATOR; // v16 0x101D2554
         static constexpr uint32_t SENTINEL = ALLOC_BASE + 0x20u;   // 0x101D2574
         static constexpr uint32_t EXTENT_HDR = ALLOC_BASE + 0x28u; // 0x101D257C
         // The first free node sits 8 bytes into the heap region so that the
@@ -674,7 +675,7 @@ int main(int argc, char** argv) {
 #endif
     cpu.r[1] = STACK_TOP - 8; // r1 = stack pointer (8-byte aligned)
     cpu.r[2] = 0x10008000u;   // verified FILEINFO SDA2 (offset 0x28)
-    cpu.r[13] = 0x10256C80u;  // verified FILEINFO SDA (offset 0x24)
+    cpu.r[13] = RBREW_GAME_SDA; // verified FILEINFO SDA (offset 0x24); v16 0x10256C80
 
     // 6b. Run static constructors from the GHS ctor table in .rodata.
     //
@@ -687,8 +688,8 @@ int main(int argc, char** argv) {
     // matching the original GHS initializer, so reentrant or later guest
     // startup observes that initialization has already begun.
     {
-        const uint32_t CTOR_TABLE = 0x101BFA54u;
-        const uint32_t CTOR_DONE_FLAG = 0x101CC020u;
+        const uint32_t CTOR_TABLE = RBREW_GAME_CTORS;          // v16 0x101BFA54
+        const uint32_t CTOR_DONE_FLAG = RBREW_GAME_CTORS_DONE; // v16 0x101CC020
         RBREW_LOG_INFO("PPC", "Running constructor table at 0x%08X\n", CTOR_TABLE);
         uint32_t n_ctors = rbrew_run_constructors(&cpu, CTOR_TABLE, CTOR_DONE_FLAG);
         RBREW_LOG_INFO("gambit", "Ran %u static constructors\n", n_ctors);
@@ -704,7 +705,7 @@ int main(int argc, char** argv) {
     //
     // Clearing the handle forces fn_02801A78 to take the simple fallback path
     // (L_028019F4 → MEMAllocFromDefaultHeap), which works correctly.
-    rbrew_write32(arena, 0x101C98F0u, 0u);
+    rbrew_write32(arena, RBREW_GAME_TLS_HANDLE, 0u); // v16 0x101C98F0
     RBREW_LOG_INFO("gambit", "GHS TLS allocator handle cleared\n");
 
     // The loader invokes the module entry; all application callbacks and loops

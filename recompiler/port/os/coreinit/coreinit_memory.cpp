@@ -1,4 +1,5 @@
 #include "../../runtime/rbrew_diagnostics.h"
+#include "../../runtime/game_revision.h"
 #include "../../runtime/texture_diagnostics.h"
 // coreinit memory management
 // Native application heap, disjoint from the image/stack/bootstrap reservations.

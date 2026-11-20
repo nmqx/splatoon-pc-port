@@ -16,11 +16,12 @@
 // per call site, and the game goes on (one message not delivered to everyone).
 // RBREW_BROADCAST_GUARD=0 runs the original code instead.
 #include "../runtime/rebrewu_runtime.h"
+#include "../runtime/game_revision.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-#if RBREW_GAME_REVISION == 288
+#ifdef RBREW_GAME_HAS_BROADCAST_DISPATCH // v272, v288
 namespace {
 constexpr uint32_t kBroadcast = RBREW_GAME_BROADCAST_DISPATCH;
 constexpr uint32_t kSetCurrent = RBREW_GAME_BROADCAST_SET_CURRENT; // called with (obj, -1) before and after the walk

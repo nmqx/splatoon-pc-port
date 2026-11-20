@@ -137,7 +137,11 @@ static void BOSSGetHttpStatusCode(CPUState* cpu) {
 //   Storage (0x28): +0x04 kind, +0x0B name[8]
 //   NsData  (0x58): +0x00 name[32], +0x20 Storage copy, +0x48 u64 seek
 // ---------------------------------------------------------------------------
-#include "boss_vssetting.h"
+#if RBREW_GAME_REVISION >= 272
+#include "boss_vssetting_v3.h" // v272 parser: Version <= 3, AfterFesBonusStart required
+#else
+#include "boss_vssetting.h" // v16 parser (02184868): Version == 0
+#endif
 
 // VSSetting with its DateTime set to the start of the current 4 hour UTC slot,
 // so the schedule is always "the latest" (the game only plays the Inkopolis
