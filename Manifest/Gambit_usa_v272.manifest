@@ -2286,6 +2286,8 @@ hash = Undefined
 # Splatfest data (optdat2, object [0x101E0A60] with 3 files loaded) when save +0x2C == 1 (a Splatfest
 # in progress for this save). No Splatfest data is served, so that branch is skipped: no Splatfest.
 0x028C22A4 = b 0x028C22DC
+# PIA trace function (empty in release): branch to the port thunk (hooks/pia_trace.cpp, RBREW_PIA_TRACE).
+0x02C3350C = b 0x02DDF100
 
 [globals]
 # Guest addresses the port code needs by name (not covered by a hash).
@@ -2308,6 +2310,7 @@ broadcast_dispatch   = 0x0285C3A0
 broadcast_set_current = 0x0285BD24
 # Port additions (same meaning as in Gambit_v16.manifest).
 mouse_aim_thunk      = 0x02DDF000
+pia_trace_thunk      = 0x02DDF100
 mouse_aim_callsite   = 0x02668D18
 camera_input         = 0x026621E8
 plaza_mode_sync      = 0x02AD5C44

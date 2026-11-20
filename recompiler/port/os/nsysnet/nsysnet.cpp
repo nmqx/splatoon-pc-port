@@ -467,9 +467,41 @@ bool is_private_or_loopback_ipv4(uint32_t addr_nbo) {
     return false;
 }
 
+// Second NAT check server on a one-IP server. PIA 4.9 (v272) needs nncs1 and nncs2 at two different
+// IPv4 addresses (its type-103 test, else "NatPropertyDetecter: Missing mandatory messages"), as
+// Pretendo runs them. nncs2 resolves to a placeholder address (192.0.2.2, TEST-NET, never routed);
+// packets to it go to the NEX host on port + 1000 (11025 / 11125, multiplayer/nncs_server.py) and
+// the answers come back as if from the placeholder. RBREW_NNCS_SPLIT=0 resolves nncs2 to the host.
+bool nncs_split_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RBREW_NNCS_SPLIT");
+        return !(v && v[0] == '0');
+    }();
+    return on && get_net_config().has_nex_host && get_net_config().nex_host_ipv4_nbo != 0;
+}
+constexpr uint32_t kNncs2PlaceholderHbo = 0xC0000202u; // 192.0.2.2
+constexpr uint16_t kNncs2PortOffset = 1000;
+bool is_nncs2_hostname(const char* hostname) {
+    return nncs_split_enabled() && contains_icase(hostname, "nncs2.");
+}
+void nncs_split_outgoing(struct sockaddr_in* sa) {
+    if (sa->sin_family != AF_INET || sa->sin_addr.s_addr != htonl(kNncs2PlaceholderHbo) || !nncs_split_enabled()) return;
+    sa->sin_addr.s_addr = get_net_config().nex_host_ipv4_nbo;
+    sa->sin_port = htons(uint16_t(ntohs(sa->sin_port) + kNncs2PortOffset));
+}
+void nncs_split_incoming(struct sockaddr_in* sa) {
+    if (!nncs_split_enabled() || sa->sin_addr.s_addr != get_net_config().nex_host_ipv4_nbo) return;
+    const uint16_t port = ntohs(sa->sin_port);
+    if (port == 10025 + kNncs2PortOffset || port == 10125 + kNncs2PortOffset) {
+        sa->sin_addr.s_addr = htonl(kNncs2PlaceholderHbo);
+        sa->sin_port = htons(uint16_t(port - kNncs2PortOffset));
+    }
+}
+
 void maybe_redirect_sockaddr(struct sockaddr_in* sa) {
     const auto& cfg = get_net_config();
     if (!cfg.has_nex_host || cfg.nex_host_ipv4_nbo == 0) return;
+    nncs_split_outgoing(sa);
     if (!cfg.force_redirect) return;
     if (sa->sin_family != AF_INET) return;
     // Never rewrite packets already targeted at the configured NEX host (e.g.
@@ -960,6 +992,7 @@ void recvfrom_impl(CPUState* cpu, bool is_ex) {
         RET = static_cast<uint32_t>(-1);
         return;
     }
+    nncs_split_incoming(&sa);
     if (ARG4 && rbrew_memory_accessible(MEM, ARG4, 16u)) host_to_guest_sockaddr(MEM, ARG4, &sa);
     if (ARG5 && rbrew_memory_accessible(MEM, ARG5, 4u)) rbrew_write32(MEM, ARG5, 16u);
     if (is_ex && ARG6 && ARG7 > 0) {
@@ -1303,6 +1336,7 @@ void gethostbyname_(CPUState* cpu) {
         const auto& cfg = get_net_config();
         resolved_nbo = cfg.nex_host_ipv4_nbo;
         if (resolved_nbo == 0) resolve_ipv4_nbo(cfg.nex_host.c_str(), &resolved_nbo);
+        if (is_nncs2_hostname(hostname)) resolved_nbo = htonl(kNncs2PlaceholderHbo);
     }
     if (resolved_nbo == 0) {
         if (!resolve_ipv4_nbo(hostname, &resolved_nbo)) {
@@ -1397,6 +1431,7 @@ void getaddrinfo_(CPUState* cpu) {
             const uint32_t sa_base = entry_base + 32u;
 
             auto* sin = reinterpret_cast<struct sockaddr_in*>(a->ai_addr);
+            if (is_nncs2_hostname(hostname)) sin->sin_addr.s_addr = htonl(kNncs2PlaceholderHbo);
             if (count == 0) format_sockaddr_str(*sin, first_addr, sizeof(first_addr));
             host_to_guest_sockaddr(MEM, sa_base, sin);
 

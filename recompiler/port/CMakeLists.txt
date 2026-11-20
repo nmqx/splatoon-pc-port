@@ -232,6 +232,7 @@ add_library(gambit_runtime STATIC
     hooks/branch_tables.cpp
     hooks/broadcast_guard.cpp
     hooks/trace_hooks.cpp
+    hooks/pia_trace.cpp
     loader/gambit_loader.cpp
     loader/native_console_profile.cpp
     runtime/splatoon_diagnostics.cpp
