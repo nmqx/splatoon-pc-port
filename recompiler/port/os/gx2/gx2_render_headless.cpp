@@ -48,6 +48,7 @@ bool gx2_render_query_result(uint32_t, uint32_t output, uint8_t* mem) {
 }
 void gx2_render_query_poll() {}
 void gx2_render_query_poll_completed() {}
+void gx2_render_reset_command_tracking() {}
 void gx2_render_query_service_waiter() {}
 void gx2_render_conditional_begin(uint32_t, uint32_t, bool, bool, uint8_t*) {}
 void gx2_render_conditional_end() {}

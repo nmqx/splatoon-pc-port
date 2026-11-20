@@ -21,6 +21,7 @@
 #include "gx2_host_memory.h"
 #include "gx2_attrib.h"
 #include "vk/gx2_render_vk_state.h"
+#include "vk/gx2_vk_capture.h"
 #include "vk/gx2_vk_shader.h"
 #include "vk/gx2_compile_queue.h"
 #include "vk/gx2_last_lookup.h"
@@ -314,6 +315,11 @@ void gx2r::before_submit() {
     s_dynamic_serial = 0;
 }
 
+void gx2_render_reset_command_tracking() {
+    reset_command_tracking();
+    s_dynamic_serial = 0;
+}
+
 static VkImageView attachment_view(ColorTarget& t) {
     gx2vk::ViewDesc v;
     v.type = VK_IMAGE_VIEW_TYPE_2D;
@@ -467,6 +473,7 @@ static TexObject* shadow_depth_copy(const TexObject& source) {
     const auto& cd = c.image.desc;
     if (!c.image.image || cd.format != format || cd.width != sd.width || cd.height != sd.height ||
         cd.layers != sd.layers || cd.levels != sd.levels) {
+        const VkBuffer old_staging = c.staging.buffer;
         if (c.image.image) gx2vk::destroy_image(c.image);
         if (c.staging.buffer) gx2vk::destroy_buffer(c.staging);
         gx2vk::ImageDesc desc;
@@ -476,12 +483,16 @@ static TexObject* shadow_depth_copy(const TexObject& source) {
         desc.layers = sd.layers;
         desc.levels = sd.levels;
         desc.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (!gx2vk::create_image(c.image, desc)) return nullptr;
+        if (!gx2vk::create_image(c.image, desc)) {
+            gx2vk::capture::register_staging(VK_NULL_HANDLE, old_staging);
+            return nullptr;
+        }
         VkDeviceSize bytes = 0;
         for (uint32_t l = 0; l < sd.levels; ++l)
             bytes += VkDeviceSize(std::max(1u, sd.width >> l)) * std::max(1u, sd.height >> l) * sd.layers * bpp;
         c.staging = gx2vk::create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                          gx2vk::MemoryUse::DeviceLocal);
+        gx2vk::capture::register_staging(c.staging.buffer, old_staging);
         if (!c.staging.buffer) {
             gx2vk::destroy_image(c.image);
             return nullptr;
@@ -6563,6 +6574,7 @@ void gx2r::shutdown_draw_state() {
     for (auto& [key, dummy] : s_dummies) gx2vk::destroy_image(dummy.image);
     s_dummies.clear();
     for (auto& [source, copy] : s_shadow_copies) {
+        gx2vk::capture::register_staging(VK_NULL_HANDLE, copy.staging.buffer);
         gx2vk::destroy_image(copy.image);
         gx2vk::destroy_buffer(copy.staging);
     }

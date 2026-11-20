@@ -82,6 +82,12 @@ constexpr size_t align16(size_t n) {
     return (n + 15) & ~size_t(15);
 }
 // Pass (index + 1) the packets being captured belong to; 0 outside passes.
+// Top bit marks rendering-instance ops (BeginRendering, EndRendering, Draw,
+// DrawIndexed, ClearAttachments) so skipping a tiny pass drops only its render
+// work while still replaying command-buffer state changes (e.g. vertex buffer
+// or dynamic state binds that later passes elided via redundant-state tracking).
+constexpr uint32_t kRenderOpBit = 0x80000000u;
+constexpr uint32_t kPassMask = 0x7FFFFFFFu;
 uint32_t s_pass_tag = 0;
 struct Arena {
     std::vector<std::unique_ptr<uint8_t[]>> blocks;
@@ -101,7 +107,7 @@ struct Arena {
         packets.clear();
         passes.clear();
     }
-    uint8_t* reserve(size_t body, Thunk fn) {
+    uint8_t* reserve(size_t body, Thunk fn, bool render_op = false) {
         const size_t size = sizeof(Header) + align16(body);
         if (size > kBlock) {
             complete = false;
@@ -114,7 +120,7 @@ struct Arena {
             if (block == blocks.size()) blocks.emplace_back(new uint8_t[kBlock]);
         }
         uint8_t* p = blocks[block].get() + used;
-        Header h{uint32_t(size), s_pass_tag, fn};
+        Header h{uint32_t(size), (s_pass_tag & kPassMask) | (render_op ? kRenderOpBit : 0u), fn};
         std::memcpy(p, &h, sizeof(h));
         packets.push_back({block, used});
         used += size;
@@ -143,10 +149,10 @@ bool blend_pass(uint32_t pass) {
 template <class F> void thunk(uint8_t* body, VkCommandBuffer cb) {
     (*reinterpret_cast<F*>(body))(cb);
 }
-template <class Make> void cap(size_t extra, Make make) {
+template <class Make> void cap(size_t extra, Make make, bool render_op = false) {
     using F = decltype(make(static_cast<uint8_t*>(nullptr)));
     static_assert(std::is_trivially_copyable_v<F>);
-    uint8_t* body = s_capture->reserve(align16(sizeof(F)) + extra, &thunk<F>);
+    uint8_t* body = s_capture->reserve(align16(sizeof(F)) + extra, &thunk<F>, render_op);
     if (!body) return;
     new (body) F(make(body + align16(sizeof(F))));
 }
@@ -216,7 +222,7 @@ VKAPI_ATTR void VKAPI_CALL c_SetDepthTestEnable(VkCommandBuffer cb, VkBool32 e) 
     prev.SetDepthTestEnable(cb, e);
 }
 VKAPI_ATTR void VKAPI_CALL c_EndRendering(VkCommandBuffer cb) {
-    if (capturing()) cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdEndRendering(c); }; });
+    if (capturing()) cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdEndRendering(c); }; }, true);
     s_pass_tag = 0;
     prev.EndRendering(cb);
 }
@@ -225,7 +231,7 @@ VKAPI_ATTR void VKAPI_CALL c_Draw(VkCommandBuffer cb, uint32_t v, uint32_t i, ui
     if (capturing() && !s_tf_active) {
         if (!s_capture->passes.empty()) ++s_capture->passes.back().draws;
         note_draw_depth();
-        cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdDraw(c, v, i, fv, fi); }; });
+        cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdDraw(c, v, i, fv, fi); }; }, true);
     }
     prev.Draw(cb, v, i, fv, fi);
 }
@@ -234,7 +240,7 @@ VKAPI_ATTR void VKAPI_CALL c_DrawIndexed(VkCommandBuffer cb, uint32_t n, uint32_
     if (capturing() && !s_tf_active) {
         if (!s_capture->passes.empty()) ++s_capture->passes.back().draws;
         note_draw_depth();
-        cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdDrawIndexed(c, n, i, fi, vo, fin); }; });
+        cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdDrawIndexed(c, n, i, fi, vo, fin); }; }, true);
     }
     prev.DrawIndexed(cb, n, i, fi, vo, fin);
 }
@@ -308,11 +314,14 @@ VKAPI_ATTR void VKAPI_CALL c_PushConstants(VkCommandBuffer cb, VkPipelineLayout 
 VKAPI_ATTR void VKAPI_CALL c_ClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a, uint32_t rn,
                                               const VkClearRect* r) {
     if (capturing())
-        cap(bytes(a, n) + bytes(r, rn), [=](uint8_t* p) {
-            const VkClearAttachment* ax = put(p, a, n);
-            const VkClearRect* rx = put(p, r, rn);
-            return [=](VkCommandBuffer c) { vkCmdClearAttachments(c, n, ax, rn, rx); };
-        });
+        cap(
+            bytes(a, n) + bytes(r, rn),
+            [=](uint8_t* p) {
+                const VkClearAttachment* ax = put(p, a, n);
+                const VkClearRect* rx = put(p, r, rn);
+                return [=](VkCommandBuffer c) { vkCmdClearAttachments(c, n, ax, rn, rx); };
+            },
+            true);
     prev.ClearAttachments(cb, n, a, rn, r);
 }
 bool buffer_type(VkDescriptorType t) {
@@ -420,7 +429,8 @@ VKAPI_ATTR void VKAPI_CALL c_BeginRendering(VkCommandBuffer cb, const VkRenderin
         if (!simple)
             s_capture->complete = false;
         else
-            cap(bytes(info, 1) + bytes(info->pColorAttachments, info->colorAttachmentCount) +
+            cap(
+                bytes(info, 1) + bytes(info->pColorAttachments, info->colorAttachmentCount) +
                     bytes(info->pDepthAttachment, 1) + bytes(info->pStencilAttachment, 1),
                 [=](uint8_t* p) {
                     VkRenderingInfo* ix = const_cast<VkRenderingInfo*>(put(p, info, 1));
@@ -428,7 +438,8 @@ VKAPI_ATTR void VKAPI_CALL c_BeginRendering(VkCommandBuffer cb, const VkRenderin
                     ix->pDepthAttachment = put(p, info->pDepthAttachment, info->pDepthAttachment ? 1u : 0u);
                     ix->pStencilAttachment = put(p, info->pStencilAttachment, info->pStencilAttachment ? 1u : 0u);
                     return [=](VkCommandBuffer c) { vkCmdBeginRendering(c, ix); };
-                });
+                },
+                true);
     }
     prev.BeginRendering(cb, info);
 }
@@ -621,12 +632,15 @@ void finish_frame() {
     s_push_depth_flags.clear();
     std::swap(s_capture, s_replay);
     s_capture->clear();
+    s_pass_tag = 0;
     s_unit = UINT32_MAX;
 }
 void discard() {
     s_push_depth_flags.clear();
     s_capture->clear();
     s_replay->clear();
+    s_pass_tag = 0;
+    s_unit = UINT32_MAX;
 }
 size_t replay_command_count() {
     return s_replay->commands;
@@ -746,8 +760,14 @@ void replay(Substitute substitute) {
         uint8_t* p = s_replay->blocks[spot.block].get() + spot.offset;
         Header h;
         std::memcpy(&h, p, sizeof(h));
-        if (!replay_tiny && h.pad && h.pad <= s_replay->passes.size()) {
-            const PassInfo& pass = s_replay->passes[h.pad - 1];
+        // Skip only rendering ops (BeginRendering/EndRendering/Draw*/ClearAttachments)
+        // of tiny passes, NOT their state/binding commands: the renderer elides
+        // redundant vertex-buffer and dynamic-state binds in later passes (bloom,
+        // TV composite), so dropping those binds left the prior pass's vertex buffer
+        // bound on the TV composite draw (Shooting Range bottom-right triangle).
+        const uint32_t pass_tag = h.pad & kPassMask;
+        if (!replay_tiny && (h.pad & kRenderOpBit) && pass_tag && pass_tag <= s_replay->passes.size()) {
+            const PassInfo& pass = s_replay->passes[pass_tag - 1];
             if (pass.color && uint64_t(pass.w) * pass.h <= 128) continue;
         }
         h.fn(p + sizeof(Header), cb);

@@ -20,6 +20,7 @@
 #include <vector>
 
 void gx2_render_query_poll_completed(); // gx2_render.h
+void gx2_render_reset_command_tracking(); // gx2_render_vk_draw.cpp
 
 namespace gx2interp {
 namespace {
@@ -803,6 +804,9 @@ void sync_capture() {
     if (want && !gx2vk::capture::enabled()) {
         gx2vk::capture::install();
         gx2vk::capture::set_enabled(true);
+        // Reset redundant-state tracking so the captured frame emits its own
+        // initial Vulkan state and replays cleanly even in a fresh command buffer.
+        gx2_render_reset_command_tracking();
         s_capture_mid_frame = !s_capture_armed; // false: the frame starts here
         s_frame_first_serial = gx2vk::recording_serial();
         gx2vk::set_capture_hold(s_frame_first_serial);
@@ -1453,6 +1457,7 @@ void run_replays() {
     s_occurrences.clear();
     s_burst_waited_ns = 0;
     bool ok = true;
+    bool vk_replayed = false;
     unsigned made = 0;
     const size_t queued_before = s_shots.size();
     const unsigned presents_before = s_stats.presents;
@@ -1495,6 +1500,7 @@ void run_replays() {
             s_substituted.clear();
             s_by_content.clear();
             s_occurrences.clear();
+            vk_replayed = true;
             gx2vk::capture::replay(&substitute);
             if (cut_guard && cut()) {
                 ok = false;
@@ -1559,9 +1565,13 @@ void run_replays() {
     drop_works(s_replay_works);
     // Frame N's host-visible buffers stay untouched until the GPU ran the
     // last replay (replay_may_read): it is in the submission recorded now.
-    if (s_vk_replay && made) {
+    // Guard on vk_replayed (not made) so a camera cut on the first replay
+    // still protects frame N's buffers and resets command tracking after
+    // replay() mutated the command buffer's bound state.
+    if (s_vk_replay && vk_replayed) {
         s_holds[s_hold_next] = {s_frame_first_serial, gx2vk::recording_serial() + 2};
         s_hold_next = (s_hold_next + 1) % kHolds;
+        gx2_render_reset_command_tracking();
     }
     gx2vk::set_capture_hold(0);
     const bool has_n = s_plan.count && s_plan.t[s_plan.count - 1] >= 1.0f;
