@@ -768,6 +768,16 @@ void bind_(CPUState* cpu) {
     }
     struct sockaddr_in sa{};
     guest_to_host_sockaddr(MEM, ARG1, &sa);
+    // RBREW_BIND_IP=<ipv4>: bind "any address" sockets to this local address instead, so two
+    // instances on one PC show different source IPs (PIA's host refuses a station whose IP matches
+    // an already-known station with another connection id: "battle full" when both share one IP).
+    static const uint32_t s_bind_ip_nbo = [] {
+        const char* v = std::getenv("RBREW_BIND_IP");
+        uint32_t nbo = 0;
+        if (v && *v) resolve_ipv4_nbo(v, &nbo);
+        return nbo;
+    }();
+    if (sa.sin_family == AF_INET && sa.sin_addr.s_addr == 0 && s_bind_ip_nbo != 0) sa.sin_addr.s_addr = s_bind_ip_nbo;
     const int rc = bind(s, reinterpret_cast<struct sockaddr*>(&sa), static_cast<socklen_t>(sizeof(sa)));
     if (rc < 0) {
         record_host_error();
