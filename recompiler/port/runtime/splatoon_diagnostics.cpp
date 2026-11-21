@@ -14,6 +14,8 @@
 #include <sstream>
 #include <string>
 #include <time.h>
+#include <csignal>
+#include <exception>
 
 #if !defined(_MSC_VER)
 #include <strings.h> // strcasecmp
@@ -189,6 +191,61 @@ static LONG WINAPI CrashUnhandledFilter(PEXCEPTION_POINTERS ep) {
     }
     return s_previous_filter ? s_previous_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
+
+// abort() and std::terminate never reach the unhandled-exception filter (abort
+// ends in __fastfail 0xC0000409). Write the same report from a SIGABRT handler
+// (process wide) and a terminate handler (which also names the exception).
+static std::atomic<bool> s_abort_reported{false};
+static void write_abort_report(const char* why) {
+    if (s_abort_reported.exchange(true)) return;
+    CONTEXT context{};
+    RtlCaptureContext(&context);
+    char time_str[64];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d_%02d-%02d-%02d_abort", st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
+    std::string base = get_diagnostics_base_dir();
+    std::string crash_dir = base + "\\" + time_str;
+    CreateDirectoryA(base.c_str(), nullptr);
+    CreateDirectoryA(crash_dir.c_str(), nullptr);
+    std::string summary_path = crash_dir + "\\summary.txt";
+    HANDLE hFile =
+        CreateFileA(summary_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    char buf[4096];
+    int len = snprintf(buf, sizeof(buf),
+                       "============================================================\n"
+                       "SPLATOON 1 PC PORT — ABORT REPORT (AUTOMATIC CAPTURE)\n"
+                       "============================================================\n"
+                       "Reason:            %s\n"
+                       "Thread ID:         %u\n"
+                       "Frame Number:      %u\n"
+                       "Timestamp:         %s\n",
+                       why, (unsigned int)GetCurrentThreadId(), s_frame_write_index.load(), time_str);
+    DWORD written = 0;
+    WriteFile(hFile, buf, (DWORD)len, &written, nullptr);
+    len = format_backtrace(context, buf, sizeof(buf));
+    WriteFile(hFile, buf, (DWORD)len, &written, nullptr);
+    CloseHandle(hFile);
+}
+static void on_sigabrt(int) {
+    write_abort_report("abort() (SIGABRT)");
+}
+static void on_terminate() {
+    std::string why = "std::terminate";
+    if (std::exception_ptr e = std::current_exception()) {
+        try {
+            std::rethrow_exception(e);
+        } catch (const std::exception& x) {
+            why = std::string("std::terminate, uncaught exception: ") + x.what();
+        } catch (...) {
+            why = "std::terminate, uncaught non-std exception";
+        }
+    }
+    write_abort_report(why.c_str());
+    std::abort();
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -236,6 +293,8 @@ void Init() {
 
 #if defined(_WIN32)
     s_previous_filter = SetUnhandledExceptionFilter(CrashUnhandledFilter);
+    std::signal(SIGABRT, on_sigabrt);
+    std::set_terminate(on_terminate);
 #endif
 
     // Start watchdog (daemon thread)

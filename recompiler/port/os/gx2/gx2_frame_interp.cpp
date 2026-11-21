@@ -5,6 +5,7 @@
 #include "../../runtime/benchmark_input.h"
 #include "vk/gx2_vk_capture.h"
 #include "../../hooks/mouse_aim.h"
+#include "../../runtime/splatoon_diagnostics.h"
 
 #include <algorithm>
 #include <bit>
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <immintrin.h>
 #include <memory>
 #include <unordered_map>
@@ -84,6 +86,11 @@ bool s_replaying = false, s_pending_replay = false, s_frame_broken = false;
 // again with blended uniform buffers. RBREW_INTERP_VK=0 replays the GX2
 // commands instead (the first implementation, far more render-thread time).
 bool s_vk_replay = false, s_capture_mid_frame = false, s_capture_armed = false;
+// A failed replay (exception) stops the in-between frames for a while: the
+// game runs at plain 60 instead of the process aborting (Recon at 165 Hz,
+// 2026-11-21: fail-fast during a stage load).
+uint64_t s_fault_until_ns = 0;
+void note_replay_fault(const char* what);
 uint64_t s_frame_first_serial = 0;     // recording serial when the frame's capture started
 std::vector<const void*> s_prev_cache; // per unit of N: matched N-1 unit (or the sentinel)
 struct SpanOwner {
@@ -1190,7 +1197,8 @@ bool frame_complete(unsigned scan_index) {
     gx2vk::capture::set_enabled(false);
     gx2vk::capture::finish_frame(); // the captured commands become the replay frame
     s_vk_replay = vk_mode() && !s_capture_mid_frame && gx2vk::capture::replay_complete();
-    bool replay = capturing() && !s_frame_broken && !s_last->units.empty() && !s_cur->units.empty() &&
+    bool replay = capturing() && !s_frame_broken && now >= s_fault_until_ns && !s_last->units.empty() &&
+                  !s_cur->units.empty() &&
                   (s_vk_replay || !s_works.empty());
     // Why a frame has no in-between frames (stats "why"): not captured,
     // capture broken, no recorded draws, Vulkan capture incomplete, capture
@@ -1476,6 +1484,7 @@ void run_replays() {
         };
         s_blended_matrices = s_jumped_matrices = 0;
         bool replayed_n = false;
+        try {
         for (unsigned i = 0; i < s_plan.count; ++i) {
             s_blend_t = s_plan.t[i];
             prepare_view_fix(s_blend_t);
@@ -1529,6 +1538,15 @@ void run_replays() {
                 s_lead_ns = std::clamp(s_lead_ns * 0.9 + lead * 0.1, 0.3e6, 8e6);
             }
         }
+        } catch (const std::exception& error) {
+            ok = false;
+            ++s_stats.failed;
+            note_replay_fault(error.what());
+        } catch (...) {
+            ok = false;
+            ++s_stats.failed;
+            note_replay_fault("unknown exception");
+        }
         s_blend_t = 0.5f;
         s_fix.on = false;
         if (!ok) replayed_n = false;
@@ -1554,9 +1572,14 @@ void run_replays() {
             s_stats.replay_ms += took / 1e6;
             ++s_stats.replays;
             s_lead_ns = std::clamp(s_lead_ns * 0.9 + (took * 1.1 + 150000.0) * 0.1, 0.3e6, 8e6);
+        } catch (const std::exception& error) {
+            ok = false;
+            ++s_stats.failed;
+            note_replay_fault(error.what());
         } catch (...) {
             ok = false;
             ++s_stats.failed;
+            note_replay_fault("unknown exception");
         }
         s_blend_t = 0.5f;
     }
@@ -1607,10 +1630,29 @@ bool replay_may_read(uint64_t last_serial) {
     return false;
 }
 
+namespace {
+void note_replay_fault(const char* what) {
+    s_fault_until_ns = now_ns() + 10'000'000'000ull; // 10 s of plain frames
+    char message[160];
+    std::snprintf(message, sizeof(message), "frame interpolation replay failed (%s): plain frames for 10 s", what);
+    SplatoonDiagnostics::RecordEvent(SplatoonDiagnostics::EventCategory::Engine,
+                                     SplatoonDiagnostics::EventSeverity::Warning, 0, message);
+}
+} // namespace
+
 void service() {
     if (s_pending_replay) {
         s_pending_replay = false;
-        run_replays();
+        try {
+            run_replays();
+        } catch (const std::exception& error) {
+            // Outside the replay loops (scheduling, presents): drop the step.
+            s_replaying = false;
+            s_replay_cur = s_replay_prev = nullptr;
+            drop_works(s_replay_works);
+            gx2vk::set_capture_hold(0);
+            note_replay_fault(error.what());
+        }
     }
     present_due(false, 0);
 }
