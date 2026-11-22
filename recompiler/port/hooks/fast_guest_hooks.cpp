@@ -39,12 +39,16 @@ namespace {
 inline void spin_backoff(uint32_t& spin) {
     // Prevent the compiler from hoisting guest memory reads across iterations
     // and reduce SMT/cache-line contention while waiting on worker cores.
+    // Never call SwitchToThread() on the main game thread: under 165 Hz load
+    // (where render_thread runs ABOVE_NORMAL), yielding after ~8 us surrenders
+    // the game thread's scheduling quantum for 2-15 ms per barrier (10x/frame),
+    // stalling the game below 60 FPS and pausing frame interpolation.
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    if (spin < 64u) {
+    if (spin < 128u) {
 #if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
         _mm_pause();
 #endif
-    } else if (spin < 256u) {
+    } else if (spin < 2048u) {
 #if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
         _mm_pause();
         _mm_pause();
@@ -52,10 +56,15 @@ inline void spin_backoff(uint32_t& spin) {
         _mm_pause();
 #endif
     } else {
-#if defined(_WIN32)
-        SwitchToThread();
-#else
-        std::this_thread::yield();
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+        _mm_pause();
+        _mm_pause();
+        _mm_pause();
+        _mm_pause();
+        _mm_pause();
+        _mm_pause();
+        _mm_pause();
+        _mm_pause();
 #endif
     }
     ++spin;

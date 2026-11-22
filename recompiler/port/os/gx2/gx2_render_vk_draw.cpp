@@ -2730,6 +2730,11 @@ Program* resolve_active_program(uint8_t* mem) {
         });
         s_pending_translations.emplace(key, AsyncTranslation{std::move(job), disk_key, exact_base, canon, rect, points,
                                                              vs_program.address, ps_program.address, exact});
+        if (s_pending_translations.size() > 64) {
+            std::erase_if(s_pending_translations, [key](const auto& kv) {
+                return kv.first != key && kv.second.job.ready();
+            });
+        }
         s_last_async_translate_skip = true;
         return nullptr;
     }

@@ -2338,8 +2338,8 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
         s_chunk_meta[next].retain_until = s_next_serial;
         // Trim excess completed upload chunks left over from transient bursts
         // (e.g. stage loads) so process RAM never stays permanently elevated.
-        constexpr size_t kChunkTrimHigh = 16;
-        constexpr size_t kChunkTrimTarget = 12;
+        constexpr size_t kChunkTrimHigh = 24;
+        constexpr size_t kChunkTrimTarget = 16;
         if (s_chunks.size() > kChunkTrimHigh) {
             for (int i = int(s_chunks.size()) - 1; i >= 0 && s_chunks.size() > kChunkTrimTarget; --i) {
                 if (i == s_active_chunk) continue;
