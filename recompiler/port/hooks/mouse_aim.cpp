@@ -185,9 +185,13 @@ void camera_input_thunk(CPUState* cpu) {
     s_pending_yaw = s_pending_pitch = 0;
     const float weight = rf(mem, self + kInputWeight);
     // The game holds the camera, or the player has no control of it (title
-    // screen): the mouse movement is dropped, as the game drops the stick.
+    // screen, cinematics, respawn/super-jump lock): drop mouse movement, clear
+    // any stale pitch offset, and leave the game's pitch untouched.
     const bool locked = rbrew_read32(mem, self + kLocked) != 0 || !(weight > 0.0f);
-    if (locked) yaw_step = pitch_step = 0;
+    if (locked) {
+        yaw_step = pitch_step = 0;
+        cam.offset = 0;
+    }
 
     if (yaw_step != 0) {
         const float angle = yaw_step * (kPi / 180.0f);
@@ -201,29 +205,32 @@ void camera_input_thunk(CPUState* cpu) {
     const float hi = rf(mem, self + kPitchMax), mid = rf(mem, self + kPitchMid), lo = rf(mem, self + kPitchMin);
     const float game_fc = rf(mem, self + kPitch);
     const float game_pitch = game_fc >= 0 ? mid + (hi - mid) * game_fc : mid + (mid - lo) * game_fc;
-    float pitch = game_pitch + cam.offset + pitch_step;
-    if (pitch > hi) pitch = hi;
-    if (pitch < lo) pitch = lo;
-    cam.offset = pitch - game_pitch;
-    // The stick holds the game's pitch on a limit the offset keeps the camera
-    // away from: the offset gives way, so the stick alone reaches every angle.
-    if (s_stick_pitch && pitch_step == 0 && cam.offset != 0 && std::fabs(game_fc) > 0.999f &&
-        (game_fc > 0) != (cam.offset > 0)) {
-        constexpr float kGiveWay = 3.0f; // degrees per frame
-        cam.offset = std::fabs(cam.offset) <= kGiveWay ? 0.0f : cam.offset - std::copysign(kGiveWay, cam.offset);
-        pitch = game_pitch + cam.offset;
-    }
-    if (std::fabs(cam.offset) < 1e-4f) {
-        cam.offset = 0;
-        pitch = game_pitch;
-    } else {
-        float fc = pitch >= mid ? (pitch - mid) / (hi - mid) : (pitch - mid) / (mid - lo);
-        if (fc > 1.0f) fc = 1.0f;
-        if (fc < -1.0f) fc = -1.0f;
-        wf(mem, self + kPitch, fc);
-        cam.game_fc = game_fc;
-        cam.written_bits = rbrew_read32(mem, self + kPitch);
-        cam.wrote = true;
+    float pitch = game_pitch;
+    if (!locked) {
+        pitch = game_pitch + cam.offset + pitch_step;
+        if (pitch > hi) pitch = hi;
+        if (pitch < lo) pitch = lo;
+        cam.offset = pitch - game_pitch;
+        // The stick holds the game's pitch on a limit the offset keeps the camera
+        // away from: the offset gives way, so the stick alone reaches every angle.
+        if (s_stick_pitch && pitch_step == 0 && cam.offset != 0 && std::fabs(game_fc) > 0.999f &&
+            (game_fc > 0) != (cam.offset > 0)) {
+            constexpr float kGiveWay = 3.0f; // degrees per frame
+            cam.offset = std::fabs(cam.offset) <= kGiveWay ? 0.0f : cam.offset - std::copysign(kGiveWay, cam.offset);
+            pitch = game_pitch + cam.offset;
+        }
+        if (std::fabs(cam.offset) < 1e-4f) {
+            cam.offset = 0;
+            pitch = game_pitch;
+        } else {
+            float fc = pitch >= mid ? (pitch - mid) / (hi - mid) : (pitch - mid) / (mid - lo);
+            if (fc > 1.0f) fc = 1.0f;
+            if (fc < -1.0f) fc = -1.0f;
+            wf(mem, self + kPitch, fc);
+            cam.game_fc = game_fc;
+            cam.written_bits = rbrew_read32(mem, self + kPitch);
+            cam.wrote = true;
+        }
     }
 
     Debug& d = s_debug;
@@ -657,7 +664,9 @@ struct MouseSample {
     uint64_t ns = 0;
     int64_t x = 0, y = 0;
 };
-constexpr size_t kMouseHist = 128;
+// 1024 samples covers >1 s at 1000 Hz and 128..256 ms on 4000-8000 Hz mice
+// without clamping counts_at() during stage hitches.
+constexpr size_t kMouseHist = 1024;
 MouseSample s_hist[kMouseHist]{};
 size_t s_hist_head = 0, s_hist_count = 0;
 uint64_t aim_now_ns() {
@@ -738,9 +747,13 @@ bool raw_counting() {
 void seed_raw_buttons() {
     uint32_t mask = 0;
     if (raw_counting()) {
-        if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) mask |= 1u << 0;
+        // GetAsyncKeyState checks physical buttons, matching RI_MOUSE_LEFT/RIGHT.
+        const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        const uint32_t left_bit = swapped ? (1u << 2) : (1u << 0);
+        const uint32_t right_bit = swapped ? (1u << 0) : (1u << 2);
+        if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) mask |= left_bit;
         if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) mask |= 1u << 1;
-        if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) mask |= 1u << 2;
+        if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) mask |= right_bit;
         if (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) mask |= 1u << 3;
         if (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) mask |= 1u << 4;
     }
@@ -799,6 +812,9 @@ void raw_sync_registration() {
         } else if (!s_raw_owns.load(std::memory_order_relaxed)) {
             seed_raw_buttons();
             s_raw_owns.store(true, std::memory_order_release);
+        } else if (!raw_counting()) {
+            s_raw_buttons.store(0, std::memory_order_release);
+            s_raw_pressed.store(0, std::memory_order_release);
         }
     } else {
         s_raw_owns.store(false, std::memory_order_release);
@@ -816,9 +832,14 @@ LRESULT CALLBACK raw_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             input.header.dwType == RIM_TYPEMOUSE) {
             const RAWMOUSE& m = input.data.mouse;
             const bool active = raw_counting();
-            if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE) && (m.lLastX || m.lLastY) && active)
-                add_raw(m.lLastX, m.lLastY);
-            if (m.usButtonFlags) update_raw_buttons(m.usButtonFlags, active);
+            if (!active) {
+                s_raw_buttons.store(0, std::memory_order_release);
+                s_raw_pressed.store(0, std::memory_order_release);
+            } else {
+                if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE) && (m.lLastX || m.lLastY))
+                    add_raw(m.lLastX, m.lLastY);
+                if (m.usButtonFlags) update_raw_buttons(m.usButtonFlags, true);
+            }
         }
         return 0;
     }
@@ -931,16 +952,33 @@ void take_counts(int sdl_dx, int sdl_dy, bool relative, int& dx, int& dy) {
     s_taken_x += dx;
     s_taken_y += dy;
     s_taken_ns = ns;
-    push_sample_locked(ns);
+    // When the raw thread owns mouse input and SDL added no movement, avoid
+    // injecting a fake zero-velocity knot between hardware WM_INPUT packets
+    // (which would create a 60 Hz velocity ripple in counts_at()); still anchor
+    // idle pauses (>12 ms since the last sample) and non-raw / SDL paths.
+    const bool raw_active = s_raw_owns.load(std::memory_order_acquire);
+    bool push_now = !raw_active || sdl_dx != 0 || sdl_dy != 0 || s_hist_count == 0;
+    if (!push_now) {
+        const MouseSample& newest = s_hist[(s_hist_head + kMouseHist - 1) % kMouseHist];
+        if (ns > newest.ns && (ns - newest.ns) > 12000000ull) push_now = true;
+    }
+    if (push_now) push_sample_locked(ns);
 }
 
 bool take_buttons(bool relative, uint32_t& buttons) {
 #if defined(_WIN32)
     if (!relative) {
+        s_raw_buttons.store(0, std::memory_order_relaxed);
         s_raw_pressed.store(0, std::memory_order_relaxed);
         return false;
     }
     if (!s_raw_owns.load(std::memory_order_acquire)) return false;
+    if (!raw_counting()) {
+        s_raw_buttons.store(0, std::memory_order_relaxed);
+        s_raw_pressed.store(0, std::memory_order_relaxed);
+        buttons = 0;
+        return true;
+    }
     const uint32_t latched = s_raw_pressed.exchange(0, std::memory_order_acq_rel);
     const uint32_t held = s_raw_buttons.load(std::memory_order_acquire);
     buttons = held | latched;
@@ -1000,34 +1038,34 @@ bool counts_at(uint64_t query_ns, double& x, double& y) {
         y = double(s_taken_y + (s_raw_y - s_raw_taken_y));
         return true;
     }
-    const auto at = [&](size_t age) -> const MouseSample& {
-        return s_hist[(s_hist_head + kMouseHist - 1 - age) % kMouseHist];
-    };
-    const MouseSample& newest = at(0);
+    const size_t oldest_idx = (s_hist_head + kMouseHist - s_hist_count) % kMouseHist;
+    const auto at = [&](size_t i) -> const MouseSample& { return s_hist[(oldest_idx + i) % kMouseHist]; };
+    const MouseSample& newest = at(s_hist_count - 1);
     if (query_ns >= newest.ns || s_hist_count == 1) {
         x = double(newest.x);
         y = double(newest.y);
         return true;
     }
-    const MouseSample& oldest = at(s_hist_count - 1);
+    const MouseSample& oldest = at(0);
     if (query_ns <= oldest.ns) {
         x = double(oldest.x);
         y = double(oldest.y);
         return true;
     }
-    for (size_t age = 1; age < s_hist_count; ++age) {
-        const MouseSample& a = at(age);
-        const MouseSample& b = at(age - 1);
-        if (query_ns >= a.ns && query_ns <= b.ns) {
-            const double span = double(b.ns - a.ns);
-            const double u = span > 0.0 ? double(query_ns - a.ns) / span : 1.0;
-            x = double(a.x) + u * double(b.x - a.x);
-            y = double(a.y) + u * double(b.y - a.y);
-            return true;
-        }
+    size_t lo = 0, hi = s_hist_count - 1;
+    while (hi - lo > 1) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (at(mid).ns <= query_ns)
+            lo = mid;
+        else
+            hi = mid;
     }
-    x = double(newest.x);
-    y = double(newest.y);
+    const MouseSample& a = at(lo);
+    const MouseSample& b = at(hi);
+    const double span = double(b.ns - a.ns);
+    const double u = span > 0.0 ? double(query_ns - a.ns) / span : 1.0;
+    x = double(a.x) + u * double(b.x - a.x);
+    y = double(a.y) + u * double(b.y - a.y);
     return true;
 }
 } // namespace rbrew_aim

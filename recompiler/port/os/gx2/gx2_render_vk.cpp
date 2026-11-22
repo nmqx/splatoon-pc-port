@@ -46,6 +46,7 @@ using namespace gx2r;
 
 size_t gx2r_vertex_cache_entries(); // gx2_render_vk_draw.cpp
 size_t gx2r_native_query_count();
+void gx2r_note_target_cleared(const void* target); // gx2_render_vk_draw.cpp
 std::pair<uint64_t, uint64_t> gx2_dl_recording_counts(); // gx2_display_list.cpp
 std::array<uint64_t, 9> gx2_dl_maintenance_counts();
 
@@ -63,6 +64,22 @@ Counters& counters() {
 namespace {
 State& S = state();
 Counters& C = counters();
+
+// Per-unit memo for direct 2D render-target texture aliases (shadow/depth/color
+// targets sampled directly via &cb.tex / &depth.tex). Avoids re-running
+// gx2_render_upload_texture on every draw from refresh_bound_render_texture
+// while no new views were created and no competing depth/color alias changed.
+struct RefreshAliasMemo {
+    uint32_t image = 0;
+    uint64_t color_rev = UINT64_MAX;
+    uint64_t depth_rev = UINT64_MAX;
+    const gx2vk::Image* alt_image = nullptr;
+    uint64_t alt_gen = 0;
+    TexObject* tex = nullptr;
+    uint32_t swizzle = 0;
+    bool direct = false;
+};
+std::array<RefreshAliasMemo, 96> s_refresh_alias_memo{};
 
 template <class Map> auto image_views(const Map& map, uint32_t image) {
     auto& cache = []() -> auto& {
@@ -720,6 +737,7 @@ void gx2_render_shutdown() {
     TXDIAG(txdiag::drain_probes(true));
     s_clear_color_as_depth = false;
     s_color_as_depth_keys.clear();
+    s_refresh_alias_memo.fill({});
     if (s_alias_staging.buffer) gx2vk::destroy_buffer(s_alias_staging);
     s_alias_staging = {};
     shutdown_draw_state();
@@ -1054,11 +1072,18 @@ static void clear_bound(bool color, bool depth, bool stencil) {
     }
     if (clears.empty()) return;
     vkCmdClearAttachments(gx2vk::cmd(), uint32_t(clears.size()), clears.data(), 1, &rect);
+    const bool full_clear = rect.rect.offset.x == 0 && rect.rect.offset.y == 0 &&
+                            rect.rect.extent.width == area.extent.width &&
+                            rect.rect.extent.height == area.extent.height;
     for (const auto& clear : clears) {
-        if (clear.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-            gx2vk::note_gpu_write(S.framebuffer.colors[clear.colorAttachment]->image);
-        else
+        if (clear.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+            auto* ct = S.framebuffer.colors[clear.colorAttachment];
+            gx2vk::note_gpu_write(ct->image);
+            if (full_clear) gx2r_note_target_cleared(ct);
+        } else {
             gx2vk::note_gpu_write(S.framebuffer.depth->image);
+            if (full_clear) gx2r_note_target_cleared(S.framebuffer.depth);
+        }
     }
     if (shadow_log() && depth && S.framebuffer.depth)
         RBREW_LOG_DEBUG("shadow", "clear bound depth value=%g stencil=%u %ux%u gx2fmt=%X scissor=%d,%d %ux%u\n",
@@ -1139,6 +1164,7 @@ void gx2_render_clear_depth_buffer(uint32_t db_addr, uint8_t* mem, float depth, 
         const VkImageSubresourceRange range{aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearDepthStencilImage(cb, target.image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
         gx2vk::note_gpu_write(target.image);
+        gx2r_note_target_cleared(&target);
     }
     if (shadow_log())
         RBREW_LOG_DEBUG("shadow",
@@ -1193,6 +1219,7 @@ void gx2_render_clear_color_buffer(uint32_t cb_addr, uint8_t* mem, float r, floa
         for (unsigned c = 0; c < 4; ++c) value.float32[c] = quantize_unorm(S.raster.clear_color[c], bits[c]);
     }
     clear_image_color(target->image, value);
+    gx2r_note_target_cleared(target);
 }
 
 // ---------------------------------------------------------------------------
@@ -1690,8 +1717,13 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
 #ifdef RBREW_TEXTURE_DIAGNOSTICS
     txdiag::TextureScope diagnostic_scope{mem, data, tex_addr, slot};
 #endif
-    S.bound_textures[slot].address = tex_addr;
-    std::memcpy(S.bound_textures[slot].descriptor.data(), data, GX2TEX_SIZEOF);
+    s_refresh_alias_memo[slot].direct = false;
+    auto& bound_slot = S.bound_textures[slot];
+    if (bound_slot.address != tex_addr ||
+        (bound_slot.descriptor.data() != data && std::memcmp(bound_slot.descriptor.data(), data, GX2TEX_SIZEOF) != 0)) {
+        bound_slot.address = tex_addr;
+        std::memcpy(bound_slot.descriptor.data(), data, GX2TEX_SIZEOF);
+    }
     const uint32_t word4 = descriptor_word(data, 0x90);
     r700_texture_registers(S.regs.data(), data, slot);
 
@@ -1731,6 +1763,19 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
     } else {
         TXDIAG(txdiag::count(txdiag::Hits));
     }
+    static const bool s_cube_probe = rbrew_diagnostic_env("RBREW_CUBE_PROBE") != nullptr;
+    const uint64_t eff_depth_rev = S.effective_depth_revision();
+    const uint64_t eff_color_rev = S.effective_color_revision();
+    // Fast path for already-created static textures: entry is keyed by the full
+    // GX2TEX_COMP_MAP layout (dim, size, format, ptr, mips, slices), so target
+    // and dimensions are invariant once created. Skip all descriptor_word()
+    // byte-swaps on the 99% cache-hit path.
+    if (!s_cube_probe && entry.created && entry.hash_valid && !entry.verify && entry.depth_revision == eff_depth_rev &&
+        entry.no_depth_alias && entry.color_revision == eff_color_rev && entry.no_color_alias) {
+        entry.tex.swizzle = word4;
+        bind_unit(slot, &entry.tex);
+        return;
+    }
     const uint32_t w = descriptor_word(data, GX2SURF_WIDTH), h = descriptor_word(data, GX2SURF_HEIGHT);
     const uint32_t fmt = descriptor_word(data, GX2SURF_FORMAT);
     const uint32_t img_ptr = descriptor_word(data, GX2SURF_IMAGE), img_sz = descriptor_word(data, GX2SURF_IMAGE_SIZE);
@@ -1759,16 +1804,6 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
     entry.created = true;
     entry.tex.target = target;
 
-    static const bool s_cube_probe = rbrew_diagnostic_env("RBREW_CUBE_PROBE") != nullptr;
-    const uint64_t eff_depth_rev = S.effective_depth_revision();
-    const uint64_t eff_color_rev = S.effective_color_revision();
-    if (!s_cube_probe && entry.hash_valid && !entry.verify && entry.depth_revision == eff_depth_rev &&
-        entry.no_depth_alias && entry.color_revision == eff_color_rev && entry.no_color_alias) {
-        entry.tex.swizzle = word4;
-        bind_unit(slot, &entry.tex);
-        return;
-    }
-
     if (entry.depth_revision != eff_depth_rev) {
         const auto depth_range = image_views(S.depth_map, img_ptr);
         entry.no_depth_alias = (depth_range.begin() == depth_range.end());
@@ -1796,8 +1831,8 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
         }
         // A surface cleared through a depth alias (ClearColorAsDepth) and then
         // rendered as color: the newer of the two native views holds the bytes.
-        if (const auto color = S.cb_map.find(key);
-            color != S.cb_map.end() && color->second.image.content_generation > depth.image.content_generation)
+        const auto color = S.cb_map.find(key);
+        if (color != S.cb_map.end() && color->second.image.content_generation > depth.image.content_generation)
             continue;
         if ((target == wire::TEXTURE_2D || (target == wire::TEXTURE_2D_ARRAY && layers == 1)) &&
             texture_view_matches(key, data)) {
@@ -1818,6 +1853,14 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             }
             sampled->swizzle = word4;
             bind_unit(slot, sampled);
+            s_refresh_alias_memo[slot] = {img_ptr,
+                                          eff_color_rev,
+                                          eff_depth_rev,
+                                          color != S.cb_map.end() ? &color->second.image : nullptr,
+                                          color != S.cb_map.end() ? color->second.image.content_generation : 0,
+                                          sampled,
+                                          word4,
+                                          true};
             if (g_trace_active || shadow_log())
                 RBREW_LOG_DEBUG("tex", "slot %u samples depth target image %08X (gl tex %u %ux%u fmt %X mip %u)\n",
                                 slot, img_ptr, depth.id, depth.width, depth.height, fmt, key[5]);
@@ -2014,6 +2057,9 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             if (target == wire::TEXTURE_2D && texture_view_matches(key, data) && cb.image.image) {
                 cb.tex.swizzle = word4;
                 bind_unit(slot, &cb.tex);
+                if (entry.no_depth_alias)
+                    s_refresh_alias_memo[slot] = {img_ptr, eff_color_rev, eff_depth_rev, nullptr, 0, &cb.tex, word4,
+                                                  true};
                 static unsigned s_logged_aliases;
                 if (s_logged_aliases++ < 8 || g_trace_active)
                     RBREW_LOG_DEBUG("tex", "slot %u samples render target image %08X (gl tex %u %ux%u fmt %X)\n", slot,
@@ -2039,6 +2085,9 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                 }
                 view.tex.swizzle = word4;
                 bind_unit(slot, &view.tex);
+                if (entry.no_depth_alias)
+                    s_refresh_alias_memo[slot] = {img_ptr, eff_color_rev, eff_depth_rev, nullptr, 0, &view.tex, word4,
+                                                  true};
                 return;
             }
         }
@@ -2336,6 +2385,15 @@ void gx2r::refresh_bound_render_texture(uint32_t unit, uint8_t* mem) {
     const uint64_t eff_depth_rev = S.effective_depth_revision();
     auto& memo = S.bound_alias_memo[unit];
     if (memo.image == image && memo.color_rev == eff_color_rev && memo.depth_rev == eff_depth_rev) return;
+    const auto& direct = s_refresh_alias_memo[unit];
+    if (direct.direct && direct.tex && S.units[unit][0] == direct.tex && direct.image == image &&
+        direct.color_rev == eff_color_rev && direct.depth_rev == eff_depth_rev &&
+        (!direct.alt_image || direct.alt_image->content_generation == direct.alt_gen)) {
+        // Restore this slot's swizzle in case another slot sampled the same
+        // render target with a different component mapping since our bind.
+        direct.tex->swizzle = direct.swizzle;
+        return;
+    }
     const auto depth = image_views(S.depth_map, image);
     const auto color = image_views(S.cb_map, image);
     if (depth.begin() == depth.end() && color.begin() == color.end()) {
@@ -2427,9 +2485,10 @@ void gx2_render_restore_context_state(uint32_t context_state, uint8_t* mem) {
     S.active_fetch = snapshot.fetch_shader;
     for (unsigned slot = 0; slot < S.bound_textures.size(); ++slot) {
         const auto& bound = snapshot.bound_textures[slot];
-        if (bound.address &&
-            (prev_textures[slot].address != bound.address ||
-             std::memcmp(prev_textures[slot].descriptor.data(), bound.descriptor.data(), GX2TEX_SIZEOF) != 0)) {
+        if (!bound.address) {
+            s_refresh_alias_memo[slot].direct = false;
+        } else if (prev_textures[slot].address != bound.address ||
+                   std::memcmp(prev_textures[slot].descriptor.data(), bound.descriptor.data(), GX2TEX_SIZEOF) != 0) {
             gx2_render_upload_texture(bound.address, slot, mem, bound.descriptor.data());
         }
     }
@@ -3162,7 +3221,15 @@ void gx2_render_interp_present(unsigned slot) {
             write_frame_bmp(kept.image.desc.format, kept.w, kept.h, raw.data(), name);
         }
     }
-    gx2vk::present(kept.image, kept.w, kept.h);
+    const bool photo = !kept.in_between && s_photo_request.exchange(false, std::memory_order_relaxed);
+    const bool previous = photo ? gx2vk::capture_presents(true) : false;
+    const bool presented = gx2vk::present(kept.image, kept.w, kept.h);
+    if (photo) {
+        gx2vk::capture_presents(previous);
+        std::vector<uint8_t> rgba;
+        uint32_t width = 0, height = 0;
+        if (presented && gx2vk::last_present(rgba, width, height)) save_photo(rgba, width, height);
+    }
 }
 static void gx2r_shutdown_interp_images() {
     for (auto& kept : s_interp_slots) {
@@ -3815,7 +3882,7 @@ static void save_photo(const std::vector<uint8_t>& rgba, uint32_t width, uint32_
 #if defined(_WIN32)
     wchar_t exe[MAX_PATH];
     const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    if (!n || n >= MAX_PATH || rgba.size() < size_t(width) * height * 4) return;
+    if (!n || n >= MAX_PATH || !width || !height || rgba.size() < size_t(width) * height * 4) return;
     const auto directory = std::filesystem::path(exe).parent_path() / L"Screenshots";
     std::error_code error;
     std::filesystem::create_directories(directory, error);
@@ -3827,8 +3894,14 @@ static void save_photo(const std::vector<uint8_t>& rgba, uint32_t width, uint32_
     auto path = directory / (std::wstring(name) + L".png");
     for (int suffix = 2; std::filesystem::exists(path, error); ++suffix)
         path = directory / (std::wstring(name) + L"_" + std::to_wstring(suffix) + L".png");
-    std::vector<uint8_t> pixels(rgba);
-    for (size_t i = 3; i < pixels.size(); i += 4) pixels[i] = 255; // opaque
+    // WIC PNG encoder expects BGRA (it rejects 32bppRGBA by negotiating 32bppBGRA).
+    std::vector<uint8_t> pixels(size_t(width) * height * 4);
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        pixels[i] = rgba[i + 2];
+        pixels[i + 1] = rgba[i + 1];
+        pixels[i + 2] = rgba[i];
+        pixels[i + 3] = 255; // opaque
+    }
     bool ok = false;
     std::thread([&] {
         if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
@@ -3836,7 +3909,7 @@ static void save_photo(const std::vector<uint8_t>& rgba, uint32_t width, uint32_
         IWICStream* stream = nullptr;
         IWICBitmapEncoder* encoder = nullptr;
         IWICBitmapFrameEncode* frame = nullptr;
-        WICPixelFormatGUID format = GUID_WICPixelFormat32bppRGBA;
+        WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
         if (SUCCEEDED(
                 CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
             SUCCEEDED(factory->CreateStream(&stream)) &&
@@ -3845,7 +3918,7 @@ static void save_photo(const std::vector<uint8_t>& rgba, uint32_t width, uint32_
             SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache)) &&
             SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
             SUCCEEDED(frame->SetSize(width, height)) && SUCCEEDED(frame->SetPixelFormat(&format)) &&
-            IsEqualGUID(format, GUID_WICPixelFormat32bppRGBA) &&
+            IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA) &&
             SUCCEEDED(frame->WritePixels(height, width * 4, UINT(pixels.size()), pixels.data())) &&
             SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit()))
             ok = true;
@@ -3855,6 +3928,7 @@ static void save_photo(const std::vector<uint8_t>& rgba, uint32_t width, uint32_
         if (factory) factory->Release();
         CoUninitialize();
     }).join();
+    if (!ok) std::filesystem::remove(path, error);
     RBREW_LOG_INFO("photo", "%s %ls (%ux%u)", ok ? "saved" : "could not save", path.c_str(), width, height);
 #else
     (void)rgba;

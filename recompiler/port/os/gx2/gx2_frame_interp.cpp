@@ -72,6 +72,9 @@ struct Record {
         return offset;
     }
 };
+constexpr size_t kMaxRecordedUnits = 100000;
+constexpr size_t kMaxRecordedBytes = size_t(128) << 20; // 128 MiB per-frame cap (prevents OOM / u32 overflow)
+void break_capture();
 Record s_records[2];
 Record* s_cur = &s_records[0];                        // frame being recorded (frame N during its replay)
 Record* s_last = &s_records[1];                       // previous complete frame (N-1 for the replay)
@@ -303,7 +306,7 @@ bool parallel(const float* x, const float* y) {
     if (nx < 1e-6f || ny < 1e-6f) return false;
     return std::fabs(x[0] * y[0] + x[1] * y[1] + x[2] * y[2]) >= 0.98f * nx * ny;
 }
-// Not motion between two frames: a row turning by more than ~20 degrees
+// Not motion between two frames: a row turning by more than ~26 degrees
 // (another object, a camera cut) or a translation changing by more than a
 // quarter of its size (a texture matrix switching buffers, a teleport).
 bool transform_jump(const float* a, const float* b) {
@@ -314,7 +317,7 @@ bool transform_jump(const float* a, const float* b) {
         const float diff = std::sqrt(dx * dx + dy * dy + dz * dz);
         const float scale = std::max(std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]),
                                      std::sqrt(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]));
-        if (diff > 0.35f * scale) return true;
+        if (diff > 0.45f * scale) return true;
     }
     const float dt =
         std::sqrt((a[3] - b[3]) * (a[3] - b[3]) + (a[7] - b[7]) * (a[7] - b[7]) + (a[11] - b[11]) * (a[11] - b[11]));
@@ -439,8 +442,8 @@ const Unit* match_prev(const Unit& cur) {
         }
         break;
     }
-    // Many copies (text glyphs, ink drops, particles): only an unchanged
-    // position in the order counts (above); never blend two different ones.
+    // Many copies (text glyphs, ink drops, particles, culled props): only an
+    // unchanged position in the order counts (above); never blend two different ones.
     if (count > 8) return best < 2.0 ? best_unit : nullptr;
     for (uint32_t occurrence = 1; occurrence <= count && best > 0; ++occurrence)
         if (const Unit* candidate = unit_of(occurrence); candidate && candidate != best_unit) {
@@ -472,8 +475,11 @@ const Unit* match_prev(const Unit& cur) {
 // row) goes with them. RBREW_INTERP_MOUSE=0: off.
 struct ViewFix {
     bool on = false;
-    float rot[9]{};                  // the camera's extra rotation (world, row-major)
-    float pivot[3]{};                // it turns around this point
+    bool cur_on = false;
+    float rot[9]{};                  // extra rotation from blended pose (bx) to tx (row-major)
+    float pivot[3]{};                // blended pivot
+    float rot_cur[9]{};              // extra rotation from frame-N pose (cur) to tx (for unblended draws)
+    float pivot_cur[3]{};            // frame-N pivot
     float basis[9]{};                // frame N's camera basis rows: right, up, forward
     float basis_prev[9]{};           // the same from the newest tag
     float yaw = 0.0f, pitch = 0.0f;  // degrees (stats)
@@ -512,9 +518,17 @@ float dot3(const float* a, const float* b) {
 // t=1.0, zero 0.8 ms burst duplicates, and 16.7 ms lower mouse input delay.
 void prepare_view_fix(float t) {
     s_fix.on = false;
+    s_fix.cur_on = false;
     const rbrew_aim::ViewTag& cur = s_cur->view;
     const rbrew_aim::ViewTag& last = s_last->view;
-    if (!mouse_look_on() || !cur.active || !last.active || cur.degrees_per_count == 0.0f) return;
+    if (!mouse_look_on() || !cur.active || !last.active || cur.degrees_per_count == 0.0f ||
+        !std::isfinite(cur.degrees_per_count) || !std::isfinite(cur.pitch) || !std::isfinite(last.pitch) ||
+        !std::isfinite(cur.pitch_min) || !std::isfinite(cur.pitch_max) || cur.pitch_min > cur.pitch_max)
+        return;
+    for (int i = 0; i < 3; ++i)
+        if (!std::isfinite(cur.eye[i]) || !std::isfinite(cur.at[i]) || !std::isfinite(last.eye[i]) ||
+            !std::isfinite(last.at[i]))
+            return;
     double tx = 0.0, ty = 0.0;
     const double u = std::clamp(double(t), 0.0, 1.0);
     if (s_held_view.active && s_held_view.taken_ns > cur.taken_ns && cur.taken_ns > 0) {
@@ -533,35 +547,56 @@ void prepare_view_fix(float t) {
     const float base_pitch = last.pitch + (cur.pitch - last.pitch) * float(u);
     pitch = std::clamp(base_pitch + pitch, cur.pitch_min, cur.pitch_max) - base_pitch;
     yaw = std::clamp(yaw, -45.0f, 45.0f);
-    if (std::fabs(yaw) < 1e-4f && std::fabs(pitch) < 1e-4f) return;
-    float eye[3], at[3], f[3];
+    float yaw_cur = float(-(tx - double(cur.taken_x)) * cur.degrees_per_count);
+    float pitch_cur = float(-(ty - double(cur.taken_y)) * cur.degrees_per_count);
+    pitch_cur = std::clamp(cur.pitch + pitch_cur, cur.pitch_min, cur.pitch_max) - cur.pitch;
+    yaw_cur = std::clamp(yaw_cur, -45.0f, 45.0f);
+    const bool have_blend = std::fabs(yaw) >= 1e-4f || std::fabs(pitch) >= 1e-4f;
+    const bool have_cur = std::fabs(yaw_cur) >= 1e-4f || std::fabs(pitch_cur) >= 1e-4f;
+    if (!have_blend && !have_cur) return;
+    const float up[3] = {0, 1, 0};
+    auto build_rot = [&](const float eye_p[3], const float at_p[3], float y_deg, float p_deg, float out_rot[9]) {
+        float f[3] = {at_p[0] - eye_p[0], at_p[1] - eye_p[1], at_p[2] - eye_p[2]};
+        normalize3(f);
+        // Yaw about +Y (as the game: atan2(x, z) grows), then pitch about the
+        // horizontal axis k = f' x Y (positive looks up).
+        const float a = y_deg * (3.14159265358979f / 180.0f), ca = std::cos(a), sa = std::sin(a);
+        const float ry[9] = {ca, 0, sa, 0, 1, 0, -sa, 0, ca};
+        float f1[3] = {ry[0] * f[0] + ry[1] * f[1] + ry[2] * f[2], ry[3] * f[0] + ry[4] * f[1] + ry[5] * f[2],
+                       ry[6] * f[0] + ry[7] * f[1] + ry[8] * f[2]};
+        float k[3];
+        cross3(f1, up, k);
+        normalize3(k);
+        const float b = p_deg * (3.14159265358979f / 180.0f), cb = std::cos(b), sb = std::sin(b);
+        // Rodrigues: R = cI + s[k]x + (1-c) k k^T
+        const float rk[9] = {cb + (1 - cb) * k[0] * k[0],        (1 - cb) * k[0] * k[1] - sb * k[2],
+                             (1 - cb) * k[0] * k[2] + sb * k[1], (1 - cb) * k[1] * k[0] + sb * k[2],
+                             cb + (1 - cb) * k[1] * k[1],        (1 - cb) * k[1] * k[2] - sb * k[0],
+                             (1 - cb) * k[2] * k[0] - sb * k[1], (1 - cb) * k[2] * k[1] + sb * k[0],
+                             cb + (1 - cb) * k[2] * k[2]};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                out_rot[r * 3 + c] =
+                    rk[r * 3 + 0] * ry[0 * 3 + c] + rk[r * 3 + 1] * ry[1 * 3 + c] + rk[r * 3 + 2] * ry[2 * 3 + c];
+    };
+    float eye[3], at[3];
     for (int i = 0; i < 3; ++i) {
         eye[i] = last.eye[i] + (cur.eye[i] - last.eye[i]) * t;
         at[i] = last.at[i] + (cur.at[i] - last.at[i]) * t;
-        f[i] = at[i] - eye[i];
     }
-    normalize3(f);
-    // Yaw about +Y (as the game: atan2(x, z) grows), then pitch about the
-    // horizontal axis k = f' x Y (positive looks up).
-    const float a = yaw * (3.14159265358979f / 180.0f), ca = std::cos(a), sa = std::sin(a);
-    const float ry[9] = {ca, 0, sa, 0, 1, 0, -sa, 0, ca};
-    float f1[3] = {ry[0] * f[0] + ry[1] * f[1] + ry[2] * f[2], ry[3] * f[0] + ry[4] * f[1] + ry[5] * f[2],
-                   ry[6] * f[0] + ry[7] * f[1] + ry[8] * f[2]};
-    const float up[3] = {0, 1, 0};
-    float k[3];
-    cross3(f1, up, k);
-    normalize3(k);
-    const float b = pitch * (3.14159265358979f / 180.0f), cb = std::cos(b), sb = std::sin(b);
-    // Rodrigues: R = cI + s[k]x + (1-c) k k^T
-    const float rk[9] = {cb + (1 - cb) * k[0] * k[0],        (1 - cb) * k[0] * k[1] - sb * k[2],
-                         (1 - cb) * k[0] * k[2] + sb * k[1], (1 - cb) * k[1] * k[0] + sb * k[2],
-                         cb + (1 - cb) * k[1] * k[1],        (1 - cb) * k[1] * k[2] - sb * k[0],
-                         (1 - cb) * k[2] * k[0] - sb * k[1], (1 - cb) * k[2] * k[1] + sb * k[0],
-                         cb + (1 - cb) * k[2] * k[2]};
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            s_fix.rot[r * 3 + c] = rk[r * 3 + 0] * ry[0 * 3 + c] + rk[r * 3 + 1] * ry[1 * 3 + c] + rk[r * 3 + 2] * ry[2 * 3 + c];
-    std::copy(at, at + 3, s_fix.pivot);
+    if (have_blend) {
+        build_rot(eye, at, yaw, pitch, s_fix.rot);
+        std::copy(at, at + 3, s_fix.pivot);
+    } else {
+        const float id[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        std::copy(id, id + 9, s_fix.rot);
+        std::copy(at, at + 3, s_fix.pivot);
+    }
+    if (have_cur) {
+        build_rot(cur.eye, cur.at, yaw_cur, pitch_cur, s_fix.rot_cur);
+        std::copy(cur.at, cur.at + 3, s_fix.pivot_cur);
+        s_fix.cur_on = true;
+    }
     // The camera bases of the tags (detection against N's own data).
     auto basis_of = [&](const rbrew_aim::ViewTag& tag, float* out) {
         float fn[3] = {tag.at[0] - tag.eye[0], tag.at[1] - tag.eye[1], tag.at[2] - tag.eye[2]};
@@ -583,7 +618,7 @@ void prepare_view_fix(float t) {
         basis_of(cur, s_fix.basis_prev);
     s_fix.yaw = yaw;
     s_fix.pitch = pitch;
-    s_fix.on = true;
+    s_fix.on = have_blend;
 }
 // Rows m (3 vec4) of frame N: a world-to-view (or view-projection) matrix of
 // N's camera.
@@ -613,7 +648,10 @@ bool is_view_matrix(const float* m, const float* bs) {
 }
 // Applies the extra rotation to the view matrices of a uniform block: `cur`
 // is frame N's bytes (detection), `out` the in-between frame's bytes.
-unsigned apply_view_fix(const uint8_t* cur, uint8_t* out, size_t size, bool host_order) {
+// When `from_cur` is true (block was not blended from N-1), rotates from frame
+// N's own pose (`rot_cur`) instead of the blended pose (`rot`) so unblended
+// draws never overshoot the rest of the scene.
+unsigned apply_view_fix(const uint8_t* cur, uint8_t* out, size_t size, bool host_order, bool from_cur = false) {
     const size_t rows = size / 16;
     if (rows < 3) return 0;
     auto read = [&](const uint8_t* p) { return to_float(host_order ? le(p) : be(p)); };
@@ -621,8 +659,8 @@ unsigned apply_view_fix(const uint8_t* cur, uint8_t* out, size_t size, bool host
         const uint32_t w = host_order ? to_bits(v) : rbrew_bswap32(to_bits(v));
         std::memcpy(out + word * 4, &w, 4);
     };
-    const float* rot = s_fix.rot;
-    const float* p = s_fix.pivot;
+    const float* rot = from_cur ? s_fix.rot_cur : s_fix.rot;
+    const float* p = from_cur ? s_fix.pivot_cur : s_fix.pivot;
     unsigned fixed = 0;
     for (size_t r = 0; r + 3 <= rows;) {
         // Cheap filter: the third row lies along the view axis.
@@ -656,15 +694,21 @@ unsigned apply_view_fix(const uint8_t* cur, uint8_t* out, size_t size, bool host
             const float wn = std::sqrt(dot3(m + 12, m + 12));
             if (vec4_ok(m + 12) && wn > 1e-6f && std::fabs(dot3(m + 12, bs + 6)) > 0.99f * wn) n = 4;
         }
+        // Pure 3x3 direction/normal/sky-rotation matrices have zero translation
+        // column: rotate their basis without injecting a world-pivot offset.
+        const bool has_translation = !(read(cur + (r + 0) * 16 + 12) == 0.0f && read(cur + (r + 1) * 16 + 12) == 0.0f &&
+                                       read(cur + (r + 2) * 16 + 12) == 0.0f);
         for (size_t i = 0; i < n; ++i) {
             float row[4];
             for (int c = 0; c < 4; ++c) row[c] = read(out + (r + i) * 16 + c * 4);
             // row' . x = (R row) . x + row.w + row.p - (R row).p
             float nr[3];
             for (int c = 0; c < 3; ++c) nr[c] = rot[c * 3 + 0] * row[0] + rot[c * 3 + 1] * row[1] + rot[c * 3 + 2] * row[2];
-            const float w = row[3] + dot3(row, p) - dot3(nr, p);
             for (int c = 0; c < 3; ++c) put((r + i) * 4 + c, nr[c]);
-            put((r + i) * 4 + 3, w);
+            if (has_translation) {
+                const float w = row[3] + dot3(row, p) - dot3(nr, p);
+                put((r + i) * 4 + 3, w);
+            }
         }
         ++fixed;
         r += n;
@@ -716,11 +760,12 @@ bool substitute(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSiz
         size_t length = 0;
         const unsigned st = ref->stage;
         if (ref->bank == 255) {
-            if (cur.has_uf[st]) {
+            if (cur.has_uf[st] && size_t(cur.uf_off[st]) + cur.uf_size[st] <= s_cur->bytes.size()) {
                 bytes = s_cur->bytes.data() + cur.uf_off[st];
                 length = cur.uf_size[st];
             }
-        } else if (cur.bank_mask[st] >> ref->bank & 1) {
+        } else if (ref->bank < 16 && (cur.bank_mask[st] >> ref->bank & 1) &&
+                   size_t(cur.bank_off[st][ref->bank]) + cur.bank_size[st][ref->bank] <= s_cur->bytes.size()) {
             bytes = s_cur->bytes.data() + cur.bank_off[st][ref->bank];
             length = cur.bank_size[st][ref->bank];
         }
@@ -746,46 +791,47 @@ bool substitute(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSiz
     if (s_prev_cache.size() != s_cur->units.size()) s_prev_cache.assign(s_cur->units.size(), &s_prev_cache);
     if (s_prev_cache[ref->owner] == &s_prev_cache) s_prev_cache[ref->owner] = match_prev(cur);
     const Unit* prev = static_cast<const Unit*>(s_prev_cache[ref->owner]);
-    // A screen-space draw (no depth test) that is one of several copies of
-    // its program and mesh (the panes of a 2D layout) is never blended: the
-    // most similar copy of N-1 can be another pane, and the blend of two
-    // panes is a shape of neither.
-    if (no_depth && prev) {
-        const auto copies = s_last->occurrences.find(cur.base);
-        if (copies != s_last->occurrences.end() && copies->second > 1) prev = nullptr;
-    }
     ++s_stats.units;
     // Without a match (or with the block unchanged since N-1) frame N's own
     // data is already bound - unless the mouse look turns the view.
-    if (!prev && !s_fix.on) return false;
+    if (!prev && !s_fix.on && !s_fix.cur_on) return false;
     const unsigned stage = ref->stage;
+    if (stage > 1) return false;
     const uint8_t* a = nullptr;
     const uint8_t* b = nullptr;
     size_t size = 0;
     if (ref->bank == 255) {
-        if (!cur.has_uf[stage]) return false;
+        if (!cur.has_uf[stage] || size_t(cur.uf_off[stage]) + cur.uf_size[stage] > s_cur->bytes.size()) return false;
         size = cur.uf_size[stage];
         b = s_cur->bytes.data() + cur.uf_off[stage];
-        if (prev && prev->has_uf[stage] && prev->uf_size[stage] == size) a = s_last->bytes.data() + prev->uf_off[stage];
+        if (prev && prev->has_uf[stage] && prev->uf_size[stage] == size &&
+            size_t(prev->uf_off[stage]) + size <= s_last->bytes.size())
+            a = s_last->bytes.data() + prev->uf_off[stage];
     } else {
         const unsigned bank = ref->bank;
-        if (!(cur.bank_mask[stage] >> bank & 1)) return false;
+        if (bank > 15 || !(cur.bank_mask[stage] >> bank & 1) ||
+            size_t(cur.bank_off[stage][bank]) + cur.bank_size[stage][bank] > s_cur->bytes.size())
+            return false;
         size = cur.bank_size[stage][bank];
         b = s_cur->bytes.data() + cur.bank_off[stage][bank];
-        if (prev && (prev->bank_mask[stage] >> bank & 1) && prev->bank_size[stage][bank] == size)
+        if (prev && (prev->bank_mask[stage] >> bank & 1) && prev->bank_size[stage][bank] == size &&
+            size_t(prev->bank_off[stage][bank]) + size <= s_last->bytes.size())
             a = s_last->bytes.data() + prev->bank_off[stage][bank];
     }
     if (a && std::memcmp(a, b, size) == 0) a = nullptr; // unchanged
-    if (!a && !s_fix.on) return false;                  // keep N's buffer
+    const bool did_blend = a && s_blend_t < 1.0f;
+    const bool use_cur_fix = !did_blend && s_blend_t < 1.0f;
+    const bool want_fix = use_cur_fix ? s_fix.cur_on : s_fix.on;
+    if (!did_blend && !want_fix) return false; // keep N's buffer
     // Blend in host memory: the upload span is write-combined, reading it
     // back (a comparison) cost ~25 us per block.
     thread_local std::vector<uint8_t> blended;
     blended.resize(size);
-    if (a && s_blend_t < 1.0f)
+    if (did_blend)
         blend_bytes(a, b, blended.data(), size, ref->bank == 255);
     else
         std::memcpy(blended.data(), b, size);
-    if (s_fix.on) s_stats.views += apply_view_fix(b, blended.data(), size, ref->bank == 255);
+    if (want_fix) s_stats.views += apply_view_fix(b, blended.data(), size, ref->bank == 255, use_cur_fix);
     if (std::memcmp(blended.data(), b, size) == 0) return false; // nothing moved: N's buffer
     ++s_stats.changed;
     const VkDeviceSize bytes = std::max<VkDeviceSize>(range, size);
@@ -803,6 +849,20 @@ bool substitute(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSiz
     s_substituted[cache_key] = {span.buffer, span.offset};
     if (content_key) s_by_content[content_key] = {span.buffer, span.offset};
     return true;
+}
+// Abandon the current frame's capture immediately (e.g. stage load burst or
+// allocation cap) so upload chunks and deferred resources are never pinned.
+void break_capture() {
+    s_frame_broken = true;
+    s_unit = UINT32_MAX;
+    if (gx2vk::capture::enabled()) {
+        gx2vk::capture::set_enabled(false);
+        gx2vk::capture::discard();
+    }
+    gx2vk::set_capture_hold(0);
+    drop_works(s_works);
+    s_cur->clear();
+    s_span_owner.clear();
 }
 // Capture follows the frame: on while a frame is recorded for interpolation.
 void sync_capture() {
@@ -837,7 +897,7 @@ void set_wanted(bool wanted) {
     s_wanted.store(wanted && mode_enabled(), std::memory_order_relaxed);
 }
 bool capturing() {
-    return !s_replaying && s_wanted.load(std::memory_order_relaxed);
+    return !s_replaying && !s_pending_replay && !s_frame_broken && s_wanted.load(std::memory_order_relaxed);
 }
 bool replaying() {
     return s_replaying;
@@ -850,25 +910,58 @@ void add_busy(uint64_t ns) {
 }
 
 void note_ubo(unsigned stage, unsigned bank, uint64_t buffer, uint64_t offset) {
-    if (s_unit == UINT32_MAX || s_replaying || stage > 1) return;
+    if (s_unit == UINT32_MAX || s_unit >= s_cur->units.size() || !capturing() || stage > 1) return;
     Unit& unit = s_cur->units[s_unit];
     if (unit.ref_count >= sizeof(unit.refs) / sizeof(unit.refs[0])) return;
     const bool own = bank == 255 ? unit.has_uf[stage] : bank < 16 && (unit.bank_mask[stage] >> bank & 1);
     const uint64_t key = span_key(buffer, offset);
     SpanOwner owner{s_unit, uint8_t(stage), uint8_t(bank)};
-    if (own)
-        s_span_owner.try_emplace(key, owner);
-    else if (const auto it = s_span_owner.find(key); it != s_span_owner.end())
-        owner = it->second;
-    else
-        return; // bound before this frame's capture: no bytes to blend
+    try {
+        if (own)
+            s_span_owner.try_emplace(key, owner);
+        else if (const auto it = s_span_owner.find(key); it != s_span_owner.end())
+            owner = it->second;
+        else
+            return; // bound before this frame's capture: no bytes to blend
+    } catch (const std::exception& error) {
+        break_capture();
+        note_replay_fault(error.what());
+        return;
+    } catch (...) {
+        break_capture();
+        note_replay_fault("note_ubo exception");
+        return;
+    }
     unit.refs[unit.ref_count++] = {buffer, offset, owner.unit, owner.stage, owner.bank};
 }
 void before_item() {
-    sync_capture();
+    try {
+        sync_capture();
+    } catch (const std::exception& error) {
+        break_capture();
+        note_replay_fault(error.what());
+    } catch (...) {
+        break_capture();
+        note_replay_fault("before_item exception");
+    }
 } // render thread, before each queue item
+uint64_t s_logical_frame = 0;
 void present_begin() { // gx2_render_present: the present's own commands are not the frame's
+    ++s_logical_frame;
     if (gx2vk::capture::enabled()) gx2vk::capture::set_enabled(false);
+}
+uint64_t logical_frame() {
+    return s_logical_frame;
+}
+bool replay_view(float& blend_t, bool& has_fix, float rot[9], float pivot[3]) {
+    if (!s_replaying) return false;
+    blend_t = s_blend_t;
+    has_fix = s_fix.on;
+    if (s_fix.on) {
+        std::copy(s_fix.rot, s_fix.rot + 9, rot);
+        std::copy(s_fix.pivot, s_fix.pivot + 3, pivot);
+    }
+    return true;
 }
 
 void keep(Gx2AsyncWork* work) {
@@ -876,16 +969,27 @@ void keep(Gx2AsyncWork* work) {
         delete work;
         return;
     }
-    sync_capture();
-    if (!capturing() || !work->replayable() || s_frame_broken) {
+    try {
+        sync_capture();
+        if (!capturing() || !work->replayable()) {
+            delete work;
+            return;
+        }
+        // A loading screen without presents must not grow without bound.
+        if (s_works.size() >= 400000) {
+            delete work;
+            break_capture();
+            return;
+        }
+        s_works.push_back(work);
+    } catch (const std::exception& error) {
         delete work;
-        return;
-    }
-    s_works.push_back(work);
-    // A loading screen without presents must not grow without bound.
-    if (s_works.size() > 400000) {
-        drop_works(s_works);
-        s_frame_broken = true;
+        break_capture();
+        note_replay_fault(error.what());
+    } catch (...) {
+        delete work;
+        break_capture();
+        note_replay_fault("keep exception");
     }
 }
 
@@ -932,37 +1036,77 @@ void draw_unit(uint64_t key, bool transparent) {
     s_unit = UINT32_MAX;
     sync_capture();
     if (!capturing()) return;
-    s_unit = uint32_t(s_cur->units.size());
-    gx2vk::capture::set_unit(s_unit);
-    s_cur->by_key.emplace(full, s_unit);
-    s_cur->occurrences[key] = s_occurrences[key];
-    s_cur->units.push_back({});
-    s_cur->units.back().key = full;
-    s_cur->units.back().base = key;
-    s_cur->units.back().transparent = transparent;
+    if (s_cur->units.size() >= kMaxRecordedUnits) {
+        break_capture();
+        return;
+    }
+    try {
+        const uint32_t idx = uint32_t(s_cur->units.size());
+        s_cur->units.push_back({});
+        s_cur->units.back().key = full;
+        s_cur->units.back().base = key;
+        s_cur->units.back().transparent = transparent;
+        s_cur->by_key.emplace(full, idx);
+        s_cur->occurrences[key] = s_occurrences[key];
+        s_unit = idx;
+        gx2vk::capture::set_unit(s_unit);
+    } catch (const std::exception& error) {
+        break_capture();
+        note_replay_fault(error.what());
+    } catch (...) {
+        break_capture();
+        note_replay_fault("draw_unit exception");
+    }
 }
 
 void record_uf(unsigned stage, const void* data, size_t size) {
-    if (s_unit == UINT32_MAX || s_replaying || stage > 1) return;
-    Unit& unit = s_cur->units[s_unit];
-    unit.uf_off[stage] = s_cur->put(data, size);
-    unit.uf_size[stage] = uint32_t(size);
-    unit.has_uf[stage] = true;
+    if (s_unit == UINT32_MAX || s_unit >= s_cur->units.size() || !capturing() || stage > 1) return;
+    if (size > kMaxRecordedBytes || s_cur->bytes.size() > kMaxRecordedBytes - size) {
+        break_capture();
+        return;
+    }
+    try {
+        const uint32_t offset = s_cur->put(data, size);
+        Unit& unit = s_cur->units[s_unit];
+        unit.uf_off[stage] = offset;
+        unit.uf_size[stage] = uint32_t(size);
+        unit.has_uf[stage] = true;
+    } catch (const std::exception& error) {
+        break_capture();
+        note_replay_fault(error.what());
+    } catch (...) {
+        break_capture();
+        note_replay_fault("record_uf exception");
+    }
 }
 void record_bank(unsigned stage, unsigned bank, const void* data, size_t size) {
-    if (s_unit == UINT32_MAX || s_replaying || stage > 1 || bank > 15) return;
-    Unit& unit = s_cur->units[s_unit];
-    unit.bank_off[stage][bank] = s_cur->put(data, size);
-    unit.bank_size[stage][bank] = uint32_t(size);
-    unit.bank_mask[stage] |= 1u << bank;
+    if (s_unit == UINT32_MAX || s_unit >= s_cur->units.size() || !capturing() || stage > 1 || bank > 15) return;
+    if (size > kMaxRecordedBytes || s_cur->bytes.size() > kMaxRecordedBytes - size) {
+        break_capture();
+        return;
+    }
+    try {
+        const uint32_t offset = s_cur->put(data, size);
+        Unit& unit = s_cur->units[s_unit];
+        unit.bank_off[stage][bank] = offset;
+        unit.bank_size[stage][bank] = uint32_t(size);
+        unit.bank_mask[stage] |= 1u << bank;
+    } catch (const std::exception& error) {
+        break_capture();
+        note_replay_fault(error.what());
+    } catch (...) {
+        break_capture();
+        note_replay_fault("record_bank exception");
+    }
 }
 
 bool replay_uf(unsigned stage, void* data, size_t size) {
     if (!s_replaying || !s_replay_cur || stage > 1 || !s_replay_cur->has_uf[stage] ||
-        s_replay_cur->uf_size[stage] != size)
+        s_replay_cur->uf_size[stage] != size || size_t(s_replay_cur->uf_off[stage]) + size > s_cur->bytes.size())
         return false;
     const uint8_t* cur = s_cur->bytes.data() + s_replay_cur->uf_off[stage];
-    if (s_replay_prev && s_replay_prev->has_uf[stage] && s_replay_prev->uf_size[stage] == size)
+    if (s_replay_prev && s_replay_prev->has_uf[stage] && s_replay_prev->uf_size[stage] == size &&
+        size_t(s_replay_prev->uf_off[stage]) + size <= s_last->bytes.size())
         blend_bytes(s_last->bytes.data() + s_replay_prev->uf_off[stage], cur, static_cast<uint8_t*>(data), size, true);
     else
         std::memcpy(data, cur, size);
@@ -970,11 +1114,13 @@ bool replay_uf(unsigned stage, void* data, size_t size) {
 }
 const uint8_t* replay_bank(unsigned stage, unsigned bank, size_t size) {
     if (!s_replaying || !s_replay_cur || stage > 1 || bank > 15 || !(s_replay_cur->bank_mask[stage] >> bank & 1) ||
-        s_replay_cur->bank_size[stage][bank] != size)
+        s_replay_cur->bank_size[stage][bank] != size ||
+        size_t(s_replay_cur->bank_off[stage][bank]) + size > s_cur->bytes.size())
         return nullptr;
     const uint8_t* cur = s_cur->bytes.data() + s_replay_cur->bank_off[stage][bank];
     s_blend.resize(size);
-    if (s_replay_prev && (s_replay_prev->bank_mask[stage] >> bank & 1) && s_replay_prev->bank_size[stage][bank] == size)
+    if (s_replay_prev && (s_replay_prev->bank_mask[stage] >> bank & 1) && s_replay_prev->bank_size[stage][bank] == size &&
+        size_t(s_replay_prev->bank_off[stage][bank]) + size <= s_last->bytes.size())
         blend_bytes(s_last->bytes.data() + s_replay_prev->bank_off[stage][bank], cur, s_blend.data(), size, false);
     else
         std::memcpy(s_blend.data(), cur, size);
@@ -1016,14 +1162,18 @@ struct Target {
     bool capped = false, vrr = false, lock = false;
 };
 constexpr double kStepsPerSecond = 60000.0 / 1001.0;
-Target compute_target(int frame_rate, bool vrr, bool fixed_refresh) {
+Target compute_target(int frame_rate, bool vrr, bool fixed_refresh, double steps_per_second = kStepsPerSecond) {
     Target t;
     t.hz = gx2vk::display_refresh_hz();
+    if (!std::isfinite(t.hz) || t.hz < 0.0) t.hz = 0.0;
     t.vrr = vrr;
     const bool display = frame_rate == rbrew_settings::kFrameRateDisplay;
-    // 120, 165, 180 and 240 are 2, 2.75, 3 and 4 presents per game step (the
+    // 120, 165, 180 and 240 are 2, 2.75, 3 and 4 presents per 60 Hz step (the
     // game steps 59.94 times a second, so 120 is 119.88 pictures a second).
+    // In 30 Hz scenes (e.g. plaza_60fps=0), steps_per_second is ~29.97 so rate
+    // scales to hit the full display/chosen refresh rate instead of half of it.
     double fps = display ? (t.hz > 0.0 ? t.hz : 120.0) : double(frame_rate) * kStepsPerSecond / 60.0;
+    if (!std::isfinite(fps) || fps < 60.0) fps = 60.0;
     static const bool uncapped = env_on("RBREW_INTERP_UNCAPPED");
     if (t.hz > 0.0 && !uncapped) {
         if (vrr) {
@@ -1039,15 +1189,16 @@ Target compute_target(int frame_rate, bool vrr, bool fixed_refresh) {
         }
     }
     t.fps = fps;
-    t.rate = std::clamp(fps / kStepsPerSecond, 1.0, double(kMaxPerStep - 2));
+    t.rate = std::clamp(fps / steps_per_second, 1.0, double(kMaxPerStep - 2));
     if (t.rate < 1.02) t.rate = 1.0;
     return t;
 }
-Target current_target() {
+Target current_target(double steps_per_second = kStepsPerSecond) {
     const VkPresentModeKHR mode = gx2vk::present_mode();
     const bool immediate = mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
     const bool gsync = rbrew_settings::g_gsync.load(std::memory_order_relaxed);
-    return compute_target(rbrew_settings::g_frame_rate.load(std::memory_order_relaxed), gsync && immediate, !immediate);
+    return compute_target(rbrew_settings::g_frame_rate.load(std::memory_order_relaxed), gsync && immediate, !immediate,
+                          steps_per_second);
 }
 
 // A rate of a/b presents per step (b <= 8) puts every picture on a multiple
@@ -1101,9 +1252,9 @@ unsigned take_slot() {
     return slot;
 }
 uint64_t effective_due(const Shot& shot) {
-    // Never two pictures closer than half a present interval: late ones
-    // spread out again instead of going out in a bunch.
-    const uint64_t gap = uint64_t(0.5 * s_interval_ns / std::max(1.0, s_rate));
+    // Never two pictures closer than 65% of a present interval: late ones
+    // spread out smoothly instead of bunching into alternating short/long gaps.
+    const uint64_t gap = uint64_t(0.65 * s_interval_ns / std::max(1.0, s_rate));
     return std::max(shot.due, s_last_present_ns + gap);
 }
 // Presents the queued pictures whose time has come, in order. Before each
@@ -1112,11 +1263,10 @@ uint64_t effective_due(const Shot& shot) {
 // the next one early, once per step: 8.9 / 3.5 ms instead of 6.2 / 6.2 at
 // 162 FPS); the waits of one burst are bounded.
 void present_due(bool in_burst, int site) {
-    // Keep burst wait very short (<= 0.5 ms): poll() presents between draws of
-    // frame N+1 with sub-0.1 ms accuracy, whereas spinning up to 4 ms here
-    // stalled the render & game threads and caused slowdowns.
-    const uint64_t burst_wait = uint64_t(std::clamp(s_replay_avg_ns * 0.6 + 50000.0, 100000.0, 500000.0));
-    constexpr uint64_t kBurstWaitBudgetNs = 500000;
+    // Keep burst wait bounded (<= 1.2 ms): catches pictures that would otherwise
+    // miss their due time by ~0.5-1 ms during a replay without stalling the game.
+    const uint64_t burst_wait = uint64_t(std::clamp(s_replay_avg_ns * 0.85 + 100000.0, 150000.0, 1200000.0));
+    constexpr uint64_t kBurstWaitBudgetNs = 1200000;
     while (!s_shots.empty()) {
         const Shot shot = s_shots.front();
         const uint64_t due = effective_due(shot);
@@ -1203,10 +1353,10 @@ bool frame_complete(unsigned scan_index) {
     // Why a frame has no in-between frames (stats "why"): not captured,
     // capture broken, no recorded draws, Vulkan capture incomplete, capture
     // started mid-frame.
-    if (!capturing())
-        ++s_stats.why_capture;
-    else if (s_frame_broken)
+    if (s_frame_broken)
         ++s_stats.why_broken;
+    else if (!capturing())
+        ++s_stats.why_capture;
     else if (s_last->units.empty() || s_cur->units.empty())
         ++s_stats.why_units;
     if (vk_mode() && !gx2vk::capture::replay_complete()) ++s_stats.why_incomplete;
@@ -1217,36 +1367,24 @@ bool frame_complete(unsigned scan_index) {
     // full weight it kept the average above the limit for 20+ frames and cut
     // the in-between frames for half a second (2026-10-27).
     // RBREW_INTERP_HITCH_CLAMP=0: full weight.
+    // Detect 30 Hz game cadence (e.g. plaza_60fps=0: 33.37 ms per drawn step)
+    // so the controller budget and target rate match the actual step period.
+    const bool half_rate = s_interval_ns > kLogicFrameNs * 1.7 && s_interval_ns < kLogicFrameNs * 2.3;
+    const double expected_step_ns = half_rate ? 2.0 * kLogicFrameNs : kLogicFrameNs;
+    const double steps_per_second = 1e9 / expected_step_ns;
     static const bool clamp_hitch = !env_off("RBREW_INTERP_HITCH_CLAMP");
-    if (s_last_complete_interval_ns > 0 && s_last_complete_interval_ns < 100e6) {
+    if (s_last_complete_interval_ns > 0 && s_last_complete_interval_ns < expected_step_ns * 6.0) {
         const double sample =
-            clamp_hitch ? std::min(s_last_complete_interval_ns, kLogicFrameNs * 1.5) : s_last_complete_interval_ns;
+            clamp_hitch ? std::min(s_last_complete_interval_ns, expected_step_ns * 1.5) : s_last_complete_interval_ns;
         s_game_interval_ns = s_game_interval_ns ? s_game_interval_ns * 0.85 + sample * 0.15 : sample;
     }
-    // The game must keep its 60 logic steps per second, and the pictures
-    // must stay evenly spaced: the controller changes the rate rarely and
-    // only between the evenly spaced levels of ladder().
-    //
-    // It plans with the render thread's time, the one the in-between frames
-    // take: per step, the frame's own work (80th percentile of the last 64
-    // frames) plus the level's in-between frames at their measured cost must
-    // fit in a step. Down when the current level stops fitting (several
-    // frames running), at once to the highest level that fits with margin, or
-    // one level when the game falls behind while the render thread is the
-    // busy one. Up when the next level fits with a wide margin for a while
-    // and the game keeps up; a level left again soon after a raise is retried
-    // later and later (1 s, doubling up to 20 s). A game that is slow on its
-    // own (render thread with time to spare) keeps its in-between frames:
-    // dropping them would not speed it up, only make it look worse.
-    // (Before 2026-11-19: down whenever the game's frames were slow for 20
-    // frames, back up only after a fast streak, one whole rate at a time - in
-    // the plaza it sat at 60 FPS for 70% of the time and moved 60/120/160.)
-    const Target target = current_target();
+    const Target target = current_target(steps_per_second);
     static std::vector<Level> s_ladder;
     static double s_ladder_target = -1.0;
     static bool s_ladder_lock = false;
     if (target.rate != s_ladder_target || target.lock != s_ladder_lock) {
         s_ladder = ladder(target.rate, target.lock);
+        if (s_ladder.empty()) s_ladder.push_back({1.0, 0.0});
         s_ladder_target = target.rate;
         s_ladder_lock = target.lock;
         s_level = 0;
@@ -1254,7 +1392,7 @@ bool frame_complete(unsigned scan_index) {
     const unsigned levels = unsigned(s_ladder.size() - 1);
     static double s_busy_hist[64]{};
     static unsigned s_busy_n = 0;
-    if (s_last_complete_interval_ns > 0 && s_last_complete_interval_ns < 100e6)
+    if (s_last_complete_interval_ns > 0 && s_last_complete_interval_ns < expected_step_ns * 6.0)
         s_busy_hist[s_busy_n++ % 64] = double(s_busy_last_ns);
     double busy_p80 = 0;
     {
@@ -1269,8 +1407,8 @@ bool frame_complete(unsigned scan_index) {
     // Detect loading screens and hitches before running the controller so a
     // loading transition never drops the rate or inflates s_raise_wait.
     static unsigned s_after_hitch = 0;
-    if (s_last_complete_interval_ns > kLogicFrameNs * 3)
-        s_after_hitch = 10; // > 50 ms
+    if (s_last_complete_interval_ns > expected_step_ns * 3)
+        s_after_hitch = 10; // > 50 ms at 60 Hz, > 100 ms at 30 Hz
     else if (s_after_hitch)
         --s_after_hitch;
     static const bool load_guard = !env_off("RBREW_INTERP_LOAD_GUARD");
@@ -1289,7 +1427,7 @@ bool frame_complete(unsigned scan_index) {
     static unsigned s_over_frames = 0, s_slow_frames = 0, s_fit_frames = 0, s_since_raise = 100000,
                     s_raise_wait = 45;
     if (s_level > levels) s_level = levels;
-    const double step_budget = kLogicFrameNs;
+    const double step_budget = expected_step_ns;
     if (in_transition) {
         s_over_frames = s_slow_frames = 0;
         if (s_after_load == 60) {
@@ -1301,11 +1439,11 @@ bool frame_complete(unsigned scan_index) {
     } else {
         s_over_frames = s_level < levels && load(s_level) > 0.94 * step_budget ? s_over_frames + 1 : 0;
         s_slow_frames =
-            s_level < levels && s_game_interval_ns > kLogicFrameNs * 1.05 && load(s_level) > 0.78 * step_budget
+            s_level < levels && s_game_interval_ns > expected_step_ns * 1.05 && load(s_level) > 0.78 * step_budget
                 ? s_slow_frames + 1
                 : 0;
         s_fit_frames =
-            s_level > 0 && load(s_level - 1) < 0.84 * step_budget && s_game_interval_ns < kLogicFrameNs * 1.04
+            s_level > 0 && load(s_level - 1) < 0.84 * step_budget && s_game_interval_ns < expected_step_ns * 1.04
                 ? s_fit_frames + 1
                 : 0;
         if (s_since_raise < 100000 && ++s_since_raise == 240) s_raise_wait = 45; // held for 4 s
@@ -1350,7 +1488,7 @@ bool frame_complete(unsigned scan_index) {
     s_status.capped = target.capped;
     s_status.vrr = target.vrr;
     s_status.locked = target.lock;
-    s_status.level_fps = float(rate * kStepsPerSecond);
+    s_status.level_fps = float(rate * steps_per_second);
     s_status.active = replay && rate > 1.0;
     if (!replay || rate <= 1.0) {
         // This frame is presented as it is, now: pictures still waiting are
@@ -1361,7 +1499,7 @@ bool frame_complete(unsigned scan_index) {
         s_rate = 1.0;
         ++s_stats.direct;
         drop_works(s_works);
-        if (capturing())
+        if (capturing() || (s_frame_broken && !s_replaying && s_wanted.load(std::memory_order_relaxed)))
             rotate();
         else {
             s_cur->clear();
@@ -1377,7 +1515,7 @@ bool frame_complete(unsigned scan_index) {
     // the position of the next picture and runs on across steps, so any rate
     // works, whole or not (165: 2.75 per step, positions on elevenths).
     const double step_ns =
-        std::fabs(s_interval_ns - kLogicFrameNs) < 0.02 * kLogicFrameNs ? kLogicFrameNs : s_interval_ns;
+        std::fabs(s_interval_ns - expected_step_ns) < 0.03 * expected_step_ns ? expected_step_ns : s_interval_ns;
     const Grid grid = grid_of(rate);
     const double advance = 1.0 / rate;
     if (s_schedule_reset) {
@@ -1395,8 +1533,8 @@ bool frame_complete(unsigned scan_index) {
         if (std::fabs(error) > step_ns * 0.5)
             s_anchor_ns = double(now);
         else {
-            s_anchor_ns = predicted + 0.1 * error;
-            s_jitter_ns = s_jitter_ns * 0.95 + std::fabs(error) * 0.05;
+            s_anchor_ns = predicted + 0.08 * error;
+            s_jitter_ns = s_jitter_ns * 0.98 + std::fabs(error) * 0.02;
         }
         // A changed rate: back onto its grid; the schedule's offset follows gently.
         if (grid.a) s_phase = std::max(1.0, std::round(s_phase * grid.a)) / grid.a;
@@ -1411,6 +1549,7 @@ bool frame_complete(unsigned scan_index) {
     }();
     const double lead_ns = forced_lead_ns >= 0 ? forced_lead_ns : s_lead_ns + std::min(2.0 * s_jitter_ns, 2e6);
     s_plan.count = 0;
+    if (s_phase < 0.0 || s_phase > 1.0 + 1e-6) s_phase = grid.a ? grid.lo : advance;
     while (s_phase <= 1.0 + 1e-6) {
         if (s_plan.count < kMaxPerStep) {
             const double t = s_phase >= 1.0 - 1e-6 ? 1.0 : s_phase;
@@ -1420,24 +1559,36 @@ bool frame_complete(unsigned scan_index) {
         }
         s_phase += advance;
     }
-    s_phase -= 1.0;
+    s_phase = std::max(0.0, s_phase - 1.0);
+    if (s_plan.count == 0) {
+        gx2vk::set_capture_hold(0);
+        drop_shots();
+        s_schedule_reset = true;
+        s_rate = 1.0;
+        ++s_stats.direct;
+        drop_works(s_works);
+        rotate();
+        return false;
+    }
     // Fixed refresh (no G-Sync), one picture per refresh: the presents are
-    // pulled to the middle between two vertical blanks, so every refresh
+    // pulled gently to the middle between two vertical blanks, so every refresh
     // gets exactly one new picture (MAILBOX shows the newest at the blank).
+    // Keep s_lock_offset_ns in [0, p) without discontinuous +-p wraps so
+    // due[0] never jumps backward before replay finishes or skips a refresh.
     uint64_t period = 0, vblank = 0;
     if (target.lock && s_level == 0 && forced_rate <= 0.0 && s_plan.count && gx2vk::display_vblank(period, vblank)) {
         const double p = double(period);
         double x = std::fmod(double(s_plan.due[0]) + s_lock_offset_ns - (double(vblank) + 0.5 * p), p);
         if (x < 0) x += p;
         if (x > 0.5 * p) x -= p; // how far after (before) the middle the first picture would go out
-        s_lock_offset_ns -= 0.15 * x;
-        if (s_lock_offset_ns > 0.5 * p) s_lock_offset_ns -= p;
-        if (s_lock_offset_ns < -0.5 * p) s_lock_offset_ns += p;
+        const double step = std::clamp(-0.10 * x, -150000.0, 150000.0);
+        s_lock_offset_ns = std::clamp(s_lock_offset_ns + step, 0.0, p);
         s_stats.lock_error_ms += std::fabs(x) / 1e6;
         ++s_stats.lock_samples;
     } else
-        s_lock_offset_ns *= 0.9;
-    for (unsigned i = 0; i < s_plan.count; ++i) s_plan.due[i] = uint64_t(double(s_plan.due[i]) + s_lock_offset_ns);
+        s_lock_offset_ns *= 0.95;
+    for (unsigned i = 0; i < s_plan.count; ++i)
+        s_plan.due[i] = uint64_t(std::max(0.0, double(s_plan.due[i]) + s_lock_offset_ns));
     // Room for this step's pictures among the copies (a queue this long means
     // the presents are far behind: the oldest are given up).
     while (!s_shots.empty() && s_shots.size() + s_plan.count + 1 > kSlots - 1) {
@@ -1533,9 +1684,11 @@ void run_replays() {
             s_stats.replay_ms += took / 1e6;
             ++s_stats.replays;
             if (made == 1) {
-                // From N's completion to its first picture: the schedule's lead.
+                // From N's completion to its first picture: smooth asymmetrically
+                // (fast rise to prevent late presents, slow decay to prevent 60 Hz cadence beat).
                 const double lead = double(done - s_last_complete) * 1.1 + 150000.0;
-                s_lead_ns = std::clamp(s_lead_ns * 0.9 + lead * 0.1, 0.3e6, 8e6);
+                const double alpha = lead > s_lead_ns ? 0.15 : 0.02;
+                s_lead_ns = std::clamp(s_lead_ns * (1.0 - alpha) + lead * alpha, 0.3e6, 8e6);
             }
         }
         } catch (const std::exception& error) {
@@ -1549,6 +1702,7 @@ void run_replays() {
         }
         s_blend_t = 0.5f;
         s_fix.on = false;
+        s_fix.cur_on = false;
         if (!ok) replayed_n = false;
         if (ok && s_plan.count && s_plan.t[s_plan.count - 1] >= 1.0f && !replayed_n)
             s_shots.push_back({s_plan.held_slot, s_plan.due[s_plan.count - 1], 1.0f});
@@ -1602,11 +1756,13 @@ void run_replays() {
         // The step's in-between pictures that did not go out yet are given
         // up; frame N takes the first one's time. (Pictures presented during
         // the burst came off the front of the queue: older ones first.)
-        const size_t gone = std::min<size_t>(queued_before, s_stats.presents - presents_before);
+        const size_t presented = s_stats.presents >= presents_before ? size_t(s_stats.presents - presents_before) : 0;
+        const size_t gone = std::min<size_t>(queued_before, presented);
         const size_t keep = std::min(s_shots.size(), queued_before - gone);
         s_stats.dropped += unsigned(s_shots.size() - keep);
         s_shots.resize(keep);
-        s_shots.push_back({s_plan.held_slot, s_plan.due[0], 1.0f});
+        const uint64_t fallback_due = s_plan.count ? s_plan.due[0] : now_ns();
+        s_shots.push_back({s_plan.held_slot, fallback_due, 1.0f});
     } else if (!s_vk_replay && has_n)
         s_shots.push_back({s_plan.held_slot, s_plan.due[s_plan.count - 1], 1.0f});
     rotate();
@@ -1638,6 +1794,23 @@ void note_replay_fault(const char* what) {
     SplatoonDiagnostics::RecordEvent(SplatoonDiagnostics::EventCategory::Engine,
                                      SplatoonDiagnostics::EventSeverity::Warning, 0, message);
 }
+void recover_service_fault(const char* what) {
+    s_replaying = false;
+    s_fix.on = false;
+    s_fix.cur_on = false;
+    s_blend_t = 0.5f;
+    s_replay_cur = s_replay_prev = nullptr;
+    drop_works(s_replay_works);
+    drop_shots();
+    s_schedule_reset = true;
+    s_rate = 1.0;
+    gx2vk::capture::set_enabled(false);
+    gx2vk::capture::discard();
+    gx2vk::set_capture_hold(0);
+    gx2_render_reset_command_tracking();
+    rotate();
+    note_replay_fault(what);
+}
 } // namespace
 
 void service() {
@@ -1646,21 +1819,30 @@ void service() {
         try {
             run_replays();
         } catch (const std::exception& error) {
-            // Outside the replay loops (scheduling, presents): drop the step.
-            s_replaying = false;
-            s_replay_cur = s_replay_prev = nullptr;
-            drop_works(s_replay_works);
-            gx2vk::set_capture_hold(0);
-            note_replay_fault(error.what());
+            recover_service_fault(error.what());
+        } catch (...) {
+            recover_service_fault("unknown exception");
         }
     }
-    present_due(false, 0);
+    try {
+        present_due(false, 0);
+    } catch (const std::exception& error) {
+        recover_service_fault(error.what());
+    } catch (...) {
+        recover_service_fault("present_due exception");
+    }
 }
 
 void poll() {
     if (s_shots.empty() || s_replaying || s_pending_replay) return;
     if (now_ns() < effective_due(s_shots.front())) return;
-    present_due(false, 1);
+    try {
+        present_due(false, 1);
+    } catch (const std::exception& error) {
+        recover_service_fault(error.what());
+    } catch (...) {
+        recover_service_fault("poll exception");
+    }
 }
 
 uint64_t deadline_ns() {

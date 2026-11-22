@@ -30,6 +30,8 @@
 #include <map>
 #include <unordered_map>
 
+void gx2_render_reset_command_tracking(); // gx2_render_vk_draw.cpp
+
 namespace gx2weather {
 namespace {
 using Params = WeatherParams;
@@ -72,12 +74,27 @@ std::map<std::array<uint32_t, 10>, VkPipeline> s_sky_pipelines;
 std::map<VkFormat, VkPipeline> s_rain_pipelines;
 VkDescriptorPool s_pool = VK_NULL_HANDLE;
 unsigned s_pool_sets = 0;
+VkSampler s_sampler_linear = VK_NULL_HANDLE, s_sampler_repeat = VK_NULL_HANDLE, s_sampler_nearest = VK_NULL_HANDLE,
+          s_sampler_dome = VK_NULL_HANDLE;
 gx2vk::Image s_t_lut, s_ms_lut, s_sv_lut, s_shape, s_detail, s_dome, s_dummy2d, s_dummy3d, s_dummy_storage2d,
-    s_dummy_storage3d, s_scene_copy, s_result, s_rays, s_cover, s_ao, s_bloom[5], s_bloom_up[4], s_history,
-    s_next_history, s_taa_out, s_hist, s_curve;
-bool s_curve_valid = false;
+    s_dummy_storage2d_u32, s_dummy_storage3d, s_scene_copy, s_result, s_rays, s_cover, s_ao, s_bloom[5],
+    s_bloom_up[4], s_history, s_next_history, s_taa_out, s_hist, s_curve;
+bool s_curve_valid = false, s_hist_cleared = false;
 Camera s_prev_camera;
-bool s_history_valid = false;
+bool s_history_valid = false, s_prev_camera_valid = false;
+// Persistent dynamic-UBO ring so in-between frames can rewrite weather camera
+// matrices without allocating new descriptor sets during Vulkan replay.
+constexpr uint32_t kUboSlots = 512;
+struct UboSlot {
+    Params params;
+    Camera prev_cam;
+    bool camera_dependent = false;
+    bool has_prev = false;
+};
+gx2vk::Buffer s_ubo;
+uint32_t s_ubo_stride = 0, s_ubo_next = 0;
+std::array<UboSlot, kUboSlots> s_ubo_mirror{};
+uint32_t rewrite_weather_ubo(uint32_t captured_offset);
 // The HDR scene target of this frame (the sky's colour draw), for bloom.
 gx2vk::Image* s_hdr = nullptr;
 uint64_t s_hdr_frame = ~0ull;
@@ -143,7 +160,7 @@ bool prepare() {
     for (uint32_t i = 0; i < kBindingCount; ++i)
         bindings[i] = {
             i,
-            i == kUniform ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+            i == kUniform ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
             : storage(i)  ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                           : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             1,
@@ -174,16 +191,26 @@ bool prepare() {
         !s_ao_pass || !s_bloom_pass || !s_taa_pass || !s_hist_pass || !s_curve_pass)
         return fail("Atmosphere shaders");
     const auto rgba16 = VK_FORMAT_R16G16B16A16_SFLOAT;
+    const VkImageUsageFlags kDummyUsage = kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!make_image(s_t_lut, VK_IMAGE_TYPE_2D, rgba16, 256, 64, 1, kStorageSampled) ||
         !make_image(s_ms_lut, VK_IMAGE_TYPE_2D, rgba16, 32, 32, 1, kStorageSampled) ||
         !make_image(s_sv_lut, VK_IMAGE_TYPE_2D, rgba16, 192, 216, 1, kStorageSampled) ||
         !make_image(s_shape, VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 128, 128, 128, kStorageSampled) ||
         !make_image(s_detail, VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 32, 32, 32, kStorageSampled) ||
-        !make_image(s_dummy2d, VK_IMAGE_TYPE_2D, rgba16, 1, 1, 1, kStorageSampled) ||
-        !make_image(s_dummy3d, VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, kStorageSampled) ||
-        !make_image(s_dummy_storage2d, VK_IMAGE_TYPE_2D, rgba16, 1, 1, 1, kStorageSampled) ||
-        !make_image(s_dummy_storage3d, VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, kStorageSampled))
+        !make_image(s_dummy2d, VK_IMAGE_TYPE_2D, rgba16, 1, 1, 1, kDummyUsage) ||
+        !make_image(s_dummy3d, VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, kDummyUsage) ||
+        !make_image(s_dummy_storage2d, VK_IMAGE_TYPE_2D, rgba16, 1, 1, 1, kDummyUsage) ||
+        !make_image(s_dummy_storage2d_u32, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_UINT, 1, 1, 1, kDummyUsage) ||
+        !make_image(s_dummy_storage3d, VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, kDummyUsage))
         return fail("Atmosphere images");
+    const uint32_t ubo_align =
+        uint32_t(std::max<VkDeviceSize>(256, gx2vk::caps().limits.minUniformBufferOffsetAlignment));
+    s_ubo_stride = uint32_t((sizeof(Params) + ubo_align - 1) / ubo_align) * ubo_align;
+    s_ubo_next = 0;
+    s_ubo = gx2vk::create_buffer(VkDeviceSize(kUboSlots) * s_ubo_stride, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 gx2vk::MemoryUse::Upload);
+    if (!s_ubo.buffer || !s_ubo.memory.mapped) return fail("Atmosphere uniform buffer");
+    gx2vk::capture::register_dynamic_ubo_rewrite(s_layout, &rewrite_weather_ubo);
     return true;
 }
 
@@ -199,7 +226,7 @@ VkDescriptorSet allocate_set() {
     if (!s_pool) {
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kPoolSets * 17},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kPoolSets * 3},
-                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kPoolSets}};
+                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kPoolSets}};
         VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         info.maxSets = kPoolSets;
         info.poolSizeCount = 3;
@@ -236,19 +263,25 @@ struct Bind {
     gx2vk::Image* images[kBindingCount] = {};
     bool depth = false;
 };
-VkDescriptorSet make_set(const Bind& b, const gx2vk::Span& uniform) {
+VkDescriptorSet make_set(const Bind& b) {
     VkDescriptorSet set = allocate_set();
-    if (!set) return VK_NULL_HANDLE;
-    const VkSampler linear =
-        make_sampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-    const VkSampler repeat =
-        make_sampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT);
-    const VkSampler nearest =
-        make_sampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-    const VkSampler dome =
-        make_sampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    if (!set || !s_ubo.buffer) return VK_NULL_HANDLE;
+    if (!s_sampler_linear) {
+        s_sampler_linear = make_sampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        s_sampler_repeat =
+            make_sampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT);
+        s_sampler_nearest = make_sampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        s_sampler_dome =
+            make_sampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    }
+    const VkSampler linear = s_sampler_linear;
+    const VkSampler repeat = s_sampler_repeat;
+    const VkSampler nearest = s_sampler_nearest;
+    const VkSampler dome = s_sampler_dome;
     VkDescriptorImageInfo images[kBindingCount]{};
-    VkDescriptorBufferInfo buffer{uniform.buffer, uniform.offset, sizeof(Params)};
+    VkDescriptorBufferInfo buffer{s_ubo.buffer, 0, sizeof(Params)};
     VkWriteDescriptorSet writes[kBindingCount]{};
     for (uint32_t i = 0; i < kBindingCount; ++i) {
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -256,7 +289,7 @@ VkDescriptorSet make_set(const Bind& b, const gx2vk::Span& uniform) {
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
         if (i == kUniform) {
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             writes[i].pBufferInfo = &buffer;
             continue;
         }
@@ -278,22 +311,113 @@ VkDescriptorSet make_set(const Bind& b, const gx2vk::Span& uniform) {
     vkUpdateDescriptorSets(gx2vk::device(), kBindingCount, writes, 0, nullptr);
     return set;
 }
-gx2vk::Span upload(const Params& params) {
-    auto span =
-        gx2vk::upload(sizeof(Params), std::max<VkDeviceSize>(16, gx2vk::caps().limits.minUniformBufferOffsetAlignment));
-    if (span.data) std::memcpy(span.data, &params, sizeof params);
-    return span;
+uint32_t upload(const Params& params, bool camera_dependent = false) {
+    if (!s_ubo.buffer || !s_ubo.memory.mapped || !s_ubo_stride) return UINT32_MAX;
+    const uint32_t slot = s_ubo_next;
+    s_ubo_next = (s_ubo_next + 1) % kUboSlots;
+    const uint32_t offset = slot * s_ubo_stride;
+    std::memcpy(s_ubo.memory.mapped + offset, &params, sizeof(Params));
+    gx2vk::flush_mapped(s_ubo.memory, offset, sizeof(Params));
+    UboSlot& m = s_ubo_mirror[slot];
+    m.params = params;
+    m.camera_dependent = camera_dependent;
+    m.has_prev = camera_dependent && s_prev_camera_valid;
+    if (m.has_prev) m.prev_cam = s_prev_camera;
+    return offset;
+}
+uint32_t rewrite_weather_ubo(uint32_t captured_offset) {
+    if (!s_ubo.buffer || !s_ubo.memory.mapped || !s_ubo_stride) return captured_offset;
+    const uint32_t slot = captured_offset / s_ubo_stride;
+    if (slot >= kUboSlots) return captured_offset;
+    const UboSlot& src = s_ubo_mirror[slot];
+    if (!src.camera_dependent) return captured_offset;
+    float t = 1.0f;
+    bool has_fix = false;
+    float rot[9]{}, pivot[3]{};
+    if (!gx2interp::replay_view(t, has_fix, rot, pivot)) return captured_offset;
+    if (t >= 1.0f && !has_fix) return captured_offset;
+    Params p = src.params;
+    auto norm3 = [](float v[3]) {
+        const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (l > 1e-6f) {
+            v[0] /= l;
+            v[1] /= l;
+            v[2] /= l;
+            return true;
+        }
+        return false;
+    };
+    float right[3] = {p.cam0[0], p.cam1[0], p.cam2[0]};
+    float up[3] = {p.cam0[1], p.cam1[1], p.cam2[1]};
+    float back[3] = {p.cam0[2], p.cam1[2], p.cam2[2]};
+    float eye[3] = {p.cam0[3], p.cam1[3], p.cam2[3]};
+    if (src.has_prev && t < 1.0f) {
+        const auto& iv = src.prev_cam.inverse_view;
+        const float p_right[3] = {iv[0], iv[4], iv[8]};
+        const float p_up[3] = {iv[1], iv[5], iv[9]};
+        const float p_back[3] = {iv[2], iv[6], iv[10]};
+        const float p_eye[3] = {iv[3], iv[7], iv[11]};
+        const float cos_turn = back[0] * p_back[0] + back[1] * p_back[1] + back[2] * p_back[2];
+        const float dx = eye[0] - p_eye[0], dy = eye[1] - p_eye[1], dz = eye[2] - p_eye[2];
+        if (cos_turn > 0.7f && dx * dx + dy * dy + dz * dz < 40000.0f) {
+            float nb[3], nu[3], nr[3];
+            for (int i = 0; i < 3; ++i) {
+                eye[i] = p_eye[i] + (eye[i] - p_eye[i]) * t;
+                nb[i] = p_back[i] + (back[i] - p_back[i]) * t;
+                nu[i] = p_up[i] + (up[i] - p_up[i]) * t;
+                nr[i] = p_right[i] + (right[i] - p_right[i]) * t;
+            }
+            if (norm3(nb)) {
+                float cr[3] = {nu[1] * nb[2] - nu[2] * nb[1], nu[2] * nb[0] - nu[0] * nb[2],
+                               nu[0] * nb[1] - nu[1] * nb[0]};
+                if (!norm3(cr)) {
+                    std::copy(nr, nr + 3, cr);
+                    norm3(cr);
+                }
+                const float cu[3] = {nb[1] * cr[2] - nb[2] * cr[1], nb[2] * cr[0] - nb[0] * cr[2],
+                                     nb[0] * cr[1] - nb[1] * cr[0]};
+                std::copy(cr, cr + 3, right);
+                std::copy(cu, cu + 3, up);
+                std::copy(nb, nb + 3, back);
+            }
+            p.proj[0] = src.prev_cam.projection[0] + (p.proj[0] - src.prev_cam.projection[0]) * t;
+            p.proj[1] = src.prev_cam.projection[1] + (p.proj[1] - src.prev_cam.projection[1]) * t;
+        }
+    }
+    if (has_fix) {
+        auto apply_rot = [&](float v[3]) {
+            const float x = v[0], y = v[1], z = v[2];
+            v[0] = rot[0] * x + rot[1] * y + rot[2] * z;
+            v[1] = rot[3] * x + rot[4] * y + rot[5] * z;
+            v[2] = rot[6] * x + rot[7] * y + rot[8] * z;
+        };
+        apply_rot(right);
+        apply_rot(up);
+        apply_rot(back);
+        float rel[3] = {eye[0] - pivot[0], eye[1] - pivot[1], eye[2] - pivot[2]};
+        apply_rot(rel);
+        for (int i = 0; i < 3; ++i) eye[i] = pivot[i] + rel[i];
+    }
+    p.cam0[0] = right[0]; p.cam0[1] = up[0]; p.cam0[2] = back[0]; p.cam0[3] = eye[0];
+    p.cam1[0] = right[1]; p.cam1[1] = up[1]; p.cam1[2] = back[1]; p.cam1[3] = eye[1];
+    p.cam2[0] = right[2]; p.cam2[1] = up[2]; p.cam2[2] = back[2]; p.cam2[3] = eye[2];
+    const uint32_t out_slot = s_ubo_next;
+    s_ubo_next = (s_ubo_next + 1) % kUboSlots;
+    const uint32_t out_offset = out_slot * s_ubo_stride;
+    std::memcpy(s_ubo.memory.mapped + out_offset, &p, sizeof(Params));
+    gx2vk::flush_mapped(s_ubo.memory, out_offset, sizeof(Params));
+    return out_offset;
 }
 bool dispatch(VkPipeline pipeline, const Bind& b, const Params& params, uint32_t x, uint32_t y, uint32_t z,
-              gx2vk::Image* written) {
-    const auto uniform = upload(params);
-    if (!uniform.data) return false;
-    VkDescriptorSet set = make_set(b, uniform);
+              gx2vk::Image* written, bool camera_dependent = false) {
+    const uint32_t dyn_offset = upload(params, camera_dependent);
+    if (dyn_offset == UINT32_MAX) return false;
+    VkDescriptorSet set = make_set(b);
     if (!set) return false;
     const auto cb = gx2vk::cmd();
     gx2vk::barrier_if_dirty();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_layout, 0, 1, &set, 0, nullptr);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_layout, 0, 1, &set, 1, &dyn_offset);
     vkCmdDispatch(cb, x, y, z);
     if (written) gx2vk::note_gpu_write(*written);
     return true;
@@ -532,6 +656,16 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
     Params p{};
     fill(p, f, w, h);
     if (!s_static_ready) {
+        // Zero all dummy images once so unbound descriptor slots (e.g. raysTexture
+        // when rays are disabled) never sample uninitialized VRAM.
+        gx2vk::barrier_if_dirty();
+        const VkClearColorValue zero{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const auto cb = gx2vk::cmd();
+        for (auto* dummy : {&s_dummy2d, &s_dummy3d, &s_dummy_storage2d, &s_dummy_storage2d_u32, &s_dummy_storage3d}) {
+            vkCmdClearColorImage(cb, dummy->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            gx2vk::note_gpu_write(*dummy);
+        }
         Bind b;
         b.images[kOut2D] = &s_t_lut;
         dispatch(s_transmittance, b, p, 256 / 8, 64 / 8, 1, &s_t_lut);
@@ -616,9 +750,16 @@ VkPipeline sky_pipeline(const VkFormat* colors, VkFormat depth, bool stencil) {
     VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blending.attachmentCount = 8;
     blending.pAttachments = blend;
-    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    // Match the guest draw pipeline's core dynamic states so binding the sky or
+    // rain pipeline never invalidates depth/stencil/cull/restart dynamic state
+    // (VUID-vkCmdDrawIndexed-None-07844/07845/07847).
+    const VkDynamicState dynamic_states[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,        VK_DYNAMIC_STATE_SCISSOR,           VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE,      VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+        VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 2;
+    dynamic.dynamicStateCount = uint32_t(sizeof(dynamic_states) / sizeof(dynamic_states[0]));
     dynamic.pDynamicStates = dynamic_states;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 8;
@@ -683,9 +824,16 @@ VkPipeline rain_pipeline(VkFormat format) {
     VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blending.attachmentCount = 1;
     blending.pAttachments = &blend;
-    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    // Match the guest draw pipeline's core dynamic states so binding the sky or
+    // rain pipeline never invalidates depth/stencil/cull/restart dynamic state
+    // (VUID-vkCmdDrawIndexed-None-07844/07845/07847).
+    const VkDynamicState dynamic_states[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,        VK_DYNAMIC_STATE_SCISSOR,           VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE,      VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+        VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 2;
+    dynamic.dynamicStateCount = uint32_t(sizeof(dynamic_states) / sizeof(dynamic_states[0]));
     dynamic.pDynamicStates = dynamic_states;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 1;
@@ -758,6 +906,9 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
         !gx2vk::format_supports(color.desc.format, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT))
         return false;
     gx2r::end_rendering();
+    // Present any due 165/240 Hz in-between picture before running ~1-2 ms of
+    // weather compute passes so frame cadence stays flat.
+    gx2interp::poll();
     struct PauseCapture {
         bool was = gx2vk::capture::enabled();
         PauseCapture() {
@@ -794,6 +945,17 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
     ++s_frame_index;
     Params p{};
     fill(p, f, w, h);
+    // Temporal AA (RBREW_TAA=0: off) with the previous frame's camera.
+    static const bool taa_enabled = [] {
+        const char* v = std::getenv("RBREW_TAA");
+        return !(v && v[0] == '0');
+    }();
+    const bool will_taa =
+        taa_enabled && !gx2interp::capturing() && settings.antialiasing && !(settings.camera_motion && settings.cinema_mode);
+    // Without TAA (e.g. during 165 Hz interpolation), keep spatial dithering
+    // stationary across frames so AO, volumetric shafts and contact shadows
+    // never shimmer/flicker at 60 Hz.
+    if (!will_taa) p.clouds[2] = 0.f;
     const bool rays = settings.sun_rays && f.sky.sun_elevation > -1.5f && f.sky.rain < 0.6f;
     {
         if (!make_image(s_scene_copy, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1,
@@ -821,17 +983,19 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
             r.images[kOut2D] = &s_rays;
             r.images[kShape] = &s_shape;
             r.images[kDetail] = &s_detail; // volumetric shafts sample the clouds
-            dispatch(s_rays_pass, r, p, (s_rays.desc.width + 7) / 8, (s_rays.desc.height + 7) / 8, 1, &s_rays);
+            dispatch(s_rays_pass, r, p, (s_rays.desc.width + 7) / 8, (s_rays.desc.height + 7) / 8, 1, &s_rays, true);
         }
         if (p.depth_range[3] > 0) {
             Bind a;
             a.images[kDepth] = &depth;
             a.depth = true;
             a.images[kOut2D] = &s_ao;
-            dispatch(s_ao_pass, a, p, (s_ao.desc.width + 7) / 8, (s_ao.desc.height + 7) / 8, 1, &s_ao);
+            dispatch(s_ao_pass, a, p, (s_ao.desc.width + 7) / 8, (s_ao.desc.height + 7) / 8, 1, &s_ao, true);
         }
         // Bloom chain from the HDR scene target (compute, kBloom).
-        bool bloom = p.depth_range[2] > 0 && s_hdr && s_hdr_frame == gx2vk::present_count() && *s_hdr;
+        // Keyed by logical game frame (not gx2vk::present_count(), which advances
+        // mid-frame on 165/240 Hz in-between presents via gx2interp::poll()).
+        bool bloom = p.depth_range[2] > 0 && s_hdr && s_hdr_frame == gx2interp::logical_frame() && *s_hdr;
         constexpr VkImageUsageFlags kBloomUsage = kStorageSampled;
         for (int i = 0; bloom && i < 5; ++i) {
             const uint32_t bw = std::max(1u, w >> (i + 1)), bh = std::max(1u, h >> (i + 1));
@@ -867,19 +1031,20 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
             const char* v = std::getenv("RBREW_TONE_MATCH");
             return v && v[0] == '1';
         }(); // experimental, off by default
+        const bool hist_was = bool(s_hist);
         bool curve = tone_match && settings.realistic_look &&
                      make_image(s_hist, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_UINT, 128, 1, 1,
                                 kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
                      make_image(s_curve, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, 256, 1, 1, kStorageSampled);
+        if (!hist_was && s_hist) s_hist_cleared = false;
         if (curve) {
-            static bool cleared = false;
-            if (!cleared) {
+            if (!s_hist_cleared) {
                 gx2vk::barrier_if_dirty();
                 const VkClearColorValue zero{};
                 const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 vkCmdClearColorImage(gx2vk::cmd(), s_hist.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
                 gx2vk::note_gpu_write(s_hist);
-                cleared = true;
+                s_hist_cleared = true;
             }
             Params hp = p;
             hp.look[1] = 0.8f; // how far towards the reference distribution (partly: no equalising of dark corners)
@@ -899,6 +1064,7 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
         Bind c;
         c.images[kTransmittance] = &s_t_lut;
         c.images[kShape] = &s_shape;
+        c.images[kDetail] = &s_detail;
         c.images[kDepth] = &depth;
         c.depth = true;
         c.images[kColor] = &s_scene_copy;
@@ -910,21 +1076,19 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
         c.images[kDome] = &s_dome;
         c.images[kBloom0] = bloom ? &s_bloom_up[0] : nullptr;
         c.images[kToneMap] = curve ? &s_curve : nullptr;
-        if (curve) c.images[kDomeImage] = &s_hist;
-        dispatch(s_composite, c, cp, (w + 7) / 8, (h + 7) / 8, 1, &s_result);
+        // kComposite declares binding 12 (lookHistogram) as r32ui uimage2D: always
+        // bind an R32_UINT storage image (never the RGBA16F dummy) to satisfy
+        // VUID-vkCmdDispatch-format-07753.
+        c.images[kDomeImage] = curve ? &s_hist : &s_dummy_storage2d_u32;
+        dispatch(s_composite, c, cp, (w + 7) / 8, (h + 7) / 8, 1, &s_result, true);
         gx2vk::Image* final_image = &s_result;
-        // Temporal AA (RBREW_TAA=0: off) with the previous frame's camera.
-        static const bool taa_enabled = [] {
-            const char* v = std::getenv("RBREW_TAA");
-            return !(v && v[0] == '0');
-        }();
         s_history_valid =
             s_history_valid && s_history && s_next_history && s_history.desc.width == w && s_history.desc.height == h;
         // Skip temporal TAA accumulation while 120/165 FPS in-between replay is
         // capturing: replaying TAA with frame N's camera matrices on a blended
         // in-between view ghosts against s_history (FXAA + AO + bloom + sky/clouds
         // + colour grade all stay active on every in-between frame).
-        if (taa_enabled && !gx2interp::capturing() && settings.antialiasing && !(settings.camera_motion && settings.cinema_mode) &&
+        if (will_taa &&
             make_image(s_history, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1,
                        kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
             make_image(s_next_history, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1, kStorageSampled) &&
@@ -956,7 +1120,6 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
                 s_history_valid = false;
         } else
             s_history_valid = false;
-        s_prev_camera = camera;
         gx2vk::barrier_if_dirty();
         vkCmdBlitImage(gx2vk::cmd(), final_image->image, VK_IMAGE_LAYOUT_GENERAL, color.image, VK_IMAGE_LAYOUT_GENERAL,
                        1, &blit, VK_FILTER_NEAREST);
@@ -964,13 +1127,13 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
     }
     if (p.clouds[1] > 0.001f && s_cover && (color.desc.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
         if (const auto pipeline = rain_pipeline(color.desc.format)) {
-            const auto uniform = upload(p);
+            const uint32_t dyn_offset = upload(p, true);
             Bind b;
             b.images[kDepth] = &depth;
             b.depth = true;
             b.images[kTransmittance] = &s_t_lut;
             b.images[kCover] = &s_cover;
-            VkDescriptorSet set = uniform.data ? make_set(b, uniform) : VK_NULL_HANDLE;
+            VkDescriptorSet set = dyn_offset != UINT32_MAX ? make_set(b) : VK_NULL_HANDLE;
             if (set) {
                 const auto cb = gx2vk::cmd();
                 gx2vk::barrier_if_dirty();
@@ -986,15 +1149,24 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
                 rendering.pColorAttachments = &attachment;
                 vkCmdBeginRendering(cb, &rendering);
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &set, 0, nullptr);
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &set, 1, &dyn_offset);
                 const VkViewport viewport{0, 0, float(w), float(h), 0, 1};
                 const VkRect2D scissor{{0, 0}, {w, h}};
                 vkCmdSetViewport(cb, 0, 1, &viewport);
                 vkCmdSetScissor(cb, 0, 1, &scissor);
+                vkCmdSetCullMode(cb, VK_CULL_MODE_NONE);
+                vkCmdSetFrontFace(cb, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+                vkCmdSetDepthTestEnable(cb, VK_FALSE);
+                vkCmdSetDepthWriteEnable(cb, VK_FALSE);
+                vkCmdSetDepthCompareOp(cb, VK_COMPARE_OP_ALWAYS);
+                vkCmdSetStencilTestEnable(cb, VK_FALSE);
+                vkCmdSetDepthBiasEnable(cb, VK_FALSE);
+                vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
                 const unsigned grid = unsigned(p.effects[2]);
                 vkCmdDraw(cb, 12, grid * grid, 0, 0);
                 gx2_count_gpu_draw();
                 vkCmdEndRendering(cb);
+                gx2_render_reset_command_tracking();
                 gx2vk::note_gpu_write(color);
             }
         }
@@ -1023,6 +1195,8 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
             }
         }
     }
+    s_prev_camera = camera;
+    s_prev_camera_valid = true;
     // The next frame's sky draw samples the LUTs and the dome inside rendering.
     gx2vk::barrier_if_dirty();
     gx2r::note_framebuffer_changed();
@@ -1134,31 +1308,40 @@ bool draw_sky(uint8_t* memory, VkCommandBuffer cb, const VkFormat* colors, VkFor
     if (!find_camera(memory, camera)) return false;
     f.camera = camera;
     f.sky = sky;
+    f.settings = rbrew_settings::get();
     const uint32_t w = target->image.desc.width, h = target->image.desc.height;
     const VkPipeline pipeline = sky_pipeline(colors, depth, stencil);
     if (!pipeline) return false;
     Params p{};
     fill(p, f, w, h);
-    const auto uniform = upload(p);
-    if (!uniform.data) return false;
+    const uint32_t dyn_offset = upload(p, true);
+    if (dyn_offset == UINT32_MAX) return false;
     Bind b;
     b.images[kTransmittance] = &s_t_lut;
     b.images[kSkyView] = &s_sv_lut;
     b.images[kDetail] = &s_detail;
     b.images[kDome] = &s_dome;
-    VkDescriptorSet set = make_set(b, uniform);
+    VkDescriptorSet set = make_set(b);
     if (!set) return false;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &set, 0, nullptr);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &set, 1, &dyn_offset);
     const VkViewport viewport{0, 0, float(w), float(h), 1, 1};
     const VkRect2D scissor{{0, 0}, {w, h}};
     vkCmdSetViewport(cb, 0, 1, &viewport);
     vkCmdSetScissor(cb, 0, 1, &scissor);
+    vkCmdSetCullMode(cb, VK_CULL_MODE_NONE);
+    vkCmdSetFrontFace(cb, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    vkCmdSetDepthTestEnable(cb, depth != VK_FORMAT_UNDEFINED ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthWriteEnable(cb, VK_FALSE);
+    vkCmdSetDepthCompareOp(cb, VK_COMPARE_OP_LESS_OR_EQUAL);
+    vkCmdSetStencilTestEnable(cb, VK_FALSE);
+    vkCmdSetDepthBiasEnable(cb, VK_FALSE);
+    vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
     vkCmdDraw(cb, 3, 1, 0, 0);
     gx2_count_gpu_draw();
     gx2vk::note_gpu_write(target->image);
     s_hdr = &target->image;
-    s_hdr_frame = gx2vk::present_count();
+    s_hdr_frame = gx2interp::logical_frame();
     return true;
 }
 
@@ -1235,7 +1418,11 @@ void observe_draw(uint8_t* memory, uint32_t primitive, uint32_t count) {
     // is every later draw into the TV image (hud_hidden). RBREW_CINEMA_ANY=0
     // limits it to the plaza with shaders on, as before.
     auto& s = gx2r::state();
-    const uint32_t now = uint32_t(gx2vk::present_count());
+    // Use the render-thread logical game frame index, NOT gx2vk::present_count():
+    // at 165/240 Hz, gx2interp::poll() presents in-between frames mid-frame and
+    // increments present_count(), which previously reset depth/world_draws/applied
+    // mid-frame and caused shader_quality=3 / realistic_look / bloom to flicker or skip.
+    const uint32_t now = uint32_t(gx2interp::logical_frame());
     {
         static const bool any_scene = [] {
             const char* v = std::getenv("RBREW_CINEMA_ANY");
@@ -1288,7 +1475,10 @@ void observe_draw(uint8_t* memory, uint32_t primitive, uint32_t count) {
         const auto sky = gx2env::sky_state();
         if (sky.scene_type != s_frame.sky.scene_type || sky.scene_id != s_frame.sky.scene_id) {
             s_history_valid = false;
+            s_prev_camera_valid = false;
             s_curve_valid = false;
+            s_hdr = nullptr;
+            s_hdr_frame = ~0ull;
         }
         s_frame.sky = sky;
         allowed = s_frame.sky.active;
@@ -1479,6 +1669,7 @@ void shutdown() {
                         &s_dummy2d,
                         &s_dummy3d,
                         &s_dummy_storage2d,
+                        &s_dummy_storage2d_u32,
                         &s_dummy_storage3d,
                         &s_scene_copy,
                         &s_result,
@@ -1511,14 +1702,22 @@ void shutdown() {
         if (*pipeline) vkDestroyPipeline(device, *pipeline, nullptr);
         *pipeline = VK_NULL_HANDLE;
     }
+    gx2vk::capture::register_dynamic_ubo_rewrite(VK_NULL_HANDLE, nullptr);
+    gx2vk::destroy_buffer(s_ubo);
+    s_ubo_stride = 0;
+    s_ubo_next = 0;
     if (s_pool) vkDestroyDescriptorPool(device, s_pool, nullptr);
     if (s_layout) vkDestroyPipelineLayout(device, s_layout, nullptr);
     if (s_set_layout) vkDestroyDescriptorSetLayout(device, s_set_layout, nullptr);
     s_pool = VK_NULL_HANDLE;
     s_pool_sets = 0;
+    s_sampler_linear = s_sampler_repeat = s_sampler_nearest = s_sampler_dome = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
     s_set_layout = VK_NULL_HANDLE;
     s_cover_mapping = {};
+    s_hdr = nullptr;
+    s_hdr_frame = ~0ull;
+    s_curve_valid = s_hist_cleared = s_history_valid = s_prev_camera_valid = false;
     s_failed = false;
     s_static_ready = s_skyview_ready = false;
     s_dome_quality = 0;

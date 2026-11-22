@@ -76,6 +76,12 @@ void record_bank(unsigned stage, unsigned bank, const void* data, size_t size);
 // (255: the register block), for the Vulkan replay's substitution.
 void note_ubo(unsigned stage, unsigned bank, uint64_t buffer, uint64_t offset);
 void present_begin(); // gx2_render_present starts (not part of the frame)
+// Monotonic render-thread logical game frame index (advances once per
+// gx2_render_present, never on mid-frame in-between presents).
+uint64_t logical_frame();
+// During an in-between replay: current blend factor t in [0, 1] and optional
+// display-rate mouse orbit (row-major 3x3 rotation + world pivot).
+bool replay_view(float& blend_t, bool& has_fix, float rot[9], float pivot[3]);
 void before_item();   // render thread: a queue item is about to run
 // Replay: blended bytes for this draw, or false/nullptr (use guest memory).
 bool replay_uf(unsigned stage, void* data, size_t size);

@@ -67,6 +67,8 @@ struct PassInfo {
 };
 uint32_t s_unit = UINT32_MAX;
 Substitute s_substitute = nullptr;
+VkPipelineLayout s_dyn_rewrite_layout = VK_NULL_HANDLE;
+DynamicOffsetRewrite s_dyn_rewrite_fn = nullptr;
 
 // Packets: {header, body}; body = a trivially copyable functor taking the
 // command buffer, followed by the arrays it points into. Blocks never move,
@@ -78,6 +80,9 @@ struct Header {
     Thunk fn;
 };
 constexpr size_t kBlock = size_t(4) << 20;
+constexpr size_t kMaxBlocks = 32;        // 128 MiB cap: prevents OOM during stage loads without presents
+constexpr size_t kKeepBlocks = 4;        // 16 MiB steady-state retention after spikes
+constexpr size_t kMaxPackets = 500000;   // caps per-frame command count during stage loads
 constexpr size_t align16(size_t n) {
     return (n + 15) & ~size_t(15);
 }
@@ -93,6 +98,8 @@ struct Arena {
     std::vector<std::unique_ptr<uint8_t[]>> blocks;
     size_t block = 0, used = 0, commands = 0, set_binds = 0;
     bool complete = true;
+    bool in_rendering = false; // true while a captured BeginRendering lacks a captured EndRendering
+    uint32_t open_pass_tag = 0;
     struct Spot {
         size_t block, offset;
     };
@@ -104,23 +111,36 @@ struct Arena {
         commands = 0;
         set_binds = 0;
         complete = true;
+        in_rendering = false;
+        open_pass_tag = 0;
         packets.clear();
         passes.clear();
+        if (blocks.size() > kKeepBlocks) blocks.resize(kKeepBlocks);
     }
-    uint8_t* reserve(size_t body, Thunk fn, bool render_op = false) {
+    void mark_incomplete() {
+        complete = false;
+        gx2vk::set_capture_hold(0);
+    }
+    uint8_t* reserve(size_t body, Thunk fn, bool render_op = false, uint32_t tag_override = UINT32_MAX) {
+        if (!complete) return nullptr;
         const size_t size = sizeof(Header) + align16(body);
-        if (size > kBlock) {
-            complete = false;
+        if (size > kBlock || packets.size() >= kMaxPackets) {
+            mark_incomplete();
             return nullptr;
         }
         if (blocks.empty()) blocks.emplace_back(new uint8_t[kBlock]);
         if (used + size > kBlock) {
+            if (block + 1 >= kMaxBlocks) {
+                mark_incomplete();
+                return nullptr;
+            }
             ++block;
             used = 0;
             if (block == blocks.size()) blocks.emplace_back(new uint8_t[kBlock]);
         }
+        const uint32_t tag = tag_override == UINT32_MAX ? s_pass_tag : tag_override;
         uint8_t* p = blocks[block].get() + used;
-        Header h{uint32_t(size), (s_pass_tag & kPassMask) | (render_op ? kRenderOpBit : 0u), fn};
+        Header h{uint32_t(size), (tag & kPassMask) | (render_op ? kRenderOpBit : 0u), fn};
         std::memcpy(p, &h, sizeof(h));
         packets.push_back({block, used});
         used += size;
@@ -149,12 +169,13 @@ bool blend_pass(uint32_t pass) {
 template <class F> void thunk(uint8_t* body, VkCommandBuffer cb) {
     (*reinterpret_cast<F*>(body))(cb);
 }
-template <class Make> void cap(size_t extra, Make make, bool render_op = false) {
+template <class Make> bool cap(size_t extra, Make make, bool render_op = false, uint32_t tag_override = UINT32_MAX) {
     using F = decltype(make(static_cast<uint8_t*>(nullptr)));
     static_assert(std::is_trivially_copyable_v<F>);
-    uint8_t* body = s_capture->reserve(align16(sizeof(F)) + extra, &thunk<F>, render_op);
-    if (!body) return;
+    uint8_t* body = s_capture->reserve(align16(sizeof(F)) + extra, &thunk<F>, render_op, tag_override);
+    if (!body) return false;
     new (body) F(make(body + align16(sizeof(F))));
+    return true;
 }
 template <class T> const T* put(uint8_t*& cursor, const T* src, uint32_t count) {
     if (!src || !count) return nullptr;
@@ -215,14 +236,25 @@ bool blend_without_depth() {
     return on;
 }
 VKAPI_ATTR void VKAPI_CALL c_SetDepthTestEnable(VkCommandBuffer cb, VkBool32 e) {
+    if (!s_replaying) s_depth_test = e != VK_FALSE;
     if (capturing()) {
-        s_depth_test = e != VK_FALSE;
         cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdSetDepthTestEnable(c, e); }; });
     }
     prev.SetDepthTestEnable(cb, e);
 }
+bool s_replay_in_rendering = false;
 VKAPI_ATTR void VKAPI_CALL c_EndRendering(VkCommandBuffer cb) {
-    if (capturing()) cap(0, [=](uint8_t*) { return [=](VkCommandBuffer c) { vkCmdEndRendering(c); }; }, true);
+    if (capturing() && s_capture->in_rendering) {
+        if (cap(0, [=](uint8_t*) {
+                return [=](VkCommandBuffer c) {
+                    vkCmdEndRendering(c);
+                    s_replay_in_rendering = false;
+                };
+            }, true)) {
+            s_capture->in_rendering = false;
+            s_capture->open_pass_tag = 0;
+        }
+    }
     s_pass_tag = 0;
     prev.EndRendering(cb);
 }
@@ -298,7 +330,14 @@ VKAPI_ATTR void VKAPI_CALL c_BindDescriptorSets(VkCommandBuffer cb, VkPipelineBi
         cap(bytes(sets, count) + bytes(dyn, dyn_count), [=](uint8_t* p) {
             const VkDescriptorSet* sx = put(p, sets, count);
             const uint32_t* dx = put(p, dyn, dyn_count);
-            return [=](VkCommandBuffer c) { vkCmdBindDescriptorSets(c, bp, l, first, count, sx, dyn_count, dx); };
+            return [=](VkCommandBuffer c) {
+                if (dyn_count == 1 && dx && s_dyn_rewrite_fn && l == s_dyn_rewrite_layout) {
+                    const uint32_t rewritten = s_dyn_rewrite_fn(dx[0]);
+                    vkCmdBindDescriptorSets(c, bp, l, first, count, sx, 1, &rewritten);
+                } else {
+                    vkCmdBindDescriptorSets(c, bp, l, first, count, sx, dyn_count, dx);
+                }
+            };
         });
     prev.BindDescriptorSets(cb, bp, l, first, count, sets, dyn_count, dyn);
 }
@@ -378,7 +417,7 @@ VKAPI_ATTR void VKAPI_CALL c_PushDescriptorSet(VkCommandBuffer cb, VkPipelineBin
             }
         }
         if (!simple)
-            s_capture->complete = false;
+            s_capture->mark_incomplete();
         else {
             const uint32_t unit = s_unit;
             const uint32_t pass = s_capture->passes.empty() ? UINT32_MAX : uint32_t(s_capture->passes.size() - 1);
@@ -417,7 +456,11 @@ VKAPI_ATTR void VKAPI_CALL c_BeginRendering(VkCommandBuffer cb, const VkRenderin
         const uint64_t w = info->renderArea.extent.width, h = info->renderArea.extent.height;
         const bool screen = w >= 320 && h && (w * 9 > h * 16 ? w * 9 - h * 16 : h * 16 - w * 9) * 32 <= w * 9;
         const bool has_depth = info->pDepthAttachment && info->pDepthAttachment->imageView != VK_NULL_HANDLE;
-        if (!has_depth) s_depth_test = false;
+        // Do NOT clobber s_depth_test here when !has_depth: note_draw_depth()
+        // already AND-s with pass_has_depth, while gx2_render_vk_draw caches
+        // depthTestEnable across render passes and elides redundant
+        // vkCmdSetDepthTestEnable(VK_TRUE) calls on subsequent depth passes
+        // (e.g., water/transparent passes after a color-only refraction copy).
         s_pass_tag = uint32_t(s_capture->passes.size() + 1);
         s_capture->passes.push_back({uint64_t(reinterpret_cast<uintptr_t>(target)), 0, screen, uint32_t(w), uint32_t(h),
                                      info->colorAttachmentCount > 0, has_depth});
@@ -427,45 +470,81 @@ VKAPI_ATTR void VKAPI_CALL c_BeginRendering(VkCommandBuffer cb, const VkRenderin
                             (!info->pDepthAttachment || !info->pDepthAttachment->pNext) &&
                             (!info->pStencilAttachment || !info->pStencilAttachment->pNext);
         if (!simple)
-            s_capture->complete = false;
-        else
-            cap(
-                bytes(info, 1) + bytes(info->pColorAttachments, info->colorAttachmentCount) +
-                    bytes(info->pDepthAttachment, 1) + bytes(info->pStencilAttachment, 1),
-                [=](uint8_t* p) {
-                    VkRenderingInfo* ix = const_cast<VkRenderingInfo*>(put(p, info, 1));
-                    ix->pColorAttachments = put(p, info->pColorAttachments, info->colorAttachmentCount);
-                    ix->pDepthAttachment = put(p, info->pDepthAttachment, info->pDepthAttachment ? 1u : 0u);
-                    ix->pStencilAttachment = put(p, info->pStencilAttachment, info->pStencilAttachment ? 1u : 0u);
-                    return [=](VkCommandBuffer c) { vkCmdBeginRendering(c, ix); };
-                },
-                true);
+            s_capture->mark_incomplete();
+        else {
+            // If a prior BeginRendering somehow remained open in the capture,
+            // close it before opening the next rendering instance.
+            if (s_capture->in_rendering) {
+                cap(0, [=](uint8_t*) {
+                    return [=](VkCommandBuffer c) {
+                        vkCmdEndRendering(c);
+                        s_replay_in_rendering = false;
+                    };
+                }, true, s_capture->open_pass_tag);
+                s_capture->in_rendering = false;
+                s_capture->open_pass_tag = 0;
+            }
+            if (cap(
+                    bytes(info, 1) + bytes(info->pColorAttachments, info->colorAttachmentCount) +
+                        bytes(info->pDepthAttachment, 1) + bytes(info->pStencilAttachment, 1),
+                    [=](uint8_t* p) {
+                        VkRenderingInfo* ix = const_cast<VkRenderingInfo*>(put(p, info, 1));
+                        ix->pColorAttachments = put(p, info->pColorAttachments, info->colorAttachmentCount);
+                        ix->pDepthAttachment = put(p, info->pDepthAttachment, info->pDepthAttachment ? 1u : 0u);
+                        ix->pStencilAttachment = put(p, info->pStencilAttachment, info->pStencilAttachment ? 1u : 0u);
+                        return [=](VkCommandBuffer c) {
+                            vkCmdBeginRendering(c, ix);
+                            s_replay_in_rendering = true;
+                        };
+                    },
+                    true)) {
+                s_capture->in_rendering = true;
+                s_capture->open_pass_tag = s_pass_tag;
+            }
+        }
     }
     prev.BeginRendering(cb, info);
 }
 VKAPI_ATTR void VKAPI_CALL c_PipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo* d) {
-    if (capturing()) {
-        const bool simple =
-            !d->pNext &&
-            std::all_of(d->pMemoryBarriers, d->pMemoryBarriers + d->memoryBarrierCount,
-                        [](const VkMemoryBarrier2& b) { return !b.pNext; }) &&
-            std::all_of(d->pBufferMemoryBarriers, d->pBufferMemoryBarriers + d->bufferMemoryBarrierCount,
-                        [](const VkBufferMemoryBarrier2& b) { return !b.pNext; }) &&
-            std::all_of(d->pImageMemoryBarriers, d->pImageMemoryBarriers + d->imageMemoryBarrierCount,
-                        [](const VkImageMemoryBarrier2& b) { return !b.pNext; });
-        if (!simple)
-            s_capture->complete = false;
-        else
-            cap(bytes(d, 1) + bytes(d->pMemoryBarriers, d->memoryBarrierCount) +
-                    bytes(d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount) +
-                    bytes(d->pImageMemoryBarriers, d->imageMemoryBarrierCount),
-                [=](uint8_t* p) {
-                    VkDependencyInfo* dx = const_cast<VkDependencyInfo*>(put(p, d, 1));
-                    dx->pMemoryBarriers = put(p, d->pMemoryBarriers, d->memoryBarrierCount);
-                    dx->pBufferMemoryBarriers = put(p, d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount);
-                    dx->pImageMemoryBarriers = put(p, d->pImageMemoryBarriers, d->imageMemoryBarrierCount);
-                    return [=](VkCommandBuffer c) { vkCmdPipelineBarrier2(c, dx); };
-                });
+    if (capturing() && d) {
+        // Never capture one-time image initialization transitions (UNDEFINED ->
+        // GENERAL) recorded on gx2vk's separate prologue command buffer during
+        // create_image(): replaying them inside BeginRendering is invalid
+        // Vulkan (VUID-vkCmdPipelineBarrier2-None-09553/09554/oldLayout-01181)
+        // and re-transitioning from UNDEFINED discards live image contents.
+        bool is_image_init = false;
+        for (uint32_t i = 0; i < d->imageMemoryBarrierCount; ++i) {
+            if (d->pImageMemoryBarriers[i].oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                d->pImageMemoryBarriers[i].newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+                is_image_init = true;
+                break;
+            }
+        }
+        const bool illegal_in_rendering =
+            s_capture->in_rendering && (d->imageMemoryBarrierCount > 0 || d->bufferMemoryBarrierCount > 0);
+        if (!is_image_init && !illegal_in_rendering) {
+            const bool simple =
+                !d->pNext &&
+                std::all_of(d->pMemoryBarriers, d->pMemoryBarriers + d->memoryBarrierCount,
+                            [](const VkMemoryBarrier2& b) { return !b.pNext; }) &&
+                std::all_of(d->pBufferMemoryBarriers, d->pBufferMemoryBarriers + d->bufferMemoryBarrierCount,
+                            [](const VkBufferMemoryBarrier2& b) { return !b.pNext; }) &&
+                std::all_of(d->pImageMemoryBarriers, d->pImageMemoryBarriers + d->imageMemoryBarrierCount,
+                            [](const VkImageMemoryBarrier2& b) { return !b.pNext; });
+            if (!simple)
+                s_capture->mark_incomplete();
+            else
+                cap(bytes(d, 1) + bytes(d->pMemoryBarriers, d->memoryBarrierCount) +
+                        bytes(d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount) +
+                        bytes(d->pImageMemoryBarriers, d->imageMemoryBarrierCount),
+                    [=](uint8_t* p) {
+                        VkDependencyInfo* dx = const_cast<VkDependencyInfo*>(put(p, d, 1));
+                        dx->pMemoryBarriers = put(p, d->pMemoryBarriers, d->memoryBarrierCount);
+                        dx->pBufferMemoryBarriers = put(p, d->pBufferMemoryBarriers, d->bufferMemoryBarrierCount);
+                        dx->pImageMemoryBarriers = put(p, d->pImageMemoryBarriers, d->imageMemoryBarrierCount);
+                        return [=](VkCommandBuffer c) { vkCmdPipelineBarrier2(c, dx); };
+                    });
+        }
     }
     prev.PipelineBarrier2(cb, d);
 }
@@ -629,6 +708,19 @@ bool plaza() {
     return s_plaza.load(std::memory_order_relaxed);
 }
 void finish_frame() {
+    // gx2_render_present() calls present_begin() (disabling capture) before
+    // end_rendering(): close any still-open captured rendering instance so the
+    // replay command stream is always balanced.
+    if (s_capture->complete && s_capture->in_rendering) {
+        cap(0, [=](uint8_t*) {
+            return [=](VkCommandBuffer c) {
+                vkCmdEndRendering(c);
+                s_replay_in_rendering = false;
+            };
+        }, true, s_capture->open_pass_tag);
+        s_capture->in_rendering = false;
+        s_capture->open_pass_tag = 0;
+    }
     s_push_depth_flags.clear();
     std::swap(s_capture, s_replay);
     s_capture->clear();
@@ -650,6 +742,10 @@ size_t replay_set_binds() {
 }
 bool replay_complete() {
     return s_replay->complete && s_replay->commands;
+}
+void register_dynamic_ubo_rewrite(VkPipelineLayout layout, DynamicOffsetRewrite fn) {
+    s_dyn_rewrite_layout = fn ? layout : VK_NULL_HANDLE;
+    s_dyn_rewrite_fn = fn;
 }
 void replay(Substitute substitute) {
     // Which targets blend. The 3D scene is drawn in two passes with depth (a
@@ -744,9 +840,25 @@ void replay(Substitute substitute) {
                          blend_target(pass.target) ? "  <- blend" : "");
         std::fflush(pass_log);
     }
+    if (!s_replay->complete || s_replay->packets.empty()) return;
     s_substitute = substitute;
     s_replaying = true;
+    s_replay_in_rendering = false;
     VkCommandBuffer cb = gx2vk::cmd();
+    // Always restore replay state and close any open dynamic rendering instance
+    // even if a substitution callback throws (otherwise s_replaying would stay
+    // true permanently and kill all subsequent frame captures).
+    struct ReplayGuard {
+        VkCommandBuffer cb;
+        ~ReplayGuard() {
+            if (s_replay_in_rendering) {
+                vkCmdEndRendering(cb);
+                s_replay_in_rendering = false;
+            }
+            s_replaying = false;
+            s_substitute = nullptr;
+        }
+    } guard{cb};
     // Tiny passes (128x1, 1x1: the eye adaptation's luminance) blend the old
     // value with the new one. Run again per in-between frame they sped the
     // adaptation up, and with two in-between frames (180 FPS) the exposure ran
@@ -772,7 +884,5 @@ void replay(Substitute substitute) {
         }
         h.fn(p + sizeof(Header), cb);
     }
-    s_replaying = false;
-    s_substitute = nullptr;
 }
 } // namespace gx2vk::capture

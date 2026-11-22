@@ -35,6 +35,10 @@ bool replay_complete();    // the replay frame captured every command it needs
 constexpr uint32_t kNoDepthTest = 0x80000000u;
 using Substitute = bool (*)(uint32_t unit, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range,
                             VkBuffer& out_buffer, VkDeviceSize& out_offset);
+// Optional dynamic-UBO offset rewriter for a specific pipeline layout during
+// in-between replay (e.g. gx2_weather's camera UBO). Pass nullptr to clear.
+using DynamicOffsetRewrite = uint32_t (*)(uint32_t captured_offset);
+void register_dynamic_ubo_rewrite(VkPipelineLayout layout, DynamicOffsetRewrite fn);
 void replay(Substitute substitute);
 } // namespace gx2vk::capture
 

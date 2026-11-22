@@ -37,22 +37,26 @@ public:
             std::lock_guard lock(mutex_);
             fn_ = &fn;
             bands_ = bands;
-            next_ = 0;
-            remaining_ = bands;
+            next_.store(0, std::memory_order_relaxed);
+            remaining_.store(bands, std::memory_order_relaxed);
             ++generation_;
         }
         ready_.notify_all();
-        work();
-        std::unique_lock lock(mutex_);
-        done_.wait(lock, [this] { return remaining_ == 0; });
-        fn_ = nullptr;
+        work(&fn, bands);
+        {
+            std::unique_lock lock(mutex_);
+            done_.wait(lock, [this] { return remaining_.load(std::memory_order_acquire) == 0 && active_ == 0; });
+            fn_ = nullptr;
+        }
     }
 
 private:
     BandPool() {
-        unsigned n = 3;
-        if (const char* v = std::getenv("RBREW_DETILE_WORKERS")) n = unsigned(std::strtoul(v, nullptr, 10));
         const unsigned cores = std::thread::hardware_concurrency();
+        // Scale helpers smoothly from 6-core (3 helpers) up to 16-core CPUs (8 helpers),
+        // leaving headroom for game/render/audio threads.
+        unsigned n = cores >= 4 ? std::clamp(cores / 4u, 3u, 8u) : 3u;
+        if (const char* v = std::getenv("RBREW_DETILE_WORKERS")) n = unsigned(std::strtoul(v, nullptr, 10));
         if (cores > 1)
             n = std::min(n, cores - 1);
         else
@@ -76,35 +80,38 @@ private:
     void loop() {
         uint64_t seen = 0;
         for (;;) {
+            const std::function<void(unsigned)>* fn = nullptr;
+            unsigned bands = 0;
             {
                 std::unique_lock lock(mutex_);
                 ready_.wait(lock, [&] { return exit_ || generation_ != seen; });
                 if (exit_) return;
                 seen = generation_;
+                fn = fn_;
+                bands = bands_;
+                if (fn) ++active_;
             }
-            work();
+            if (fn) {
+                work(fn, bands);
+                std::lock_guard lock(mutex_);
+                if (--active_ == 0 && remaining_.load(std::memory_order_acquire) == 0) done_.notify_all();
+            }
         }
     }
-    void work() {
+    void work(const std::function<void(unsigned)>* fn, unsigned bands) {
         for (;;) {
-            const std::function<void(unsigned)>* fn;
-            unsigned band;
-            {
-                std::lock_guard lock(mutex_);
-                if (!fn_ || next_ >= bands_) return;
-                fn = fn_;
-                band = next_++;
-            }
+            const unsigned band = next_.fetch_add(1, std::memory_order_relaxed);
+            if (band >= bands) return;
             (*fn)(band);
-            std::lock_guard lock(mutex_);
-            if (--remaining_ == 0) done_.notify_all();
+            remaining_.fetch_sub(1, std::memory_order_acq_rel);
         }
     }
     std::mutex run_mutex_, mutex_;
     std::condition_variable ready_, done_;
     std::vector<std::thread> threads_;
     const std::function<void(unsigned)>* fn_ = nullptr;
-    unsigned bands_ = 0, next_ = 0, remaining_ = 0;
+    unsigned bands_ = 0, active_ = 0;
+    std::atomic<unsigned> next_{0}, remaining_{0};
     uint64_t generation_ = 0;
     bool exit_ = false;
 };
@@ -160,27 +167,42 @@ bool detile_elements(const Gx2DetileDesc& d, const uint8_t* tiled, size_t tiled_
         const bool tiled_rows =
             d.width >= 8 && d.tile_mode >= 4 && d.tile_mode <= 15 && uint64_t(d.width) * d.height >= 512;
         std::array<uint32_t, 64> offsets;
+        uint32_t offsets_or = 0;
         if (tiled_rows) {
             const uint32_t origin = address_of(0, 0);
             for (unsigned y = 0; y < 8; ++y)
-                for (unsigned x = 0; x < 8; ++x) offsets[y * 8 + x] = address_of(x, y) ^ origin;
+                for (unsigned x = 0; x < 8; ++x) {
+                    const uint32_t o = address_of(x, y) ^ origin;
+                    offsets[y * 8 + x] = o;
+                    offsets_or |= o;
+                }
         }
         auto rows = [&](uint32_t y0, uint32_t y1) {
             for (uint32_t y = y0; y < y1; ++y) {
                 uint32_t x = 0;
-                if (tiled_rows)
+                uint8_t* dst_row = out + size_t(y) * d.width * Bytes;
+                if (tiled_rows) {
+                    const uint32_t* row_offsets = offsets.data() + (y & 7) * 8;
                     for (; uint64_t(x) + 8 <= d.width; x += 8) {
                         const uint32_t base = address_of(x, y & ~7u);
-                        for (unsigned i = 0; i < 8; ++i) {
-                            const uint32_t address = base ^ offsets[(y & 7) * 8 + i];
-                            if (uint64_t(address) + Bytes > tiled_size) return false;
-                            std::memcpy(out + (size_t(y) * d.width + x + i) * Bytes, tiled + address, Bytes);
+                        uint8_t* dst = dst_row + size_t(x) * Bytes;
+                        // (base ^ o) <= (base | o) <= (base | offsets_or) for all o in offsets.
+                        if (uint64_t(base | offsets_or) + Bytes <= tiled_size) {
+                            for (unsigned i = 0; i < 8; ++i)
+                                std::memcpy(dst + size_t(i) * Bytes, tiled + (base ^ row_offsets[i]), Bytes);
+                        } else {
+                            for (unsigned i = 0; i < 8; ++i) {
+                                const uint32_t address = base ^ row_offsets[i];
+                                if (uint64_t(address) + Bytes > tiled_size) return false;
+                                std::memcpy(dst + size_t(i) * Bytes, tiled + address, Bytes);
+                            }
                         }
                     }
+                }
                 for (; x < d.width; ++x) {
                     const uint32_t address = address_of(x, y);
                     if (uint64_t(address) + Bytes > tiled_size) return false;
-                    std::memcpy(out + (size_t(y) * d.width + x) * Bytes, tiled + address, Bytes);
+                    std::memcpy(dst_row + size_t(x) * Bytes, tiled + address, Bytes);
                 }
             }
             return true;

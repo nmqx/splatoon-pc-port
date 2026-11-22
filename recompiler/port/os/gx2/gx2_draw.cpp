@@ -1,5 +1,6 @@
 #include <cstring>
 #include "../../runtime/rbrew_diagnostics.h"
+#include "../../runtime/splatoon_diagnostics.h"
 #include "../../runtime/texture_diagnostics.h"
 // GX2 draw, state, shader, texture, and surface stubs
 
@@ -18,7 +19,9 @@
 #include "gx2_surface_layout.h"
 #include "gx2_state_api.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <immintrin.h>
 #include <thread>
@@ -1088,15 +1091,98 @@ static void GX2CalcSurfaceSizeAndAlignment(CPUState* cpu) {
     desc.use = read(GX2SURF_USE);
     desc.tile_mode = read(GX2SURF_TILE_MODE);
     desc.swizzle = read(GX2SURF_SWIZZLE);
-    // Reject a missing layout explicitly instead of publishing an undersized
-    // allocation.
-    const auto layout = rbrew_gx2_calc_surface_layout(desc);
+    auto layout = rbrew_gx2_calc_surface_layout(desc);
     if (!layout) {
+        if (desc.format == 0) {
+            // Uninitialized / dummy GX2Surface (GX2_SURFACE_FORMAT_INVALID, e.g.
+            // default-constructed agl::TextureData wrapped for _PaintDummy00 during
+            // Recon/stage load before the DRC paint texture is allocated). Real
+            // gx2.rpl returns a zero-sized layout rather than aborting.
+            static std::atomic<uint32_t> s_empty_logs{0};
+            if (s_empty_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                char msg[50];
+                std::snprintf(msg, sizeof(msg), "GX2Surf empty d=%u %ux%u lr=%08X", desc.dim, desc.width, desc.height,
+                              cpu->lr);
+                SplatoonDiagnostics::RecordEvent(SplatoonDiagnostics::EventCategory::Graphics,
+                                                 SplatoonDiagnostics::EventSeverity::Info, 0, msg);
+            }
+            rbrew_write32(MEM, surf + GX2SURF_MIP_LEVELS, std::clamp(desc.levels, 1u, 14u));
+            rbrew_write32(MEM, surf + GX2SURF_IMAGE_SIZE, 0);
+            rbrew_write32(MEM, surf + GX2SURF_MIPMAP_SIZE, 0);
+            rbrew_write32(MEM, surf + GX2SURF_TILE_MODE, desc.tile_mode);
+            rbrew_write32(MEM, surf + GX2SURF_SWIZZLE, desc.swizzle & 0xFF00FFFFu);
+            rbrew_write32(MEM, surf + GX2SURF_ALIGNMENT, 256);
+            rbrew_write32(MEM, surf + GX2SURF_PITCH, 0);
+            for (uint32_t i = 0; i < 13; ++i) rbrew_write32(MEM, surf + GX2SURF_MIP_OFFSETS + i * 4, 0);
+            return;
+        }
         RBREW_LOG_ERROR_BEGIN("gx2",
                               "unsupported surface layout dim=%u fmt=%X tile=%u aa=%u "
                               "mips=%u lr=%08X\n",
                               desc.dim, desc.format, desc.tile_mode, desc.aa, desc.levels, cpu->lr);
-        abort();
+        static std::atomic<uint32_t> s_fallback_logs{0};
+        const bool log_diag = s_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16;
+        if (log_diag) {
+            char msg[50];
+            std::snprintf(msg, sizeof(msg), "GX2Surf d=%u f=%X t=%u a=%u m=%u %X", desc.dim, desc.format,
+                          desc.tile_mode, desc.aa, desc.levels, cpu->lr);
+            SplatoonDiagnostics::RecordEvent(SplatoonDiagnostics::EventCategory::Graphics,
+                                             SplatoonDiagnostics::EventSeverity::Warning, 0, msg);
+        }
+        // Try a conservative single-sample fallback for MSAA, bank-swapped/3D tile
+        // modes, or >14 mips so guest allocations are never undersized.
+        const uint32_t aa_samples = 1u << std::min(desc.aa, 3u);
+        RbrewGx2SurfaceDesc norm = desc;
+        if (norm.dim == 6)
+            norm.dim = 1;
+        else if (norm.dim == 7)
+            norm.dim = 5;
+        else if (norm.dim > 5)
+            norm.dim = 1;
+        norm.aa = 0;
+        if (norm.tile_mode >= 8 && norm.tile_mode <= 15) {
+            static constexpr uint32_t kMacroMap[8] = {4, 5, 6, 7, 4, 7, 4, 7};
+            norm.tile_mode = kMacroMap[norm.tile_mode - 8];
+        } else if (norm.tile_mode > 16) {
+            norm.tile_mode = 0;
+        }
+        if (norm.levels > 14) norm.levels = 14;
+        layout = rbrew_gx2_calc_surface_layout(norm);
+        if (layout) {
+            if (aa_samples > 1) {
+                const uint64_t scaled = uint64_t(layout->image_size) * aa_samples;
+                layout->image_size = scaled > UINT32_MAX ? UINT32_MAX : uint32_t(scaled);
+            }
+            if (desc.tile_mode >= 8 && desc.tile_mode <= 15) layout->tile_mode = desc.tile_mode;
+        } else {
+            // Last-resort upper bound for unmodeled non-zero formats (e.g. 96-bit)
+            // instead of aborting the live process.
+            const uint32_t w = std::max(1u, desc.width);
+            const uint32_t h = std::max(1u, desc.height);
+            const uint32_t slices =
+                desc.dim == 3 ? std::max(6u, desc.depth)
+                              : ((desc.dim == 2 || desc.dim == 4 || desc.dim == 5 || desc.dim == 7)
+                                     ? std::max(1u, desc.depth)
+                                     : 1u);
+            const uint64_t pitch64 = (uint64_t(w) + 63u) & ~63ull;
+            const uint32_t pitch = pitch64 > UINT32_MAX ? UINT32_MAX : uint32_t(pitch64);
+            const uint64_t bytes = pitch64 * h * slices * 16u * aa_samples;
+            if (log_diag) {
+                char msg[50];
+                std::snprintf(msg, sizeof(msg), "GX2Surf fallback f=%X %ux%u lr=%08X", desc.format, w, h, cpu->lr);
+                SplatoonDiagnostics::RecordEvent(SplatoonDiagnostics::EventCategory::Graphics,
+                                                 SplatoonDiagnostics::EventSeverity::Error, 0, msg);
+            }
+            rbrew_write32(MEM, surf + GX2SURF_MIP_LEVELS, 1);
+            rbrew_write32(MEM, surf + GX2SURF_IMAGE_SIZE, bytes > UINT32_MAX ? UINT32_MAX : uint32_t(bytes));
+            rbrew_write32(MEM, surf + GX2SURF_MIPMAP_SIZE, 0);
+            rbrew_write32(MEM, surf + GX2SURF_TILE_MODE, desc.tile_mode);
+            rbrew_write32(MEM, surf + GX2SURF_SWIZZLE, desc.swizzle & 0xFF00FFFFu);
+            rbrew_write32(MEM, surf + GX2SURF_ALIGNMENT, 256);
+            rbrew_write32(MEM, surf + GX2SURF_PITCH, pitch);
+            for (uint32_t i = 0; i < 13; ++i) rbrew_write32(MEM, surf + GX2SURF_MIP_OFFSETS + i * 4, 0);
+            return;
+        }
     }
     rbrew_write32(MEM, surf + GX2SURF_MIP_LEVELS, layout->levels);
     rbrew_write32(MEM, surf + GX2SURF_IMAGE_SIZE, layout->image_size);

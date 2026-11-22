@@ -26,6 +26,11 @@
 #include "vk/gx2_vk_shader.h"
 #include "vk/gx2_compile_queue.h"
 #include "vk/gx2_last_lookup.h"
+
+namespace gx2vk {
+void stage_buffer_copy(VkBuffer src, VkDeviceSize src_offset, VkBuffer dst, VkDeviceSize dst_offset,
+                       VkDeviceSize size); // gx2_vk.cpp
+}
 #include "../os_common.h"
 #include <algorithm>
 #include <array>
@@ -288,7 +293,11 @@ bool gx2r::rendering_active() {
 VkRect2D gx2r::render_area() {
     return s_area;
 }
-void gx2r::note_framebuffer_changed() {}
+uint64_t s_fb_generation = 0;
+
+void gx2r::note_framebuffer_changed() {
+    ++s_fb_generation;
+}
 
 void gx2r::query_rendering_begin(VkCommandBuffer cb) {
     begin_segment_query(cb);
@@ -679,7 +688,7 @@ struct LastSampler {
     VkSampler sampler = VK_NULL_HANDLE;
     bool shadow = false, integer = false;
 };
-std::array<LastSampler, 64> s_sampler_mru{};
+std::array<LastSampler, 128> s_sampler_mru{};
 } // namespace
 VkSampler gx2r::tex_object_sampler(const TexParams& p, bool shadow, bool integer) {
     uint32_t bias_bits, min_bits;
@@ -830,12 +839,16 @@ struct Program {
     // Per stage, bit b set when uniform bank b / texture slot b has a binding
     // (create_program_layouts); draws visit only those, in ascending order.
     std::array<uint32_t, 2> live_banks{}, live_textures{}, tex_scale_mask{};
+    // True when mode==1, offset_remapped==0, and every mapped_index in [0, remapped.size())
+    // is written by info.remapped (allows build_stage to skip zeroing the packed prefix).
+    std::array<bool, 2> remapped_dense{};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     bool valid = false;
     struct UfBlockSlot {
         std::string bytes;
         gx2vk::Span span;
         uint64_t reserved_serial = 0;
+        uint64_t sig = 0;
     };
     std::array<std::array<UfBlockSlot, 4>, 2> ufblock_slots{};
     std::array<uint8_t, 2> ufblock_mru{}, ufblock_next{};
@@ -847,7 +860,7 @@ struct ProgMru {
     Program* prog = nullptr;
     bool valid = false;
 };
-std::array<ProgMru, 128> s_prog_mru{};
+std::array<ProgMru, 256> s_prog_mru{};
 std::unordered_map<uint64_t, Program*> s_prog_cache;
 std::unordered_map<uint64_t, std::unique_ptr<Program>> s_prog_by_source;
 uint32_t s_next_program = 1;
@@ -1005,6 +1018,18 @@ bool create_program_layouts(Program& p, bool allow_push = true) {
         const auto& vk = p.info[stage].vk;
         const VkShaderStageFlags flags = stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
         p.live_banks[stage] = p.live_textures[stage] = p.tex_scale_mask[stage] = 0;
+        p.remapped_dense[stage] = false;
+        if (p.info[stage].uniform_mode == 1 && vk.offset_remapped == 0 && !p.info[stage].remapped.empty()) {
+            const size_t n = p.info[stage].remapped.size();
+            std::vector<uint8_t> covered(n, 0);
+            size_t count = 0;
+            for (const auto& entry : p.info[stage].remapped)
+                if (entry.mapped_index < n && !covered[entry.mapped_index]) {
+                    covered[entry.mapped_index] = 1;
+                    ++count;
+                }
+            p.remapped_dense[stage] = (count == n);
+        }
         for (unsigned b = 0; b < 16; ++b)
             if (vk.uniform_buffer_bindings[b] >= 0) p.live_banks[stage] |= 1u << b;
         for (unsigned t = 0; t < 18; ++t) {
@@ -1544,6 +1569,40 @@ bool translation_predates_fixes(const char* glsl) {
     }
     return false;
 }
+// Reject cached (vs, ps) translations from before the default VS output fix
+// where PS declares a passParameterSem input at location N that VS never
+// exports (VUID-RuntimeSpirv-OpEntryPoint-08743). Non-streamout VS only.
+bool translation_pair_predates_fixes(const char* vs, const char* ps, uint32_t vs_streamout_mask) {
+    if (!vs || !ps || vs_streamout_mask) return false;
+    auto location_mask = [](std::string_view text, std::string_view marker) -> uint32_t {
+        uint32_t mask = 0;
+        constexpr std::string_view kPrefix = "layout(location = ";
+        for (size_t at = text.find(kPrefix); at != std::string_view::npos;
+             at = text.find(kPrefix, at + kPrefix.size())) {
+            size_t p = at + kPrefix.size();
+            uint32_t loc = 0;
+            bool digits = false;
+            while (p < text.size() && text[p] >= '0' && text[p] <= '9') {
+                digits = true;
+                loc = loc * 10u + uint32_t(text[p] - '0');
+                if (loc >= 32u) {
+                    digits = false;
+                    break;
+                }
+                ++p;
+            }
+            if (!digits || p >= text.size() || text[p] != ')') continue;
+            const size_t eol = text.find_first_of(";\n", p);
+            const std::string_view line = text.substr(p, eol == std::string_view::npos ? text.size() - p : eol - p);
+            if (line.find(marker) != std::string_view::npos) mask |= 1u << loc;
+        }
+        return mask;
+    };
+    const uint32_t ps_in = location_mask(ps, "in vec4 passParameterSem");
+    if (!ps_in) return false;
+    const uint32_t vs_out = location_mask(vs, "out vec4 ");
+    return (ps_in & ~vs_out) != 0;
+}
 bool load_translation(uint64_t key, char*& vs, char*& ps, std::array<R700TranslationInfo, 2>& info) {
     const std::string dir = translation_cache_dir();
     if (dir.empty()) return false;
@@ -1628,7 +1687,9 @@ bool load_translation(uint64_t key, char*& vs, char*& ps, std::array<R700Transla
     }
     uint32_t end = read_u32();
     if (end != kTranslationMagic) ok = false;
-    if (ok && (translation_predates_fixes(v) || translation_predates_fixes(p))) ok = false;
+    if (ok && (translation_predates_fixes(v) || translation_predates_fixes(p) ||
+               translation_pair_predates_fixes(v, p, loaded[0].streamout_mask)))
+        ok = false;
     if (!ok) {
         std::free(v);
         std::free(p);
@@ -1943,8 +2004,8 @@ std::unordered_map<uint64_t, ExactReads> s_exact_reads;
 // and any newer write still compare every byte. Read masks only grow through
 // emplace; their count invalidates a key computed before a mask was discovered.
 struct ExactKeyInputs {
-    std::array<uint32_t, kExactKeyRegisterCount> words{};
-    std::array<uint32_t, 36> texture_bits{};
+    std::array<uint32_t, kExactKeyRegisterCount> words;
+    std::array<uint32_t, 36> texture_bits;
     uint64_t fetch_hash = 0;
     uint32_t rect = 0, points = 0, vs_attribs = 0;
     bool operator==(const ExactKeyInputs&) const = default;
@@ -2010,13 +2071,24 @@ std::vector<ExactKeyMemo> s_exact_key_memos;
 ExactKeyMemo* s_last_exact_key_memo = nullptr; // previous draw's slot: consecutive draws often repeat it
 ExactKeyMemo& exact_key_memo_slot(const ExactKeyInputs& in, const GX2ShaderProgram& vs, const GX2ShaderProgram& ps) {
     if (s_exact_key_memos.empty()) s_exact_key_memos.resize(kExactKeyMemoSlots);
-    KeyHash h;
-    const uint32_t ranges[] = {vs.address, vs.size, ps.address, ps.size, in.rect, in.points, in.vs_attribs};
-    h.add(ranges, sizeof(ranges));
-    h.add(in.words.data(), sizeof(in.words));
-    h.add(in.texture_bits.data(), sizeof(in.texture_bits));
-    h.add(&in.fetch_hash, sizeof(in.fetch_hash));
-    return s_exact_key_memos[h.finish() & (kExactKeyMemoSlots - 1)];
+    // Only chooses a 10-bit cache slot; hit() checks full ExactKeyInputs equality.
+    uint64_t h = (uint64_t(vs.address) << 32 | vs.size) * 0x9E3779B97F4A7C15ull;
+    h ^= (uint64_t(ps.address) << 32 | ps.size) * 0xBF58476D1CE4E5B9ull;
+    h ^= in.fetch_hash * 0x94D049BB133111EBull;
+    h ^= (uint64_t(in.rect) << 40) | (uint64_t(in.points) << 32) | in.vs_attribs;
+    for (size_t i = 0; i + 2 <= in.words.size(); i += 2) {
+        uint64_t w;
+        std::memcpy(&w, in.words.data() + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+    }
+    if (in.words.size() & 1) h = (h ^ in.words.back()) * 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < in.texture_bits.size(); i += 2) {
+        uint64_t w;
+        std::memcpy(&w, in.texture_bits.data() + i, 8);
+        h = (h ^ w) * 0xBF58476D1CE4E5B9ull;
+    }
+    h ^= h >> 33;
+    return s_exact_key_memos[h & (kExactKeyMemoSlots - 1)];
 }
 
 // Canonical translation identity: the exact key's inputs with every register
@@ -2855,7 +2927,7 @@ struct PipelineReqMru {
     VkPipeline val = VK_NULL_HANDLE;
     uint64_t epoch = 0;
 };
-static std::array<PipelineReqMru, 64> s_pipeline_req_mru{};
+static std::array<PipelineReqMru, 256> s_pipeline_req_mru{};
 
 VkPipeline get_pipeline(const PipelineRequest& r) {
     const PipelineSwitches s = pipeline_switches(*r.program);
@@ -2891,12 +2963,11 @@ VkPipeline get_pipeline(const PipelineRequest& r) {
         }
         s_last_pipeline_lookup.remember(key.view(), entry);
     }
-#if RBREW_GAME_REVISION != 16 // the updates (v272, v288)
-    // A demand draw must never be dropped while its pipeline compiles: one-time
-    // targets such as pre-painted ink would lose their stamp for the whole session.
-#else
+    // On v272/v288, s_async_draw is gated by transient_cleared_target() so
+    // persistent targets (pre-painted ink maps, cubemaps, captures) never set
+    // s_async_draw and always wait synchronously, while per-frame cleared
+    // scene/post targets skip compiling pipelines instead of freezing for seconds.
     if (still_compiling(*entry)) return VK_NULL_HANDLE;
-#endif
     VkPipeline result = await_compile(*entry);
     if (result != VK_NULL_HANDLE) {
         mru.req = r;
@@ -3093,22 +3164,28 @@ bool warmup_enabled() {
 struct WarmState {
     std::string dir;           // translation cache directory the file belongs to
     std::FILE* file = nullptr; // append handle
+    uint32_t unflushed = 0;
     bool started = false;
     std::deque<WarmPipelineRecord> pending;
     std::unordered_set<uint64_t> programs, masks, pipelines; // already recorded (hash of record)
 };
 WarmState s_warm;
+std::mutex s_warm_file_mutex;
 uint64_t warm_hash(const void* data, size_t bytes) {
     KeyHash h;
     h.add(data, bytes);
     return h.finish();
 }
 void warm_append(uint32_t tag, const void* data, uint32_t bytes) {
+    std::lock_guard lock(s_warm_file_mutex);
     if (!s_warm.file) return;
     std::fwrite(&tag, 4, 1, s_warm.file);
     std::fwrite(&bytes, 4, 1, s_warm.file);
     std::fwrite(data, 1, bytes, s_warm.file);
-    std::fflush(s_warm.file);
+    if (++s_warm.unflushed >= 64) {
+        std::fflush(s_warm.file);
+        s_warm.unflushed = 0;
+    }
 }
 void warm_record_program(uint64_t key, uint32_t rect, uint32_t points) {
     if (!s_warm.file || !s_warm.programs.insert(key).second) return;
@@ -3338,7 +3415,11 @@ void warm_start() {
     if (std::FILE* f = std::fopen((path + ".tmp").c_str(), "wb")) {
         const uint32_t header[2] = {kWarmMagic, kWarmVersion};
         std::fwrite(header, 4, 2, f);
-        s_warm.file = f;
+        {
+            std::lock_guard lock(s_warm_file_mutex);
+            s_warm.file = f;
+            s_warm.unflushed = 0;
+        }
         for (const auto& p : programs) warm_append(kWarmProgram, &p, sizeof(p));
         for (const auto& [base, reads] : s_exact_reads) {
             WarmMasksRecord m{};
@@ -3347,17 +3428,26 @@ void warm_start() {
             warm_append(kWarmMasks, &m, sizeof(m));
         }
         for (const auto& p : pipelines) warm_append(kWarmPipeline, &p, sizeof(p));
-        std::fclose(f);
-        s_warm.file = nullptr;
+        {
+            std::lock_guard lock(s_warm_file_mutex);
+            std::fclose(f);
+            s_warm.file = nullptr;
+            s_warm.unflushed = 0;
+        }
         std::error_code ec;
         std::filesystem::rename(path + ".tmp", path, ec);
         rewritten = !ec;
         if (ec) std::filesystem::remove(path + ".tmp", ec);
     }
     // Append only to a file that starts with a valid header.
-    if (rewritten || valid_file) s_warm.file = std::fopen(path.c_str(), "ab");
+    if (rewritten || valid_file) {
+        std::lock_guard lock(s_warm_file_mutex);
+        s_warm.file = std::fopen(path.c_str(), "ab");
+        s_warm.unflushed = 0;
+    }
 }
 void warm_reset() {
+    std::lock_guard lock(s_warm_file_mutex);
     if (s_warm.file) std::fclose(s_warm.file);
     s_warm = WarmState{};
 }
@@ -3408,6 +3498,8 @@ struct CachedVertexBuffer {
     uint64_t written = 0, last_use = 0, last_serial = 0;
     uint64_t hash = 0;  // content hash of mem[..] when written is untracked
     uint64_t epoch = 0; // frame epoch the hash was last proven at
+    uint8_t rewrites = 0;
+    bool device_local = false;
     bool valid = false;
 };
 std::unordered_map<uint64_t, CachedVertexBuffer> s_vertex_buffers;
@@ -3488,7 +3580,7 @@ struct IdxMru {
     IndexKey key{};
     CachedIndices* entry = nullptr;
 };
-std::array<IdxMru, 16> s_idx_mru{};
+std::array<IdxMru, 256> s_idx_mru{};
 // Uniform blocks in guest memory: one resident ring copy per guest range and
 // padded size, valid until a write to its pages (or byte mismatch) or chunk reuse.
 struct UniformKey {
@@ -3513,7 +3605,7 @@ struct UboMru {
     UniformKey key{};
     CachedUniform* entry = nullptr;
 };
-std::array<UboMru, 64> s_ubo_mru{};
+std::array<UboMru, 256> s_ubo_mru{};
 // RBREW_UNIFORM_CACHE=0: ignore write-watch generations for uniform blocks and
 // compare guest bytes on every bind (the pre-cache behaviour).
 bool uniform_cache_enabled() {
@@ -3572,7 +3664,7 @@ struct VboMru {
     uint64_t key = 0;
     CachedVertexBuffer* ptr = nullptr;
 };
-static std::array<VboMru, 32> s_vbo_mru{};
+static std::array<VboMru, 256> s_vbo_mru{};
 
 BufferRef cached_vertex_buffer(uint8_t* mem, uint32_t addr, uint32_t size, uint64_t written) {
     const uint64_t key = uint64_t(addr) << 32 | size;
@@ -3653,17 +3745,65 @@ BufferRef cached_vertex_buffer(uint8_t* mem, uint32_t addr, uint32_t size, uint6
     gx2_perf_bytes(kBytesVertex, size);
     ++C.vertex_uploads;
     if (untracked && content == 0) content = hash_guest_bytes(mem + addr, size);
+    if (b.rewrites < 255) ++b.rewrites;
+    // Static geometry (uploaded once or twice, >= 1 KiB) is staged into pure
+    // DEVICE_LOCAL VRAM via the submission prologue so vertex fetches hit GDDR
+    // bandwidth instead of PCIe system RAM once the 256 MiB BAR fills. Dynamic
+    // per-frame vertex buffers (rewrites >= 3) stay in mapped Upload storage to
+    // avoid double-copy and staging churn. RBREW_VBO_VRAM=0 disables promotion.
+    static const bool s_vbo_vram = [] {
+        const char* v = std::getenv("RBREW_VBO_VRAM");
+        return !(v && v[0] == '0');
+    }();
+    bool want_vram = s_vbo_vram && size >= 1024 && size <= (16u << 20) && b.rewrites <= 2;
+#ifndef RBREW_DISABLE_LOGGING
+    if (cache_verify_enabled()) want_vram = false;
+#endif
+    const bool busy = b.buffer.buffer &&
+                      (b.last_serial > gx2vk::known_completed_serial() || gx2interp::replay_may_read(b.last_serial));
+    if (want_vram) {
+        if (!b.buffer.buffer || !b.device_local || busy) {
+            if (b.buffer.buffer) s_vertex_bytes -= size;
+            gx2vk::destroy_buffer(b.buffer);
+            b.buffer = gx2vk::create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                            gx2vk::MemoryUse::DeviceLocal);
+            b.device_local = b.buffer.buffer != VK_NULL_HANDLE;
+            if (b.buffer.buffer) s_vertex_bytes += size;
+        }
+        if (b.buffer.buffer && b.device_local) {
+            const auto stage = gx2vk::upload(size, 16);
+            if (stage.data) {
+                std::memcpy(stage.data, mem + addr, size);
+                gx2vk::stage_buffer_copy(stage.buffer, stage.offset, b.buffer.buffer, 0, size);
+                b.valid = true;
+                b.mem = mem;
+                b.written = written;
+                if (untracked) {
+                    b.hash = content;
+                    b.epoch = epoch;
+                }
+                b.last_serial = gx2vk::recording_serial();
+                return {b.buffer.buffer, 0, size};
+            }
+        }
+        // Fallback to mapped Upload storage if DeviceLocal or staging failed.
+        if (b.buffer.buffer && b.device_local) {
+            s_vertex_bytes -= size;
+            gx2vk::destroy_buffer(b.buffer);
+            b.device_local = false;
+        }
+    }
     // Resident copy for tracked and untracked ranges alike: reuse mapped
     // storage only when every recorded read has completed.
     // Otherwise orphan it so earlier draws retain their original bytes.
     // The cached completion is conservative and adds no polling or GPU wait.
     // An in-between replay re-binds this buffer without passing here: while
     // it may still run on the GPU, the buffer is busy too (gx2_frame_interp.h).
-    if (!b.buffer.buffer || b.last_serial > gx2vk::known_completed_serial() ||
-        gx2interp::replay_may_read(b.last_serial)) {
+    if (!b.buffer.buffer || b.device_local || busy) {
         if (b.buffer.buffer) s_vertex_bytes -= size;
         gx2vk::destroy_buffer(b.buffer);
         b.buffer = gx2vk::create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, gx2vk::MemoryUse::Upload);
+        b.device_local = false;
         if (b.buffer.buffer) s_vertex_bytes += size;
     }
     if (!b.buffer.buffer || !b.buffer.memory.mapped) {
@@ -3708,19 +3848,19 @@ VkFormat attribute_format(uint32_t type, uint32_t components) {
 
 struct VertexBindings {
     VertexInput input;
-    VkBuffer buffers[kMaxVertexInputs]{};
-    VkDeviceSize offsets[kMaxVertexInputs]{};
+    VkBuffer buffers[kMaxVertexInputs];
+    VkDeviceSize offsets[kMaxVertexInputs];
 };
 
 void flush_streamouts(uint8_t* mem);
-void flush_streamouts_for_draw(uint8_t* mem);
+void flush_streamouts_for_draw(uint8_t* mem, const Program& prog);
 
 // gx2_setup_vertex_attribs: fetch attributes -> one binding per location.
 void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
     Gx2PerfScope perf_scope(kPerfVertex);
     // Publish pending stream-out results only if this draw can read them
     // (see flush_streamouts_for_draw); RBREW_STREAMOUT_EAGER=1 always flushes.
-    flush_streamouts_for_draw(mem);
+    flush_streamouts_for_draw(mem, prog);
     out.input.count = 0;
     const auto& mapping = prog.info[0].attribute_locations;
     // Locations the vertex shader reads: every semantic with a location, up
@@ -3730,7 +3870,8 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
     if (g_trace_active)
         RBREW_LOG_DEBUG("ftrace", "  fetch program=%08X known=%d attributes=%zu\n", S.active_fetch,
                         int(fs_info != nullptr), fs_info ? fs_info->attributes.size() : size_t(0));
-    std::array<BufferRef, 32> vbo{};
+    std::array<BufferRef, 32> vbo;
+    uint32_t vbo_mask = 0;
     static const std::vector<R700FetchAttribute> none;
     const auto& attributes = fs_info ? fs_info->attributes : none;
     // Fetch shaders describe the mesh's streams, including ones this vertex
@@ -3765,8 +3906,8 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
                  attr.per_instance});
         }
     }
-    std::array<Gx2WriteRange, 32> checks{};
-    std::array<unsigned, 32> checked_slots{};
+    std::array<Gx2WriteRange, 32> checks;
+    std::array<unsigned, 32> checked_slots;
     unsigned check_count = 0;
     for (uint32_t m = plan.used_slots; m; m &= m - 1) { // live streams, ascending
         const uint32_t slot = uint32_t(std::countr_zero(m));
@@ -3776,14 +3917,23 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
         checks[check_count] = {ab.guest_addr, ab.size};
         checked_slots[check_count++] = slot;
     }
-    gx2_write_generations(mem, checks.data(), check_count);
-    for (unsigned i = 0; i < check_count; ++i)
-        vbo[checked_slots[i]] = cached_vertex_buffer(mem, checks[i].address, checks[i].size, checks[i].generation);
+    if (check_count) {
+        gx2_write_generations(mem, checks.data(), check_count);
+        for (unsigned i = 0; i < check_count; ++i) {
+            const unsigned slot = checked_slots[i];
+            const BufferRef ref = cached_vertex_buffer(mem, checks[i].address, checks[i].size, checks[i].generation);
+            if (ref.buffer) {
+                vbo[slot] = ref;
+                vbo_mask |= 1u << slot;
+            }
+        }
+    }
     struct Bound {
-        VkFormat format = VK_FORMAT_UNDEFINED;
-        uint32_t buffer = 0, offset = 0, stride = 0, rate = 0, divisor = 0;
+        VkFormat format;
+        uint32_t buffer, offset, stride, rate, divisor;
     };
-    std::array<Bound, kMaxVertexInputs> bound{};
+    std::array<Bound, kMaxVertexInputs> bound;
+    uint32_t bound_mask = 0;
     for (const auto& attr : plan.attributes) {
         const uint32_t location = attr.location;
         const uint32_t buf_slot = attr.buffer;
@@ -3792,13 +3942,14 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
             RBREW_LOG_DEBUG("ftrace", "  attr loc=%u buf=%u off=%u fmt=%X vbo_addr=%08X size=%u stride=%u\n", location,
                             buf_slot, offset, attr.guest_format, buf_slot < 32 ? S.attrib[buf_slot].guest_addr : 0,
                             buf_slot < 32 ? S.attrib[buf_slot].size : 0, buf_slot < 32 ? S.attrib[buf_slot].stride : 0);
-        if (!vbo[buf_slot].buffer) continue;
+        if (!(vbo_mask & (1u << buf_slot))) continue;
         if (attr.format == VK_FORMAT_UNDEFINED) break; // the GPU loop aborts the remaining attributes
         const auto& ab = S.attrib[buf_slot];
         if (attr.per_instance && S.single_instance_fetch)
             offset += (S.instance_uniform / std::max(1u, attr.divisor)) * ab.stride;
         const uint32_t divisor = attr.per_instance ? (S.single_instance_fetch ? 1u : std::max(1u, attr.divisor)) : 0;
         bound[location] = Bound{attr.format, buf_slot, offset, ab.stride, attr.per_instance ? 1u : 0u, divisor};
+        bound_mask |= 1u << location;
     }
     // Every location the shader reads needs a binding in Vulkan; GPU supplies
     // the current generic attribute (0,0,0,1.0f) for disabled arrays.
@@ -3808,20 +3959,34 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
         auto& a = out.input.attrs[out.input.count];
         auto& buffer = out.buffers[out.input.count];
         auto& offset = out.offsets[out.input.count];
-        if (bound[location].format != VK_FORMAT_UNDEFINED) {
+        if (bound_mask & (1u << uint32_t(location))) {
             const auto& b = bound[location];
             a = {uint32_t(location), b.format, b.stride, b.rate, std::max(1u, b.divisor)};
             buffer = vbo[b.buffer].buffer;
             offset = vbo[b.buffer].offset + b.offset;
         } else {
             if (!s_null_vertex.buffer) {
-                s_null_vertex = gx2vk::create_buffer(16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, gx2vk::MemoryUse::Upload);
                 const uint32_t words[4] = {0, 0, 0, 0x3F800000u};
-                if (!s_null_vertex.memory.mapped) return;
-                std::memcpy(s_null_vertex.memory.mapped, words, 16);
-                if (!gx2vk::flush_mapped(s_null_vertex.memory, 0, 16)) {
-                    gx2vk::destroy_buffer(s_null_vertex);
-                    return;
+                s_null_vertex = gx2vk::create_buffer(
+                    16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    gx2vk::MemoryUse::DeviceLocal);
+                if (s_null_vertex.buffer) {
+                    const auto stage = gx2vk::upload(16, 16);
+                    if (stage.data) {
+                        std::memcpy(stage.data, words, 16);
+                        gx2vk::stage_buffer_copy(stage.buffer, stage.offset, s_null_vertex.buffer, 0, 16);
+                    } else {
+                        gx2vk::destroy_buffer(s_null_vertex);
+                    }
+                }
+                if (!s_null_vertex.buffer) {
+                    s_null_vertex = gx2vk::create_buffer(16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, gx2vk::MemoryUse::Upload);
+                    if (!s_null_vertex.memory.mapped) return;
+                    std::memcpy(s_null_vertex.memory.mapped, words, 16);
+                    if (!gx2vk::flush_mapped(s_null_vertex.memory, 0, 16)) {
+                        gx2vk::destroy_buffer(s_null_vertex);
+                        return;
+                    }
                 }
             }
             a = {uint32_t(location), VK_FORMAT_R32G32B32A32_UINT, 0, 0, 1};
@@ -3836,14 +4001,53 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
 // ---------------------------------------------------------------------------
 // Uniforms and descriptors (bind_ubos_to_program)
 // ---------------------------------------------------------------------------
-gx2vk::Span s_zero_ubo;
+// Permanent 64 KiB zero UBO outside the 32 MiB streaming upload ring so unset
+// uniform bindings never pin an upload chunk across frames.
+gx2vk::Buffer s_zero_ubo_buf;
 
 gx2vk::Span zero_buffer() {
-    if (!gx2vk::span_alive(s_zero_ubo)) {
-        s_zero_ubo = gx2vk::upload(65536, 256);
-        if (s_zero_ubo.data) std::memset(s_zero_ubo.data, 0, 65536);
+    if (!s_zero_ubo_buf.buffer) {
+        s_zero_ubo_buf = gx2vk::create_buffer(
+            65536, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            gx2vk::MemoryUse::DeviceLocal);
+        if (s_zero_ubo_buf.buffer) {
+            const auto stage = gx2vk::upload(65536, 16);
+            if (stage.data) {
+                std::memset(stage.data, 0, 65536);
+                gx2vk::stage_buffer_copy(stage.buffer, stage.offset, s_zero_ubo_buf.buffer, 0, 65536);
+            } else {
+                gx2vk::destroy_buffer(s_zero_ubo_buf);
+            }
+        }
+        if (!s_zero_ubo_buf.buffer) {
+            s_zero_ubo_buf = gx2vk::create_buffer(65536, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, gx2vk::MemoryUse::Upload);
+            if (!s_zero_ubo_buf.buffer || !s_zero_ubo_buf.memory.mapped) {
+                gx2vk::destroy_buffer(s_zero_ubo_buf);
+                return {};
+            }
+            std::memset(s_zero_ubo_buf.memory.mapped, 0, 65536);
+            if (!gx2vk::flush_mapped(s_zero_ubo_buf.memory, 0, 65536)) {
+                gx2vk::destroy_buffer(s_zero_ubo_buf);
+                return {};
+            }
+        }
     }
-    return s_zero_ubo;
+    return {s_zero_ubo_buf.buffer, 0, s_zero_ubo_buf.size, s_zero_ubo_buf.memory.mapped, 0};
+}
+
+inline uint64_t ufblock_quick_sig(const char* data, size_t n) noexcept {
+    if (n < 16) {
+        uint64_t a = 0, b = 0;
+        std::memcpy(&a, data, std::min<size_t>(n, 8));
+        if (n > 8) std::memcpy(&b, data + 8, n - 8);
+        return a ^ (b * 0x9E3779B97F4A7C15ull) ^ n;
+    }
+    uint64_t a, b, c, d;
+    std::memcpy(&a, data, 8);
+    std::memcpy(&b, data + ((n >> 2) & ~size_t(7)), 8);
+    std::memcpy(&c, data + ((n >> 1) & ~size_t(7)), 8);
+    std::memcpy(&d, data + n - 8, 8);
+    return (a * 0x9E3779B97F4A7C15ull) ^ (b * 0xBF58476D1CE4E5B9ull) ^ (c * 0x94D049BB133111EBull) ^ d ^ n;
 }
 
 struct StageDescriptors {
@@ -3856,6 +4060,7 @@ struct StageDescriptors {
     std::array<VkWriteDescriptorSet, kMaxWrites> writes;
     std::array<VkDescriptorBufferInfo, kMaxBuffers> buffers;
     std::array<VkDescriptorImageInfo, kMaxImages> images;
+    const gx2material::Response* material = nullptr;
     uint32_t write_count = 0;
     uint32_t buffer_count = 0;
     uint32_t image_count = 0;
@@ -3864,7 +4069,10 @@ struct StageDescriptors {
 bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& d) {
     const auto& info = prog.info[stage];
     const auto& vk = info.vk;
-    if (stage == 0) d.write_count = d.buffer_count = d.image_count = 0;
+    if (stage == 0) {
+        d.write_count = d.buffer_count = d.image_count = 0;
+        d.material = nullptr;
+    }
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(gx2vk::caps().limits.minUniformBufferOffsetAlignment, 16);
     // Native sampler slots: PS 0-17, VS 18-35. Only a differing slot changes state.
     static_assert(sizeof(info.texture_compare[0]) == sizeof(S.sampler_compare[0]));
@@ -3873,7 +4081,6 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         for (unsigned slot = 0; slot < 18; ++slot)
             gx2_render_set_sampler_comparison((stage == 0 ? 32 : 0) + slot, info.texture_compare[slot]);
     const uint32_t live_banks = prog.live_banks[stage], live_textures = prog.live_textures[stage];
-    const gx2material::Response* material = nullptr;
     static uint64_t material_frame = ~0ull;
     static bool material_enabled = false;
     if (material_frame != gx2vk::present_count()) {
@@ -3884,36 +4091,48 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
     // Resolve aliases before packing the texture-coordinate scale uniforms.
     for (uint32_t m = live_textures; m; m &= m - 1)
         refresh_bound_render_texture((stage == 0 ? 32 : 0) + unsigned(std::countr_zero(m)), mem);
-    // The PS albedo identifies the material for both stages; each bank must still match its full native signature.
-    if (material_enabled)
-        for (uint32_t m = prog.live_textures[1]; m && !material; m &= m - 1) {
+    // The PS albedo identifies the material for both stages; resolve once in stage 0
+    // (static albedo textures carry nonzero content_hash, render targets have 0).
+    if (material_enabled && stage == 0)
+        for (uint32_t m = prog.live_textures[1]; m && !d.material; m &= m - 1) {
             const unsigned t = unsigned(std::countr_zero(m));
-            const unsigned dim = prog.info[1].vk.texture_dim[t];
-            const auto* tex = dim == 2 ? S.units[t][0] : nullptr;
-            if (tex) material = gx2material::response(tex->content_hash);
+            if (prog.info[1].vk.texture_dim[t] != 2) continue;
+            const auto* tex = S.units[t][0];
+            if (tex && tex->content_hash) d.material = gx2material::response(tex->content_hash);
         }
+    const gx2material::Response* material = d.material;
     // Uniform-variable block (uniforms that GPU keeps on the program).
     if (vk.uniform_vars_binding >= 0) {
         auto& block = prog.ufblock_scratch[stage];
         const size_t block_size = std::max<uint32_t>(vk.uniform_block_bytes, 16);
         const size_t reg_copy_bytes =
             (info.uniform_mode == 2 && vk.offset_registers == 0) ? size_t(std::min(vk.register_vec4s, 256)) * 16 : 0;
-        if (reg_copy_bytes >= block_size)
+        const size_t remapped_bytes = info.remapped.size() * 16;
+        const bool dense_remapped = prog.remapped_dense[stage] && remapped_bytes <= block_size;
+        if (reg_copy_bytes > 0) {
             block.resize(block_size);
-        else
+            if (reg_copy_bytes < block_size) std::memset(block.data() + reg_copy_bytes, 0, block_size - reg_copy_bytes);
+        } else if (dense_remapped) {
+            block.resize(block_size);
+            if (remapped_bytes < block_size) std::memset(block.data() + remapped_bytes, 0, block_size - remapped_bytes);
+        } else {
             block.assign(block_size, '\0');
+        }
         auto put = [&](int32_t offset, const void* data, size_t bytes) {
             if (offset >= 0 && size_t(offset) + bytes <= block.size()) std::memcpy(block.data() + offset, data, bytes);
         };
         if (info.uniform_mode == 1 && vk.offset_remapped >= 0) {
-            const size_t remapped_bytes = info.remapped.size() * 16;
             // Zero-filled holes and the complete-range check match the old
             // temporary vector plus put(). Pack directly into the final block.
             if (size_t(vk.offset_remapped) <= block.size() &&
                 remapped_bytes <= block.size() - size_t(vk.offset_remapped)) {
                 char* values = block.data() + vk.offset_remapped;
-                std::array<unsigned, 16> material_layouts{};
-                std::array<bool, 16> material_checked{};
+                std::array<unsigned, 16> material_layouts;
+                std::array<bool, 16> material_checked;
+                if (material) {
+                    material_layouts.fill(0);
+                    material_checked.fill(false);
+                }
                 for (const auto& entry : info.remapped) {
                     if (entry.mapped_index >= info.remapped.size()) continue;
                     char* dst = values + entry.mapped_index * 16;
@@ -3922,7 +4141,10 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
                     else if (!entry.is_register && entry.bank < 16) {
                         const auto& source = S.uniform_blocks[stage][entry.bank];
                         const uint64_t offset = uint64_t(entry.index) * 16;
-                        if (!source.address || offset + 16 > source.size) continue;
+                        if (!source.address || offset + 16 > source.size) {
+                            if (dense_remapped) std::memset(dst, 0, 16);
+                            continue;
+                        }
                         std::memcpy(dst, mem + source.address + uint32_t(offset), 16);
                         if (material) {
                             if (!material_checked[entry.bank]) {
@@ -3974,6 +4196,8 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
                                 }
                             }
                         }
+                    } else if (dense_remapped) {
+                        std::memset(dst, 0, 16);
                     }
                 }
                 if (stage == 1 && g_trace_active && remapped_bytes) {
@@ -4025,14 +4249,15 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         else if (gx2interp::capturing())
             gx2interp::record_uf(stage, block.data(), block.size());
         const uint64_t serial = gx2vk::recording_serial();
+        const uint64_t sig = ufblock_quick_sig(block.data(), block.size());
         auto& slots = prog.ufblock_slots[stage];
         int hit_slot = -1;
         const uint8_t mru_idx = prog.ufblock_mru[stage];
-        if (slots[mru_idx].bytes == block) {
+        if (slots[mru_idx].sig == sig && slots[mru_idx].bytes == block) {
             hit_slot = int(mru_idx);
         } else {
             for (unsigned s_idx = 0; s_idx < slots.size(); ++s_idx) {
-                if (s_idx != mru_idx && slots[s_idx].bytes == block) {
+                if (s_idx != mru_idx && slots[s_idx].sig == sig && slots[s_idx].bytes == block) {
                     hit_slot = int(s_idx);
                     prog.ufblock_mru[stage] = uint8_t(s_idx);
                     break;
@@ -4061,6 +4286,7 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
             if (!slot.span.data) return false;
             std::memcpy(slot.span.data, block.data(), block_size);
             slot.bytes.swap(block);
+            slot.sig = sig;
             slot.reserved_serial = serial;
             span = slot.span;
         }
@@ -4076,10 +4302,10 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         w.pBufferInfo = &buffer;
     }
     // Guest uniform blocks (FULL_CBANK).
-    std::array<Gx2WriteRange, 16> block_checks{};
-    std::array<unsigned, 16> checked_banks{};
+    std::array<Gx2WriteRange, 16> block_checks;
+    std::array<unsigned, 16> checked_banks;
     unsigned block_check_count = 0;
-    std::array<uint64_t, 16> block_generations{};
+    std::array<uint64_t, 16> block_generations;
     for (uint32_t m = live_banks; m; m &= m - 1) {
         const unsigned bank = unsigned(std::countr_zero(m));
         const auto& block = S.uniform_blocks[stage][bank];
@@ -5158,23 +5384,29 @@ void flush_streamouts_if_overlaps(uint8_t* mem, uint32_t address, uint64_t size)
     if (!s_streamout_batch.pending_count) return;
     if (!streamouts_lazy() || streamout_pending_overlaps(address, size)) flush_streamouts(mem);
 }
-void flush_streamouts_for_draw(uint8_t* mem) {
+void flush_streamouts_for_draw(uint8_t* mem, const Program& prog) {
     if (!s_streamout_batch.pending_count) return;
     bool needed = !streamouts_lazy();
     for (unsigned slot = 0; !needed && slot < 32; ++slot)
         needed = streamout_pending_overlaps(S.attrib[slot].guest_addr, S.attrib[slot].size);
     for (unsigned stage = 0; !needed && stage < 2; ++stage)
-        for (unsigned bank = 0; !needed && bank < 16; ++bank)
+        for (uint32_t m = prog.live_banks[stage]; !needed && m; m &= m - 1) {
+            const unsigned bank = unsigned(std::countr_zero(m));
             needed =
                 streamout_pending_overlaps(S.uniform_blocks[stage][bank].address, S.uniform_blocks[stage][bank].size);
-    for (size_t unit = 0; !needed && unit < S.bound_textures.size(); ++unit) {
-        const auto& bound = S.bound_textures[unit];
-        if (!bound.address) continue;
-        const uint8_t* d = bound.descriptor.data();
-        needed =
-            streamout_pending_overlaps(descriptor_word(d, GX2SURF_IMAGE), descriptor_word(d, GX2SURF_IMAGE_SIZE)) ||
-            streamout_pending_overlaps(descriptor_word(d, GX2SURF_MIPMAPS), descriptor_word(d, GX2SURF_MIPMAP_SIZE));
-    }
+        }
+    for (unsigned stage = 0; !needed && stage < 2; ++stage)
+        for (uint32_t m = prog.live_textures[stage]; !needed && m; m &= m - 1) {
+            const size_t unit = (stage == 0 ? 32u : 0u) + unsigned(std::countr_zero(m));
+            if (unit >= S.bound_textures.size()) continue;
+            const auto& bound = S.bound_textures[unit];
+            if (!bound.address) continue;
+            const uint8_t* d = bound.descriptor.data();
+            needed = streamout_pending_overlaps(descriptor_word(d, GX2SURF_IMAGE),
+                                                descriptor_word(d, GX2SURF_IMAGE_SIZE)) ||
+                     streamout_pending_overlaps(descriptor_word(d, GX2SURF_MIPMAPS),
+                                                descriptor_word(d, GX2SURF_MIPMAP_SIZE));
+        }
     if (needed) flush_streamouts(mem);
 }
 
@@ -5199,8 +5431,11 @@ static uint32_t s_shadow_depth_only_draws, s_shadow_color_draws, s_shadow_frames
 
 struct PipelineReqTemplate {
     const Program* prog = nullptr;
+    uint64_t fb_generation = UINT64_MAX;
+    uint64_t color_masks = 0;
     uint32_t fbo_id = ~0u;
     uint32_t target_masks = ~0u;
+    bool color_write = false;
     bool blend = false;
     bool xfb = false;
     uint32_t blend_src_rgb = ~0u;
@@ -5293,8 +5528,11 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
 
     const auto& fb = s_active_fb;
 
-    if (s_req_tpl.prog == prog && s_req_tpl.fbo_id == S.current_fbo_id && s_req_tpl.target_masks == S.target_masks &&
-        s_req_tpl.blend == S.raster.blend && s_req_tpl.xfb == xfb &&
+    uint64_t cur_color_masks = 0;
+    std::memcpy(&cur_color_masks, S.raster.color_mask.data(), sizeof(cur_color_masks));
+    if (s_req_tpl.prog == prog && s_req_tpl.fb_generation == s_fb_generation && s_req_tpl.fbo_id == S.current_fbo_id &&
+        s_req_tpl.target_masks == S.target_masks && s_req_tpl.color_write == S.color_write &&
+        s_req_tpl.color_masks == cur_color_masks && s_req_tpl.blend == S.raster.blend && s_req_tpl.xfb == xfb &&
         (!S.raster.blend ||
          (s_req_tpl.blend_src_rgb == S.raster.blend_src_rgb && s_req_tpl.blend_dst_rgb == S.raster.blend_dst_rgb &&
           s_req_tpl.blend_src_alpha == S.raster.blend_src_alpha &&
@@ -5345,8 +5583,11 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         r.ps_sint_mask = sint_mask;
 
         s_req_tpl.prog = prog;
+        s_req_tpl.fb_generation = s_fb_generation;
+        s_req_tpl.color_masks = cur_color_masks;
         s_req_tpl.fbo_id = S.current_fbo_id;
         s_req_tpl.target_masks = S.target_masks;
+        s_req_tpl.color_write = S.color_write;
         s_req_tpl.blend = S.raster.blend;
         s_req_tpl.xfb = xfb;
         s_req_tpl.blend_src_rgb = S.raster.blend_src_rgb;
@@ -5492,6 +5733,15 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
     return any;
 }
 
+// Per-target full-clear frame history: distinguishes per-frame transient scene/post
+// targets (full-cleared every frame) from persistent targets (pre-painted ink maps,
+// cubemaps, UI captures) that must never drop a compiling draw.
+struct TargetClearHistory {
+    uint64_t last_frame = UINT64_MAX;
+    uint64_t prev_frame = UINT64_MAX;
+};
+std::unordered_map<const void*, TargetClearHistory> s_target_clears;
+
 // A render target counts as recurring once it was drawn before the last present.
 bool recurring_target(const Framebuffer& fb) {
     const void* target = fb.colors[0] ? static_cast<const void*>(fb.colors[0]) : static_cast<const void*>(fb.depth);
@@ -5509,23 +5759,45 @@ bool recurring_target(const Framebuffer& fb) {
     return s_last_recurring;
 }
 
+bool target_cleared_per_frame(const void* target, uint64_t frame) {
+    if (!target) return false;
+    const auto it = s_target_clears.find(target);
+    if (it == s_target_clears.end()) return false;
+    // Allow up to 8 presents between consecutive logical game steps (covers 60/120/165/240/360 Hz
+    // interpolation where present_count() advances by 2-6 per 60 Hz game frame).
+    return it->second.last_frame == frame && it->second.prev_frame != UINT64_MAX &&
+           frame >= it->second.prev_frame && frame - it->second.prev_frame <= 8;
+}
+
+bool transient_cleared_target(const Framebuffer& fb) {
+    if (!recurring_target(fb)) return false;
+    const uint64_t frame = gx2vk::present_count();
+    if (fb.depth_only) return target_cleared_per_frame(fb.depth, frame);
+    bool any_color = false;
+    for (auto* c : fb.colors) {
+        if (!c) continue;
+        any_color = true;
+        if (!target_cleared_per_frame(c, frame)) return false;
+    }
+    return any_color;
+}
+
 bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vertex, const IndexStream& indices,
                 bool xfb, void (*hook)(bool, VkCommandBuffer)) {
     // The 120 FPS replay never produces stream-out data for the guest.
     if (xfb && gx2interp::replaying()) return true;
+#if RBREW_GAME_REVISION != 16 // the updates (v272, v288)
+    // Only allow async shader/pipeline skipping on targets full-cleared every
+    // frame (scene, shadow, post). Persistent targets such as pre-painted ink
+    // maps are not cleared each frame and always compile synchronously.
+    s_async_draw = async_shaders_enabled() && !xfb && !hook && !s_query_segment && !(S.regs[0xA2AC] & 1) &&
+                   transient_cleared_target(S.framebuffer);
+#else
     s_async_draw = async_shaders_enabled() && !xfb && !hook && !s_query_segment && !(S.regs[0xA2AC] & 1) &&
                    recurring_target(S.framebuffer);
+#endif
     Program* prog = resolve_active_program(mem);
     bool drawn = false;
-#if RBREW_GAME_REVISION != 16 // the updates (v272, v288)
-    if (prog && !prog->compiled.ready()) {
-        if (s_compile_queue) s_compile_queue->promote(prog->compiled.pending);
-        (void)await_compile(prog->compiled);
-    }
-    const uint64_t before = C.draws;
-    drawn = issue_draw_program(prog, mem, prim, count, first_vertex, indices, xfb, hook);
-    if (s_async_draw && prog && C.draws == before && !drawn) ++s_async_skips;
-#else
     if (prog && s_async_draw && !prog->compiled.ready()) {
         if (s_compile_queue) s_compile_queue->promote(prog->compiled.pending);
         ++s_async_skips;
@@ -5534,7 +5806,6 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
         drawn = issue_draw_program(prog, mem, prim, count, first_vertex, indices, xfb, hook);
         if (s_async_draw && prog && C.draws == before && !drawn) ++s_async_skips;
     }
-#endif
     s_async_draw = false;
     // Long scene lists (the plaza: ~4800 draws in one display list) were
     // submitted only at their end, so the GPU started when the render thread
@@ -5549,7 +5820,7 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
     // profile). Open queries/segments still suppress it (segment serials).
     static const unsigned submit_every = [] {
         const char* v = std::getenv("RBREW_SUBMIT_EVERY_DRAWS");
-        return v ? unsigned(std::strtoul(v, nullptr, 10)) : 200u;
+        return v ? unsigned(std::strtoul(v, nullptr, 10)) : 400u;
     }();
     static unsigned since_submit = 0;
     if (drawn && submit_every && ++since_submit >= submit_every && !s_query_segment && s_open_queries.empty()) {
@@ -5600,6 +5871,15 @@ uint32_t gx2r_frame_draw_index() {
 }
 size_t gx2r_vertex_cache_entries() {
     return vertex_cache_entries();
+}
+void gx2r_note_target_cleared(const void* target) {
+    if (!target) return;
+    const uint64_t frame = gx2vk::present_count();
+    auto& h = s_target_clears[target];
+    if (h.last_frame != frame) {
+        h.prev_frame = h.last_frame;
+        h.last_frame = frame;
+    }
 }
 size_t gx2r_native_query_count() {
     return s_native_queries.size();
@@ -6466,6 +6746,13 @@ std::shared_future<void> gx2_render_vk_test_background_compile(std::function<voi
 // made this session are not lost when the process ends without destructors.
 void gx2_render_wait_cache_writes(uint32_t timeout_ms) {
     {
+        std::lock_guard lock(s_warm_file_mutex);
+        if (s_warm.file) {
+            std::fflush(s_warm.file);
+            s_warm.unflushed = 0;
+        }
+    }
+    {
         auto& writer = translation_writer();
         std::unique_lock lock(writer.mutex);
         writer.idle.wait_for(lock, std::chrono::milliseconds(timeout_ms),
@@ -6568,9 +6855,11 @@ void gx2r::shutdown_draw_state() {
     for (auto& stage : s_uniform_slot_memo)
         for (auto& memo : stage) memo = {};
     gx2vk::destroy_buffer(s_null_vertex);
-    s_zero_ubo = {};
+    gx2vk::destroy_buffer(s_zero_ubo_buf);
+    s_target_clears.clear();
     s_sampler_mru.fill({});
     s_req_tpl = {};
+    ++s_fb_generation;
     gx2_write_watch_end_batch();
     for (auto& [key, dummy] : s_dummies) gx2vk::destroy_image(dummy.image);
     s_dummies.clear();

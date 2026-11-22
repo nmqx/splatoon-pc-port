@@ -205,6 +205,7 @@ VkCommandBuffer s_current = VK_NULL_HANDLE;
 // rendering instance is open. It is submitted first in the same batch; the
 // barrier second scope covers the later command buffer in submission order.
 VkCommandBuffer s_prologue = VK_NULL_HANDLE;
+bool s_prologue_buffer_copy = false;
 bool s_recorded = false;
 uint64_t s_submissions = 0;
 void (*s_before_end)() = nullptr;
@@ -251,15 +252,24 @@ void poll_completed() {
 // submission of its last allocation completed.
 // ---------------------------------------------------------------------------
 constexpr VkDeviceSize kChunkSize = 32ull << 20;
+// Under sustained upload pressure, stop pinning chunks older than the reclaim
+// watermark so completed chunks recycle instead of triggering new 32 MiB
+// vkAllocateMemory + page-fault stalls every ~15-16 frames. Threshold > 8
+// preserves idle multi-chunk residency contracts without pressure.
+constexpr size_t kChunkReclaimThreshold = 10;
 struct Chunk {
     Buffer buffer;
     VkDeviceSize used = 0;
-    uint64_t last_serial = 0;
+};
+struct ChunkMeta {
     uint64_t id = 0;
+    uint64_t last_serial = 0;
 };
 std::vector<Chunk> s_chunks;
+std::vector<ChunkMeta> s_chunk_meta; // parallel to s_chunks; 16 B/entry for fast span_alive/span_resident scans
 int s_active_chunk = -1;
 uint64_t s_chunk_ids = 0;
+uint64_t s_reclaim_before_id = 0;
 std::vector<uint64_t> s_live_chunk_ids;
 // Only non-coherent uploads enter this list. Merge adjacent spans in a chunk.
 std::vector<VkMappedMemoryRange> s_upload_flushes;
@@ -504,6 +514,7 @@ struct Real {
     PFN_vkCmdPipelineBarrier PipelineBarrier;
     PFN_vkCmdClearAttachments ClearAttachments;
     // Drain-then-direct.
+    PFN_vkCmdCopyBuffer CopyBuffer;
     PFN_vkCmdCopyImage CopyImage;
     PFN_vkCmdCopyImageToBuffer CopyImageToBuffer;
     PFN_vkCmdBlitImage BlitImage;
@@ -960,6 +971,14 @@ VKAPI_ATTR void VKAPI_CALL w_PipelineBarrier(VkCommandBuffer cb, VkPipelineStage
     }
 // Transfers, image clears, dispatch and transform feedback: also deferred
 // (plain arrays, no pNext), so they no longer stall the render thread.
+VKAPI_ATTR void VKAPI_CALL w_CopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n,
+                                        const VkBufferCopy* r) {
+    if (!deferring()) return real.CopyBuffer(cb, s, d, n, r);
+    defer(bytes(r, n), [=](uint8_t* c) {
+        const VkBufferCopy* rc = put(c, r, n);
+        return [=] { real.CopyBuffer(cb, s, d, n, rc); };
+    });
+}
 VKAPI_ATTR void VKAPI_CALL w_CopyImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl,
                                        uint32_t n, const VkImageCopy* r) {
     if (!deferring()) return real.CopyImage(cb, s, sl, d, dl, n, r);
@@ -1106,6 +1125,7 @@ void install() {
     H(ResetQueryPool);
     H(PipelineBarrier);
     H(ClearAttachments);
+    H(CopyBuffer);
     H(CopyImage);
     H(CopyImageToBuffer);
     H(BlitImage);
@@ -1613,8 +1633,10 @@ void shutdown() {
         free_now(chunk.buffer.memory);
     }
     s_chunks.clear();
+    s_chunk_meta.clear();
     s_upload_flushes.clear();
     s_active_chunk = -1;
+    s_reclaim_before_id = 0;
     s_live_chunk_ids.clear();
     destroy_swapchain_objects(false);
     for (auto& s : s_swapchain.acquired)
@@ -1628,6 +1650,7 @@ void shutdown() {
     s_pending_commands.clear();
     s_current = VK_NULL_HANDLE;
     s_prologue = VK_NULL_HANDLE;
+    s_prologue_buffer_copy = false;
     if (s_timeline) vkDestroySemaphore(s_device, s_timeline, nullptr);
     s_timeline = VK_NULL_HANDLE;
     for (auto& pool : s_pools)
@@ -1885,8 +1908,8 @@ void retain_until_current_submission(uint64_t since_serial, uint32_t later_submi
     // Only what frame N used (its serials): retaining every chunk each frame
     // kept all of them busy and allocated new 32 MB chunks every frame.
     const uint64_t until = s_next_serial + later_submissions;
-    for (auto& chunk : s_chunks)
-        if (chunk.last_serial >= since_serial) chunk.last_serial = std::max(chunk.last_serial, until);
+    for (auto& meta : s_chunk_meta)
+        if (meta.last_serial >= since_serial) meta.last_serial = std::max(meta.last_serial, until);
     for (auto& entry : s_deferred)
         if (entry.serial >= since_serial) entry.serial = std::max(entry.serial, until);
 }
@@ -1945,6 +1968,23 @@ uint64_t submit_with(const VkSemaphore* wait, VkPipelineStageFlags2 wait_stage, 
                                      {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
     uint32_t cb_count = 0;
     if (s_prologue) {
+        if (s_prologue_buffer_copy) {
+            const bool cap_was = capture::enabled();
+            if (cap_was) capture::set_enabled(false);
+            VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                                   VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
+                                    VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT;
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers = &barrier;
+            vkCmdPipelineBarrier2(s_prologue, &dependency);
+            if (cap_was) capture::set_enabled(true);
+            s_prologue_buffer_copy = false;
+        }
         vkEndCommandBuffer(s_prologue);
         cbs[cb_count++].commandBuffer = s_prologue;
         s_pending_commands.push_back({s_prologue, serial});
@@ -1991,7 +2031,7 @@ uint64_t submit_with(const VkSemaphore* wait, VkPipelineStageFlags2 wait_stage, 
     s_recorded = false;
     ++s_submissions;
     // The ring chunk in use stays reserved until this submission completes.
-    if (s_active_chunk >= 0) s_chunks[s_active_chunk].last_serial = serial;
+    if (s_active_chunk >= 0) s_chunk_meta[s_active_chunk].last_serial = serial;
     // Commands in later command buffers are ordered after this one by the
     // barrier rules (first scope includes earlier submissions); writes made
     // here still require a barrier before later reads.
@@ -2098,27 +2138,46 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (s_active_chunk >= 0) {
             auto& chunk = s_chunks[s_active_chunk];
+            auto& meta = s_chunk_meta[s_active_chunk];
             const bool noncoherent = !(chunk.buffer.memory.properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             const VkDeviceSize atom = noncoherent ? s_caps.limits.nonCoherentAtomSize : 1;
             const VkDeviceSize start = memory_detail::align_up(chunk.used, std::max(alignment, atom));
             if (start + bytes <= kChunkSize) {
                 chunk.used = memory_detail::align_up(start + bytes, atom);
-                chunk.last_serial = s_next_serial;
+                meta.last_serial = s_next_serial;
                 queue_upload_flush(chunk.buffer.memory, start, bytes);
-                return {chunk.buffer.buffer, start, bytes, chunk.buffer.memory.mapped + start, chunk.id};
+                return {chunk.buffer.buffer, start, bytes, chunk.buffer.memory.mapped + start, meta.id};
             }
-            chunk.last_serial = s_next_serial;
+            meta.last_serial = s_next_serial;
         }
-        // Retire the active chunk and pick a completed one (or make one).
+        // Retire the active chunk and pick the oldest completed one (or make one).
         poll_completed();
         int next = -1;
+        uint64_t next_id = UINT64_MAX;
+        uint32_t completed_free = 0;
         const uint64_t chunk_limit =
             s_capture_hold_serial ? std::min(s_completed, s_capture_hold_serial - 1) : s_completed;
-        for (int i = 0; i < int(s_chunks.size()); ++i)
-            if (i != s_active_chunk && s_chunks[i].last_serial <= chunk_limit) {
-                next = i;
-                break;
+        for (int i = 0; i < int(s_chunk_meta.size()); ++i)
+            if (i != s_active_chunk && s_chunk_meta[i].last_serial <= chunk_limit) {
+                ++completed_free;
+                if (s_chunk_meta[i].id < next_id) {
+                    next = i;
+                    next_id = s_chunk_meta[i].id;
+                }
             }
+        // Under sustained upload pressure, proactively unpin the oldest non-held
+        // chunk whenever fewer than 2 completed chunks remain so it finishes on
+        // the GPU before the next rotation (eliminating further 32 MiB allocs).
+        if (s_chunk_meta.size() >= kChunkReclaimThreshold && completed_free < 2) {
+            uint64_t oldest_id = UINT64_MAX;
+            for (int i = 0; i < int(s_chunk_meta.size()); ++i) {
+                if (i == s_active_chunk || i == next) continue;
+                if (s_capture_hold_serial && s_chunk_meta[i].last_serial >= s_capture_hold_serial) continue;
+                if (s_chunk_meta[i].id >= s_reclaim_before_id && s_chunk_meta[i].id < oldest_id)
+                    oldest_id = s_chunk_meta[i].id;
+            }
+            if (oldest_id != UINT64_MAX) s_reclaim_before_id = oldest_id + 1;
+        }
         if (next < 0) {
             Chunk chunk;
             chunk.buffer = create_buffer(kChunkSize,
@@ -2131,28 +2190,32 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
                 return {};
             }
             s_chunks.push_back(std::move(chunk));
+            s_chunk_meta.push_back({});
             next = int(s_chunks.size() - 1);
         }
         s_active_chunk = next;
         s_chunks[next].used = 0;
-        s_chunks[next].id = ++s_chunk_ids;
+        s_chunk_meta[next].id = ++s_chunk_ids;
+        s_chunk_meta[next].last_serial = s_next_serial;
     }
     return {};
 }
 
 bool span_resident(const Span& span) {
     if (!span.chunk_id) return false;
-    return std::any_of(s_chunks.begin(), s_chunks.end(), [&](const Chunk& chunk) { return chunk.id == span.chunk_id; });
+    for (const auto& meta : s_chunk_meta)
+        if (meta.id == span.chunk_id) return true;
+    return false;
 }
 
 bool span_alive(const Span& span) {
-    if (!span.chunk_id) return false;
-    for (auto& chunk : s_chunks) {
-        if (chunk.id != span.chunk_id) continue;
+    if (!span.chunk_id || span.chunk_id < s_reclaim_before_id) return false;
+    for (auto& meta : s_chunk_meta) {
+        if (meta.id != span.chunk_id) continue;
         // The caller reuses the span in the recording in progress: keep the
         // chunk reserved until that submission completes, or the ring would
         // recycle (and overwrite) it while those commands still read it.
-        chunk.last_serial = std::max(chunk.last_serial, s_next_serial);
+        meta.last_serial = std::max(meta.last_serial, s_next_serial);
         return true;
     }
     return false;
@@ -2186,6 +2249,14 @@ Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, MemoryUse use)
     }
     b.size = info.size;
     return b;
+}
+
+void stage_buffer_copy(VkBuffer src, VkDeviceSize src_offset, VkBuffer dst, VkDeviceSize dst_offset,
+                       VkDeviceSize size) {
+    if (!src || !dst || !size) return;
+    const VkBufferCopy region{src_offset, dst_offset, size};
+    vkCmdCopyBuffer(prologue(), src, dst, 1, &region);
+    s_prologue_buffer_copy = true;
 }
 
 void destroy_buffer(Buffer& b) {

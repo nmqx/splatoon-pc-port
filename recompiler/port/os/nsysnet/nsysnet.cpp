@@ -10,7 +10,7 @@
 //   - Winsock / POSIX errno -> Wii U SO_* error code translation (e.g.
 //     WSAEWOULDBLOCK -> SO_EWOULDBLOCK = 6).
 //   - Wii U SOL_SOCKET (-1 / 0xFFFFFFFF), SO_NBIO (0x1016), SO_BIO (0x1014),
-//     MSG_DONTWAIT (0x20) translation, and Windows SIO_UDP_CONNRESET disable.
+//     MSG_DONTWAIT (0x20) translation, and Windows SIO_UDP_CONNRESET / SIO_UDP_NETRESET disable.
 //   - sendto_multi and recvfrom_ex support for PIA transport.
 //   - Optional RBREW_NEX_HOST / RBREW_NEX_PORT / RBREW_LOCAL_IP /
 //     RBREW_AC_CONNECT environment overrides and RBREW_NET_TRACE logging.
@@ -41,6 +41,9 @@ typedef SOCKET NativeSocket;
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
+#ifndef SIO_UDP_NETRESET
+#define SIO_UDP_NETRESET _WSAIOW(IOC_VENDOR, 15)
+#endif
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -65,9 +68,12 @@ typedef int NativeSocket;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -234,6 +240,14 @@ void clear_so_err() {
     s_last_host_err = 0;
 }
 
+bool is_udp_icmp_error(int herr) {
+#if defined(_WIN32)
+    return herr == WSAENETRESET || herr == WSAECONNRESET;
+#else
+    return herr == ENETRESET || herr == ECONNRESET;
+#endif
+}
+
 void ensure_wsa_init() {
 #if defined(_WIN32)
     static std::once_flag once;
@@ -254,6 +268,9 @@ struct GuestFdEntry {
     NativeSocket sock = INVALID_NATIVE_SOCKET;
     int type = 0;
     bool nonblocking = false;
+    bool guest_bound = false;
+    uint16_t local_port = 0; // host byte order
+    int64_t last_rbrg_ms = 0;
 };
 
 std::mutex s_fd_mutex;
@@ -293,6 +310,31 @@ void set_guest_fd_nonblocking_flag(int gfd, bool nb) {
     if (gfd < 0 || gfd >= kMaxGuestFds) return;
     std::lock_guard<std::mutex> lock(s_fd_mutex);
     if (s_fd_table[gfd].in_use) s_fd_table[gfd].nonblocking = nb;
+}
+
+void set_guest_fd_bound_info(int gfd, uint16_t local_port, bool guest_bound) {
+    if (gfd < 0 || gfd >= kMaxGuestFds) return;
+    std::lock_guard<std::mutex> lock(s_fd_mutex);
+    if (s_fd_table[gfd].in_use) {
+        if (local_port != 0) s_fd_table[gfd].local_port = local_port;
+        if (guest_bound) s_fd_table[gfd].guest_bound = true;
+    }
+}
+
+bool get_guest_fd_relay_info(int gfd, uint16_t* out_port, bool* out_guest_bound, int64_t* out_last_rbrg_ms) {
+    if (gfd < 0 || gfd >= kMaxGuestFds) return false;
+    std::lock_guard<std::mutex> lock(s_fd_mutex);
+    if (!s_fd_table[gfd].in_use) return false;
+    if (out_port) *out_port = s_fd_table[gfd].local_port;
+    if (out_guest_bound) *out_guest_bound = s_fd_table[gfd].guest_bound;
+    if (out_last_rbrg_ms) *out_last_rbrg_ms = s_fd_table[gfd].last_rbrg_ms;
+    return true;
+}
+
+void set_guest_fd_last_rbrg_ms(int gfd, int64_t ms) {
+    if (gfd < 0 || gfd >= kMaxGuestFds) return;
+    std::lock_guard<std::mutex> lock(s_fd_mutex);
+    if (s_fd_table[gfd].in_use) s_fd_table[gfd].last_rbrg_ms = ms;
 }
 
 bool release_guest_fd(int gfd, NativeSocket* out_sock) {
@@ -336,7 +378,56 @@ struct NetConfig {
     uint16_t nex_port = 0;          // host byte order, 0 = not overridden
     bool force_redirect = false;
     uint32_t local_ipv4_nbo = 0;    // network byte order
+    bool p2p_relay_enabled = false;
+    uint16_t p2p_relay_port = 60002u; // host byte order (default nex_port + 2)
+    uint32_t principal_id = 0;        // matches nn_act.cpp get_active_principal_id()
 };
+
+uint32_t fnv1a_32_net(std::string_view s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+std::string read_net_settings_ini(const char* key) {
+    std::ifstream in("settings.ini");
+    if (!in) return {};
+    const size_t klen = std::strlen(key);
+    for (std::string line; std::getline(in, line);) {
+        if (line.size() > klen && line[klen] == '=' && line.compare(0, klen, key) == 0) {
+            std::string val = line.substr(klen + 1);
+            while (!val.empty() && (val.back() == '\r' || val.back() == ' ' || val.back() == '\t')) val.pop_back();
+            return val;
+        }
+    }
+    return {};
+}
+
+uint32_t resolve_net_principal_id(bool online_enabled) {
+    auto parse_u32 = [](const char* s) -> uint32_t {
+        if (!s || !*s) return 0u;
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(s, &end, 0);
+        return (end != s) ? static_cast<uint32_t>(v) : 0u;
+    };
+    if (const uint32_t p = parse_u32(std::getenv("RBREW_PRINCIPAL_ID")); p != 0u) return p;
+    const std::string ini_pid = read_net_settings_ini("principal_id");
+    if (const uint32_t p = parse_u32(ini_pid.c_str()); p != 0u) return p;
+    if (!online_enabled) return 0u;
+    const char* env_name = std::getenv("RBREW_PLAYER_NAME");
+    if (!env_name || !*env_name) env_name = std::getenv("RBREW_MII_NAME");
+    std::string name;
+    if (env_name && *env_name) {
+        name = env_name;
+    } else {
+        name = read_net_settings_ini("player_name");
+        if (name.empty()) name = "default";
+    }
+    return 10000001u + (fnv1a_32_net(name) % 9000000u);
+}
 
 bool resolve_ipv4_nbo(const char* host, uint32_t* out_nbo) {
     if (!host || !*host || !out_nbo) return false;
@@ -428,9 +519,262 @@ const NetConfig& get_net_config() {
         if (c.local_ipv4_nbo == 0 && c.online_enabled) {
             c.local_ipv4_nbo = detect_local_ipv4_nbo(c.nex_host_ipv4_nbo);
         }
+        c.principal_id = resolve_net_principal_id(c.online_enabled);
+        const char* relay_env = std::getenv("RBREW_P2P_RELAY");
+        const bool relay_disabled = (relay_env && std::strcmp(relay_env, "0") == 0);
+        c.p2p_relay_enabled = c.online_enabled && c.has_nex_host && c.nex_host_ipv4_nbo != 0 && !relay_disabled;
+        c.p2p_relay_port = static_cast<uint16_t>((c.nex_port != 0 ? c.nex_port : 60000u) + 2u);
+        if (const char* rport = std::getenv("RBREW_P2P_RELAY_PORT"); rport && *rport) {
+            const long p = std::strtol(rport, nullptr, 10);
+            if (p > 0 && p <= 65535) c.p2p_relay_port = static_cast<uint16_t>(p);
+        }
         return c;
     }();
     return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// UDP P2P Relay (198.18.0.0/16 virtual IPs + NNCS-over-RBRY via NEX_HOST:60002)
+// Wire protocol (big-endian):
+//   RBRG (C->S, 10 B): "RBRG" + u32_be(pid) + u16_be(guest_port)
+//   RBRK (S->C, 10 B): "RBRK" + u32_be(vip_be) + u16_be(guest_port)
+//   RBRY (C->S, 16 B + payload): "RBRY" + u32_be(src_pid) + u16_be(src_port) +
+//                                u32_be(dst_ip) + u16_be(dst_port) + payload
+//   RBRY (S->C, 12 B + payload): "RBRY" + u32_be(src_ip) + u16_be(src_port) +
+//                                u16_be(dst_port) + payload
+// ---------------------------------------------------------------------------
+std::atomic<bool> s_relay_active{false};
+std::atomic<uint32_t> s_relay_vip_nbo{0}; // 198.18.x.y in network byte order
+
+bool is_relay_vip_nbo(uint32_t addr_nbo) {
+    return (ntohl(addr_nbo) & 0xFFFF0000u) == 0xC6120000u; // 198.18.0.0/16
+}
+
+struct sockaddr_in make_relay_sockaddr() {
+    const auto& cfg = get_net_config();
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = cfg.nex_host_ipv4_nbo;
+    sa.sin_port = htons(cfg.p2p_relay_port);
+    return sa;
+}
+
+int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void disable_win_udp_icmp(NativeSocket s) {
+#if defined(_WIN32)
+    BOOL new_behavior = FALSE;
+    DWORD bytes_returned = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &new_behavior, sizeof(new_behavior), nullptr, 0, &bytes_returned, nullptr, nullptr);
+    WSAIoctl(s, SIO_UDP_NETRESET, &new_behavior, sizeof(new_behavior), nullptr, 0, &bytes_returned, nullptr, nullptr);
+#else
+    (void)s;
+#endif
+}
+
+void send_rbrg_packet(NativeSocket s, uint32_t pid, uint16_t guest_port) {
+    const struct sockaddr_in relay_sa = make_relay_sockaddr();
+    uint8_t pkt[10];
+    pkt[0] = 'R';
+    pkt[1] = 'B';
+    pkt[2] = 'R';
+    pkt[3] = 'G';
+    const uint32_t pid_be = htonl(pid);
+    const uint16_t port_be = htons(guest_port);
+    std::memcpy(pkt + 4, &pid_be, 4);
+    std::memcpy(pkt + 8, &port_be, 2);
+    (void)sendto(s, reinterpret_cast<const char*>(pkt), sizeof(pkt), 0,
+                 reinterpret_cast<const struct sockaddr*>(&relay_sa), static_cast<socklen_t>(sizeof(relay_sa)));
+}
+
+void ensure_relay_probed() {
+    if (s_relay_active.load(std::memory_order_acquire)) return;
+    const auto& cfg = get_net_config();
+    if (!cfg.p2p_relay_enabled || cfg.principal_id == 0u) return;
+
+    static std::mutex s_probe_mutex;
+    static int64_t s_last_probe_ms = 0;
+    static uint32_t s_probe_rounds = 0;
+
+    std::lock_guard<std::mutex> lock(s_probe_mutex);
+    if (s_relay_active.load(std::memory_order_acquire)) return;
+
+    const int64_t now = steady_now_ms();
+    if (s_probe_rounds > 0) {
+        const int64_t cooldown_ms = (s_probe_rounds < 4u) ? 2000 : 10000;
+        if ((now - s_last_probe_ms) < cooldown_ms) return;
+    }
+
+    ensure_wsa_init();
+    NativeSocket s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_NATIVE_SOCKET) {
+        s_last_probe_ms = steady_now_ms();
+        ++s_probe_rounds;
+        return;
+    }
+    disable_win_udp_icmp(s);
+    const struct sockaddr_in relay_sa = make_relay_sockaddr();
+    const int attempts = (s_probe_rounds == 0u) ? 3 : 2;
+    const long wait_usec = (s_probe_rounds == 0u) ? 300000L : 250000L;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        send_rbrg_packet(s, cfg.principal_id, 0u);
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(s, &rfds);
+        struct timeval tv{0, wait_usec};
+#if defined(_WIN32)
+        const int rc = select(0, &rfds, nullptr, nullptr, &tv);
+#else
+        const int rc = select(s + 1, &rfds, nullptr, nullptr, &tv);
+#endif
+        if (rc > 0 && FD_ISSET(s, &rfds)) {
+            uint8_t buf[32];
+            struct sockaddr_in from{};
+            socklen_t flen = sizeof(from);
+            const ssize_t n = recvfrom(s, reinterpret_cast<char*>(buf), static_cast<int>(sizeof(buf)), 0,
+                                       reinterpret_cast<struct sockaddr*>(&from), &flen);
+            if (n >= 10 && from.sin_addr.s_addr == relay_sa.sin_addr.s_addr && from.sin_port == relay_sa.sin_port &&
+                std::memcmp(buf, "RBRK", 4) == 0) {
+                uint32_t vip_nbo = 0;
+                std::memcpy(&vip_nbo, buf + 4, 4);
+                if (is_relay_vip_nbo(vip_nbo)) {
+                    s_relay_vip_nbo.store(vip_nbo, std::memory_order_release);
+                    s_relay_active.store(true, std::memory_order_release);
+                    char ipbuf[32] = "?";
+                    struct in_addr ia{};
+                    ia.s_addr = vip_nbo;
+                    inet_ntop(AF_INET, &ia, ipbuf, sizeof(ipbuf));
+                    RBREW_LOG_INFO("nsysnet", "P2P relay active on port %u: pid=%u vip=%s (round %u)\n",
+                                   unsigned(cfg.p2p_relay_port), cfg.principal_id, ipbuf, s_probe_rounds + 1u);
+                    break;
+                }
+            }
+        }
+    }
+    CLOSE_SOCKET(s);
+    s_last_probe_ms = steady_now_ms();
+    ++s_probe_rounds;
+}
+
+bool relay_is_active() {
+    return s_relay_active.load(std::memory_order_acquire);
+}
+
+uint32_t relay_vip_nbo() {
+    return s_relay_vip_nbo.load(std::memory_order_acquire);
+}
+
+uint32_t get_bind_ip_override_nbo() {
+    static const uint32_t s_bind_ip_nbo = [] {
+        const char* v = std::getenv("RBREW_BIND_IP");
+        uint32_t nbo = 0;
+        if (v && *v) resolve_ipv4_nbo(v, &nbo);
+        return nbo;
+    }();
+    return s_bind_ip_nbo;
+}
+
+uint16_t ensure_socket_local_port(int gfd, NativeSocket s) {
+    uint16_t cached = 0;
+    if (get_guest_fd_relay_info(gfd, &cached, nullptr, nullptr) && cached != 0) return cached;
+    struct sockaddr_in bound{};
+    socklen_t blen = sizeof(bound);
+    if (getsockname(s, reinterpret_cast<struct sockaddr*>(&bound), &blen) == 0 && bound.sin_port != 0) {
+        const uint16_t port = ntohs(bound.sin_port);
+        set_guest_fd_bound_info(gfd, port, false);
+        return port;
+    }
+    // Socket is unbound (e.g. PIA's ephemeral NNCS probe socket): bind to an
+    // ephemeral OS port now so src_port in RBRY matches the socket's real port.
+    struct sockaddr_in any{};
+    any.sin_family = AF_INET;
+    any.sin_addr.s_addr = get_bind_ip_override_nbo();
+    any.sin_port = 0;
+    (void)bind(s, reinterpret_cast<struct sockaddr*>(&any), static_cast<socklen_t>(sizeof(any)));
+    blen = sizeof(bound);
+    if (getsockname(s, reinterpret_cast<struct sockaddr*>(&bound), &blen) == 0 && bound.sin_port != 0) {
+        const uint16_t port = ntohs(bound.sin_port);
+        set_guest_fd_bound_info(gfd, port, false);
+        return port;
+    }
+    return 0;
+}
+
+void maybe_refresh_socket_rbrg(int gfd, NativeSocket s, bool force) {
+    if (!relay_is_active()) return;
+    const auto& cfg = get_net_config();
+    if (cfg.principal_id == 0u) return;
+    uint16_t local_port = 0;
+    bool guest_bound = false;
+    int64_t last_ms = 0;
+    if (!get_guest_fd_relay_info(gfd, &local_port, &guest_bound, &last_ms)) return;
+    if (!guest_bound && !force) return;
+    if (local_port == 0) local_port = ensure_socket_local_port(gfd, s);
+    if (local_port == 0) return;
+    const int64_t now = steady_now_ms();
+    if (!force && last_ms != 0 && (now - last_ms) < 5000) return;
+    send_rbrg_packet(s, cfg.principal_id, local_port);
+    set_guest_fd_last_rbrg_ms(gfd, now);
+}
+
+bool should_relay_destination(const struct sockaddr_in& raw_sa, bool* out_is_nncs) {
+    if (raw_sa.sin_family != AF_INET) return false;
+    const bool dst_is_vip = is_relay_vip_nbo(raw_sa.sin_addr.s_addr);
+    if (!relay_is_active()) {
+        if (!dst_is_vip) return false;
+        ensure_relay_probed();
+        if (!relay_is_active()) return false;
+    }
+    if (dst_is_vip) {
+        if (out_is_nncs) *out_is_nncs = false;
+        return true;
+    }
+    const uint16_t port = ntohs(raw_sa.sin_port);
+    if (port == 10025u || port == 10125u) {
+        const auto& cfg = get_net_config();
+        if (raw_sa.sin_addr.s_addr == cfg.nex_host_ipv4_nbo ||
+            raw_sa.sin_addr.s_addr == htonl(0xC0000202u)) { // nncs1 or nncs2 placeholder (192.0.2.2)
+            if (out_is_nncs) *out_is_nncs = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+ssize_t send_relayed_packet(int gfd, NativeSocket s, const uint8_t* payload, uint32_t len, int hflags,
+                            const struct sockaddr_in& raw_dst, bool is_nncs) {
+    const auto& cfg = get_net_config();
+    const uint16_t local_port = ensure_socket_local_port(gfd, s);
+    const struct sockaddr_in relay_sa = make_relay_sockaddr();
+    const size_t total = 16u + static_cast<size_t>(len);
+    uint8_t stack_buf[2048];
+    std::vector<uint8_t> heap_buf;
+    uint8_t* pkt = stack_buf;
+    if (total > sizeof(stack_buf)) {
+        heap_buf.resize(total);
+        pkt = heap_buf.data();
+    }
+    pkt[0] = 'R';
+    pkt[1] = 'B';
+    pkt[2] = 'R';
+    pkt[3] = 'Y';
+    const uint32_t pid_be = htonl(cfg.principal_id);
+    const uint16_t sport_be = htons(local_port);
+    std::memcpy(pkt + 4, &pid_be, 4);
+    std::memcpy(pkt + 8, &sport_be, 2);
+    std::memcpy(pkt + 10, &raw_dst.sin_addr.s_addr, 4);
+    std::memcpy(pkt + 14, &raw_dst.sin_port, 2);
+    if (len > 0) std::memcpy(pkt + 16, payload, len);
+
+    const ssize_t sent = sendto(s, reinterpret_cast<const char*>(pkt), static_cast<int>(total), hflags,
+                                reinterpret_cast<const struct sockaddr*>(&relay_sa),
+                                static_cast<socklen_t>(sizeof(relay_sa)));
+    if (sent < 0) return -1;
+    if (!is_nncs) set_guest_fd_last_rbrg_ms(gfd, steady_now_ms());
+    return static_cast<ssize_t>(len);
 }
 
 bool contains_icase(const char* haystack, const char* needle) {
@@ -710,16 +1054,13 @@ void mw_socket(CPUState* cpu) {
         return;
     }
 
-#if defined(_WIN32)
-    // Prevent ICMP Port Unreachable on UDP from causing subsequent recvfrom()
-    // calls to fail with WSAECONNRESET (classic Winsock UDP pitfall).
+    // Prevent ICMP Port Unreachable (WSAECONNRESET) and ICMP Time Exceeded from
+    // low-TTL NAT hole-punching probes (WSAENETRESET) on UDP from failing
+    // subsequent recvfrom() calls (real Wii U / BSD unconnected UDP never does).
     if (type == SOCK_DGRAM) {
-        BOOL new_behavior = FALSE;
-        DWORD bytes_returned = 0;
-        WSAIoctl(s, SIO_UDP_CONNRESET, &new_behavior, sizeof(new_behavior), nullptr, 0, &bytes_returned, nullptr,
-                 nullptr);
+        disable_win_udp_icmp(s);
+        ensure_relay_probed();
     }
-#endif
 
     const int gfd = alloc_guest_fd(s, type);
     if (gfd < 0) {
@@ -761,8 +1102,10 @@ void socketlasterr(CPUState* cpu) {
 // bind / connect / shutdown / getsockname
 // ---------------------------------------------------------------------------
 void bind_(CPUState* cpu) {
+    const int gfd = static_cast<int>(ARG0);
     NativeSocket s = INVALID_NATIVE_SOCKET;
-    if (!lookup_guest_fd(static_cast<int>(ARG0), &s)) {
+    int sock_type = 0;
+    if (!lookup_guest_fd(gfd, &s, nullptr, &sock_type)) {
         RET = static_cast<uint32_t>(-1);
         return;
     }
@@ -771,13 +1114,8 @@ void bind_(CPUState* cpu) {
     // RBREW_BIND_IP=<ipv4>: bind "any address" sockets to this local address instead, so two
     // instances on one PC show different source IPs (PIA's host refuses a station whose IP matches
     // an already-known station with another connection id: "battle full" when both share one IP).
-    static const uint32_t s_bind_ip_nbo = [] {
-        const char* v = std::getenv("RBREW_BIND_IP");
-        uint32_t nbo = 0;
-        if (v && *v) resolve_ipv4_nbo(v, &nbo);
-        return nbo;
-    }();
-    if (sa.sin_family == AF_INET && sa.sin_addr.s_addr == 0 && s_bind_ip_nbo != 0) sa.sin_addr.s_addr = s_bind_ip_nbo;
+    const uint32_t bind_ip_nbo = get_bind_ip_override_nbo();
+    if (sa.sin_family == AF_INET && sa.sin_addr.s_addr == 0 && bind_ip_nbo != 0) sa.sin_addr.s_addr = bind_ip_nbo;
     const int rc = bind(s, reinterpret_cast<struct sockaddr*>(&sa), static_cast<socklen_t>(sizeof(sa)));
     if (rc < 0) {
         record_host_error();
@@ -788,9 +1126,16 @@ void bind_(CPUState* cpu) {
     struct sockaddr_in bound{};
     socklen_t blen = sizeof(bound);
     if (getsockname(s, reinterpret_cast<struct sockaddr*>(&bound), &blen) == 0) {
+        const uint16_t bound_port = ntohs(bound.sin_port);
+        set_guest_fd_bound_info(gfd, bound_port, true);
+        if (sock_type == SOCK_DGRAM) {
+            ensure_relay_probed();
+            maybe_refresh_socket_rbrg(gfd, s, true);
+        }
         char addr[48];
         format_sockaddr_str(bound, addr, sizeof(addr));
-        std::snprintf(s_trace_detail, sizeof(s_trace_detail), "bound=%s", addr);
+        std::snprintf(s_trace_detail, sizeof(s_trace_detail), "bound=%s%s", addr,
+                      (sock_type == SOCK_DGRAM && relay_is_active()) ? " (RBRG sent)" : "");
     }
     RET = 0;
 }
@@ -845,10 +1190,13 @@ void getsockname_(CPUState* cpu) {
         return;
     }
     // If socket is bound to INADDR_ANY (0.0.0.0) in online mode, report the
-    // configured/detected local IP so StationURLs don't advertise 0.0.0.0.
+    // relay virtual IP (198.18.x.y) if active, else the configured/detected local IP
+    // so StationURLs don't advertise 0.0.0.0.
     const auto& cfg = get_net_config();
-    if (sa.sin_addr.s_addr == 0 && cfg.online_enabled && cfg.local_ipv4_nbo != 0) {
-        sa.sin_addr.s_addr = cfg.local_ipv4_nbo;
+    if (sa.sin_addr.s_addr == 0 && cfg.online_enabled) {
+        ensure_relay_probed();
+        const uint32_t adv_ip = relay_is_active() ? relay_vip_nbo() : cfg.local_ipv4_nbo;
+        if (adv_ip != 0) sa.sin_addr.s_addr = adv_ip;
     }
     if (ARG1 && rbrew_memory_accessible(MEM, ARG1, 16u)) host_to_guest_sockaddr(MEM, ARG1, &sa);
     if (ARG2 && rbrew_memory_accessible(MEM, ARG2, 4u)) rbrew_write32(MEM, ARG2, 16u);
@@ -893,9 +1241,11 @@ void send_(CPUState* cpu) {
 }
 
 void recv_(CPUState* cpu) {
+    const int gfd = static_cast<int>(ARG0);
     NativeSocket s = INVALID_NATIVE_SOCKET;
     bool nb = false;
-    if (!lookup_guest_fd(static_cast<int>(ARG0), &s, &nb)) {
+    int sock_type = 0;
+    if (!lookup_guest_fd(gfd, &s, &nb, &sock_type)) {
         RET = static_cast<uint32_t>(-1);
         return;
     }
@@ -907,14 +1257,81 @@ void recv_(CPUState* cpu) {
     }
     bool dontwait = false;
     const int hflags = translate_msg_flags(ARG3, &dontwait);
-    if (dontwait && !nb && !socket_is_readable_now(s)) {
-        set_so_err(kSoEwouldblock);
-        RET = static_cast<uint32_t>(-1);
-        return;
+    const bool use_relay = (sock_type == SOCK_DGRAM && relay_is_active());
+    if (use_relay) maybe_refresh_socket_rbrg(gfd, s, false);
+    const struct sockaddr_in relay_sa = use_relay ? make_relay_sockaddr() : sockaddr_in{};
+
+    uint8_t stack_buf[2048];
+    std::vector<uint8_t> heap_buf;
+    const size_t read_cap = use_relay ? std::max<size_t>(static_cast<size_t>(len) + 12u, 16u) : 0u;
+    uint8_t* rbuf = stack_buf;
+    if (read_cap > sizeof(stack_buf)) {
+        heap_buf.resize(read_cap);
+        rbuf = heap_buf.data();
     }
-    const ssize_t n = recv(s, reinterpret_cast<char*>(MEM + ARG1), static_cast<int>(len), hflags);
-    if (n < 0) {
-        record_host_error();
+
+    constexpr int kMaxUdpRetries = 16;
+    ssize_t n = -1;
+    for (int attempt = 0; attempt < kMaxUdpRetries; ++attempt) {
+        if (dontwait && !nb && !socket_is_readable_now(s)) {
+            set_so_err(kSoEwouldblock);
+            RET = static_cast<uint32_t>(-1);
+            return;
+        }
+        if (use_relay) {
+            struct sockaddr_in sa{};
+            socklen_t slen = sizeof(sa);
+            n = recvfrom(s, reinterpret_cast<char*>(rbuf), static_cast<int>(read_cap), hflags,
+                         reinterpret_cast<struct sockaddr*>(&sa), &slen);
+            if (n >= 0) {
+                if (sa.sin_addr.s_addr == relay_sa.sin_addr.s_addr && sa.sin_port == relay_sa.sin_port) {
+                    if (n >= 10 && std::memcmp(rbuf, "RBRK", 4) == 0) {
+                        uint32_t vip_nbo = 0;
+                        std::memcpy(&vip_nbo, rbuf + 4, 4);
+                        if (is_relay_vip_nbo(vip_nbo)) {
+                            s_relay_vip_nbo.store(vip_nbo, std::memory_order_release);
+                            s_relay_active.store(true, std::memory_order_release);
+                        }
+                        if (hflags & MSG_PEEK) {
+                            char discard[32];
+                            (void)recv(s, discard, sizeof(discard), 0);
+                        }
+                        if (attempt + 1 == kMaxUdpRetries) {
+                            set_so_err(kSoEwouldblock);
+                            RET = static_cast<uint32_t>(-1);
+                            return;
+                        }
+                        continue;
+                    }
+                    if (n >= 12 && std::memcmp(rbuf, "RBRY", 4) == 0) {
+                        const size_t payload_len = static_cast<size_t>(n) - 12u;
+                        const size_t copy_len = std::min<size_t>(payload_len, len);
+                        if (copy_len > 0) std::memcpy(MEM + ARG1, rbuf + 12, copy_len);
+                        n = static_cast<ssize_t>(copy_len);
+                        break;
+                    }
+                }
+                const size_t copy_len = std::min<size_t>(static_cast<size_t>(n), len);
+                if (copy_len > 0) std::memcpy(MEM + ARG1, rbuf, copy_len);
+                n = static_cast<ssize_t>(copy_len);
+                break;
+            }
+        } else {
+            n = recv(s, reinterpret_cast<char*>(MEM + ARG1), static_cast<int>(len), hflags);
+            if (n >= 0) break;
+        }
+        const int herr = SOCK_ERRNO;
+        if (sock_type == SOCK_DGRAM && is_udp_icmp_error(herr)) {
+            std::snprintf(s_trace_detail, sizeof(s_trace_detail), "ignored udp icmp err=%d", herr);
+            if (attempt + 1 == kMaxUdpRetries) {
+                set_so_err(kSoEwouldblock, herr);
+                RET = static_cast<uint32_t>(-1);
+                return;
+            }
+            continue;
+        }
+        s_last_host_err = herr;
+        s_last_so_err = map_host_errno(herr);
         RET = static_cast<uint32_t>(-1);
         return;
     }
@@ -923,9 +1340,11 @@ void recv_(CPUState* cpu) {
 }
 
 void sendto_(CPUState* cpu) {
+    const int gfd = static_cast<int>(ARG0);
     NativeSocket s = INVALID_NATIVE_SOCKET;
     bool nb = false;
-    if (!lookup_guest_fd(static_cast<int>(ARG0), &s, &nb)) {
+    int sock_type = 0;
+    if (!lookup_guest_fd(gfd, &s, &nb, &sock_type)) {
         RET = static_cast<uint32_t>(-1);
         return;
     }
@@ -942,22 +1361,39 @@ void sendto_(CPUState* cpu) {
     }
     struct sockaddr_in sa{};
     guest_to_host_sockaddr(MEM, ARG4, &sa);
-    maybe_redirect_sockaddr(&sa);
+    bool is_nncs_relay = false;
+    const bool relay_send = (sock_type == SOCK_DGRAM) && should_relay_destination(sa, &is_nncs_relay);
+    if (!relay_send) maybe_redirect_sockaddr(&sa);
     bool dontwait = false;
     const int hflags = translate_msg_flags(ARG3, &dontwait);
-    if (dontwait && !nb && !socket_is_writable_now(s)) {
-        set_so_err(kSoEwouldblock);
-        RET = static_cast<uint32_t>(-1);
-        return;
-    }
 
-    const ssize_t n = sendto(s, reinterpret_cast<const char*>(MEM + ARG1), static_cast<int>(len), hflags,
-                             reinterpret_cast<struct sockaddr*>(&sa), static_cast<socklen_t>(sizeof(sa)));
-    if (n < 0) {
-        record_host_error();
+    constexpr int kMaxUdpSendRetries = 4;
+    ssize_t n = -1;
+    for (int attempt = 0; attempt < kMaxUdpSendRetries; ++attempt) {
+        if (dontwait && !nb && !socket_is_writable_now(s)) {
+            set_so_err(kSoEwouldblock);
+            RET = static_cast<uint32_t>(-1);
+            return;
+        }
+        if (relay_send) {
+            n = send_relayed_packet(gfd, s, MEM + ARG1, len, hflags, sa, is_nncs_relay);
+        } else {
+            n = sendto(s, reinterpret_cast<const char*>(MEM + ARG1), static_cast<int>(len), hflags,
+                       reinterpret_cast<struct sockaddr*>(&sa), static_cast<socklen_t>(sizeof(sa)));
+        }
+        if (n >= 0) break;
+        const int herr = SOCK_ERRNO;
+        if (sock_type == SOCK_DGRAM && is_udp_icmp_error(herr)) {
+            if (attempt + 1 < kMaxUdpSendRetries) continue;
+            set_so_err(kSoEwouldblock, herr);
+        } else {
+            s_last_host_err = herr;
+            s_last_so_err = map_host_errno(herr);
+        }
         char addr[48];
         format_sockaddr_str(sa, addr, sizeof(addr));
-        std::snprintf(s_trace_detail, sizeof(s_trace_detail), "dst=%s len=%u FAIL", addr, len);
+        std::snprintf(s_trace_detail, sizeof(s_trace_detail), "%sdst=%s len=%u FAIL", relay_send ? "relay " : "", addr,
+                      len);
         RET = static_cast<uint32_t>(-1);
         return;
     }
@@ -968,15 +1404,17 @@ void sendto_(CPUState* cpu) {
     const uint8_t b1 = len > 1 ? MEM[ARG1 + 1] : 0;
     const uint8_t b2 = len > 2 ? MEM[ARG1 + 2] : 0;
     const uint8_t b3 = len > 3 ? MEM[ARG1 + 3] : 0;
-    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "dst=%s len=%u head=%02x%02x%02x%02x", addr, len, b0, b1, b2,
-                  b3);
+    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "%sdst=%s len=%u head=%02x%02x%02x%02x",
+                  relay_send ? "relay " : "", addr, len, b0, b1, b2, b3);
     RET = static_cast<uint32_t>(n);
 }
 
 void recvfrom_impl(CPUState* cpu, bool is_ex) {
+    const int gfd = static_cast<int>(ARG0);
     NativeSocket s = INVALID_NATIVE_SOCKET;
     bool nb = false;
-    if (!lookup_guest_fd(static_cast<int>(ARG0), &s, &nb)) {
+    int sock_type = 0;
+    if (!lookup_guest_fd(gfd, &s, &nb, &sock_type)) {
         RET = static_cast<uint32_t>(-1);
         return;
     }
@@ -988,21 +1426,98 @@ void recvfrom_impl(CPUState* cpu, bool is_ex) {
     }
     bool dontwait = false;
     const int hflags = translate_msg_flags(ARG3, &dontwait);
-    if (dontwait && !nb && !socket_is_readable_now(s)) {
-        set_so_err(kSoEwouldblock);
-        RET = static_cast<uint32_t>(-1);
-        return;
+    const bool use_relay = (sock_type == SOCK_DGRAM && relay_is_active());
+    if (use_relay) maybe_refresh_socket_rbrg(gfd, s, false);
+    const struct sockaddr_in relay_sa = use_relay ? make_relay_sockaddr() : sockaddr_in{};
+
+    uint8_t stack_buf[2048];
+    std::vector<uint8_t> heap_buf;
+    const size_t read_cap = use_relay ? std::max<size_t>(static_cast<size_t>(len) + 12u, 16u) : 0u;
+    uint8_t* rbuf = stack_buf;
+    if (read_cap > sizeof(stack_buf)) {
+        heap_buf.resize(read_cap);
+        rbuf = heap_buf.data();
     }
+
+    constexpr int kMaxUdpRetries = 16;
     struct sockaddr_in sa{};
     socklen_t slen = sizeof(sa);
-    const ssize_t n = recvfrom(s, reinterpret_cast<char*>(MEM + ARG1), static_cast<int>(len), hflags,
-                               reinterpret_cast<struct sockaddr*>(&sa), &slen);
-    if (n < 0) {
-        record_host_error();
+    ssize_t n = -1;
+    bool was_relayed = false;
+    for (int attempt = 0; attempt < kMaxUdpRetries; ++attempt) {
+        if (dontwait && !nb && !socket_is_readable_now(s)) {
+            set_so_err(kSoEwouldblock);
+            RET = static_cast<uint32_t>(-1);
+            return;
+        }
+        sa = {};
+        slen = sizeof(sa);
+        if (use_relay) {
+            n = recvfrom(s, reinterpret_cast<char*>(rbuf), static_cast<int>(read_cap), hflags,
+                         reinterpret_cast<struct sockaddr*>(&sa), &slen);
+            if (n >= 0) {
+                if (sa.sin_addr.s_addr == relay_sa.sin_addr.s_addr && sa.sin_port == relay_sa.sin_port) {
+                    if (n >= 10 && std::memcmp(rbuf, "RBRK", 4) == 0) {
+                        uint32_t vip_nbo = 0;
+                        std::memcpy(&vip_nbo, rbuf + 4, 4);
+                        if (is_relay_vip_nbo(vip_nbo)) {
+                            s_relay_vip_nbo.store(vip_nbo, std::memory_order_release);
+                            s_relay_active.store(true, std::memory_order_release);
+                        }
+                        if (hflags & MSG_PEEK) {
+                            char discard[32];
+                            (void)recv(s, discard, sizeof(discard), 0);
+                        }
+                        if (attempt + 1 == kMaxUdpRetries) {
+                            set_so_err(kSoEwouldblock);
+                            RET = static_cast<uint32_t>(-1);
+                            return;
+                        }
+                        continue;
+                    }
+                    if (n >= 12 && std::memcmp(rbuf, "RBRY", 4) == 0) {
+                        uint32_t src_ip_nbo = 0;
+                        uint16_t src_port_nbo = 0;
+                        std::memcpy(&src_ip_nbo, rbuf + 4, 4);
+                        std::memcpy(&src_port_nbo, rbuf + 8, 2);
+                        const size_t payload_len = static_cast<size_t>(n) - 12u;
+                        const size_t copy_len = std::min<size_t>(payload_len, len);
+                        if (copy_len > 0) std::memcpy(MEM + ARG1, rbuf + 12, copy_len);
+                        sa = {};
+                        sa.sin_family = AF_INET;
+                        sa.sin_addr.s_addr = src_ip_nbo;
+                        sa.sin_port = src_port_nbo;
+                        n = static_cast<ssize_t>(copy_len);
+                        was_relayed = true;
+                        break;
+                    }
+                }
+                const size_t copy_len = std::min<size_t>(static_cast<size_t>(n), len);
+                if (copy_len > 0) std::memcpy(MEM + ARG1, rbuf, copy_len);
+                n = static_cast<ssize_t>(copy_len);
+                break;
+            }
+        } else {
+            n = recvfrom(s, reinterpret_cast<char*>(MEM + ARG1), static_cast<int>(len), hflags,
+                         reinterpret_cast<struct sockaddr*>(&sa), &slen);
+            if (n >= 0) break;
+        }
+        const int herr = SOCK_ERRNO;
+        if (sock_type == SOCK_DGRAM && is_udp_icmp_error(herr)) {
+            std::snprintf(s_trace_detail, sizeof(s_trace_detail), "ignored udp icmp err=%d", herr);
+            if (attempt + 1 == kMaxUdpRetries) {
+                set_so_err(kSoEwouldblock, herr);
+                RET = static_cast<uint32_t>(-1);
+                return;
+            }
+            continue;
+        }
+        s_last_host_err = herr;
+        s_last_so_err = map_host_errno(herr);
         RET = static_cast<uint32_t>(-1);
         return;
     }
-    nncs_split_incoming(&sa);
+    if (!was_relayed) nncs_split_incoming(&sa);
     if (ARG4 && rbrew_memory_accessible(MEM, ARG4, 16u)) host_to_guest_sockaddr(MEM, ARG4, &sa);
     if (ARG5 && rbrew_memory_accessible(MEM, ARG5, 4u)) rbrew_write32(MEM, ARG5, 16u);
     if (is_ex && ARG6 && ARG7 > 0) {
@@ -1019,8 +1534,8 @@ void recvfrom_impl(CPUState* cpu, bool is_ex) {
     const uint8_t b1 = n > 1 ? MEM[ARG1 + 1] : 0;
     const uint8_t b2 = n > 2 ? MEM[ARG1 + 2] : 0;
     const uint8_t b3 = n > 3 ? MEM[ARG1 + 3] : 0;
-    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "src=%s n=%d head=%02x%02x%02x%02x", addr, int(n), b0, b1, b2,
-                  b3);
+    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "%ssrc=%s n=%d head=%02x%02x%02x%02x",
+                  was_relayed ? "relay " : "", addr, int(n), b0, b1, b2, b3);
     RET = static_cast<uint32_t>(n);
 }
 
@@ -1034,9 +1549,11 @@ void recvfrom_ex(CPUState* cpu) {
 
 // sendto_multi(fd, buf, len, flags, dst_addrs_array, dst_count)
 void sendto_multi(CPUState* cpu) {
+    const int gfd = static_cast<int>(ARG0);
     NativeSocket s = INVALID_NATIVE_SOCKET;
     bool nb = false;
-    if (!lookup_guest_fd(static_cast<int>(ARG0), &s, &nb)) {
+    int sock_type = 0;
+    if (!lookup_guest_fd(gfd, &s, &nb, &sock_type)) {
         RET = static_cast<uint32_t>(-1);
         return;
     }
@@ -1063,24 +1580,45 @@ void sendto_multi(CPUState* cpu) {
 
     ssize_t last_ok = -1;
     int sent_count = 0;
+    bool any_relayed = false;
     char first_addr[48] = "?";
     for (uint32_t i = 0; i < dst_count; ++i) {
         struct sockaddr_in sa{};
         guest_to_host_sockaddr(MEM, dst_addrs + i * 16u, &sa);
-        maybe_redirect_sockaddr(&sa);
+        bool is_nncs_relay = false;
+        const bool relay_send = (sock_type == SOCK_DGRAM) && should_relay_destination(sa, &is_nncs_relay);
+        if (!relay_send) maybe_redirect_sockaddr(&sa);
+        if (relay_send) any_relayed = true;
         if (i == 0) format_sockaddr_str(sa, first_addr, sizeof(first_addr));
-        const ssize_t n = sendto(s, reinterpret_cast<const char*>(MEM + ARG1), static_cast<int>(len), hflags,
-                                 reinterpret_cast<struct sockaddr*>(&sa), static_cast<socklen_t>(sizeof(sa)));
+        constexpr int kMaxUdpSendRetries = 4;
+        ssize_t n = -1;
+        for (int attempt = 0; attempt < kMaxUdpSendRetries; ++attempt) {
+            if (relay_send) {
+                n = send_relayed_packet(gfd, s, MEM + ARG1, len, hflags, sa, is_nncs_relay);
+            } else {
+                n = sendto(s, reinterpret_cast<const char*>(MEM + ARG1), static_cast<int>(len), hflags,
+                           reinterpret_cast<struct sockaddr*>(&sa), static_cast<socklen_t>(sizeof(sa)));
+            }
+            if (n >= 0) break;
+            const int herr = SOCK_ERRNO;
+            if (sock_type == SOCK_DGRAM && is_udp_icmp_error(herr)) {
+                if (attempt + 1 < kMaxUdpSendRetries) continue;
+                set_so_err(kSoEwouldblock, herr);
+            } else {
+                s_last_host_err = herr;
+                s_last_so_err = map_host_errno(herr);
+            }
+            break;
+        }
         if (n >= 0) {
             last_ok = n;
             ++sent_count;
-        } else {
-            record_host_error();
         }
     }
     if (sent_count > 0) {
         clear_so_err();
-        std::snprintf(s_trace_detail, sizeof(s_trace_detail), "multi(%u) dst0=%s len=%u", dst_count, first_addr, len);
+        std::snprintf(s_trace_detail, sizeof(s_trace_detail), "%smulti(%u) dst0=%s len=%u",
+                      any_relayed ? "relay " : "", dst_count, first_addr, len);
         RET = static_cast<uint32_t>(last_ok);
     } else {
         RET = static_cast<uint32_t>(-1);
@@ -1252,7 +1790,23 @@ void setsockopt_(CPUState* cpu) {
         hopt = map_tcp_option(wopt);
     }
 
-    const int val_host = (vl >= 4u) ? static_cast<int>(rbrew_read32(MEM, vp)) : static_cast<int>(MEM[vp]);
+    int val_host = (vl >= 4u) ? static_cast<int>(rbrew_read32(MEM, vp)) : static_cast<int>(MEM[vp]);
+    if (hlevel == IPPROTO_IP && hopt == IP_TTL) {
+        if (val_host <= 0) {
+            // PIA (v272 02C49EA8) sends its low-TTL NAT probes, then restores the socket with
+            // setsockopt(IP_TTL, 0) = "default TTL" on the Wii U. Windows accepts 0 literally:
+            // sendto() still succeeds but TTL-0 datagrams never leave the machine (loopback
+            // excepted), so every later packet of that P2P socket was silently lost between two
+            // PCs (host never answered the joiner's NAT probes). Map 0 to a normal default.
+            std::snprintf(s_trace_detail, sizeof(s_trace_detail), "IP_TTL=%d->64 (default)", val_host);
+            val_host = 64;
+        } else if (relay_is_active() && val_host < 32) {
+            // PIA sets low IP_TTL (1..4) for direct NAT hole-punching probes; in relay mode
+            // packets must reach the relay server reliably, so clamp low TTLs to 64.
+            std::snprintf(s_trace_detail, sizeof(s_trace_detail), "IP_TTL=%d->64 (relay)", val_host);
+            val_host = 64;
+        }
+    }
     (void)setsockopt(s, hlevel, hopt, reinterpret_cast<const char*>(&val_host),
                      static_cast<socklen_t>(sizeof(val_host)));
     clear_so_err();
@@ -1499,7 +2053,8 @@ void ac_Initialize(CPUState* cpu) {
 
 void ac_Connect(CPUState* cpu) {
     const bool ok = get_net_config().online_enabled;
-    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "online=%d", ok ? 1 : 0);
+    if (ok) ensure_relay_probed();
+    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "online=%d relay=%d", ok ? 1 : 0, relay_is_active() ? 1 : 0);
     RET = ok ? 0u : kAcResultNotConnected;
 }
 
@@ -1516,13 +2071,18 @@ void ac_GetLastErrorCode(CPUState* cpu) {
 void ac_GetAssignedAddress(CPUState* cpu) {
     const auto& cfg = get_net_config();
     uint32_t addr_host_be = 0u;
-    if (cfg.online_enabled && cfg.local_ipv4_nbo != 0) {
-        // rbrew_write32 writes big-endian, so pass host-order IPv4 uint32 so bytes in guest RAM are network order.
-        addr_host_be = ntohl(cfg.local_ipv4_nbo);
+    if (cfg.online_enabled) {
+        ensure_relay_probed();
+        const uint32_t ip_nbo = relay_is_active() ? relay_vip_nbo() : cfg.local_ipv4_nbo;
+        if (ip_nbo != 0) {
+            // rbrew_write32 writes big-endian, so pass host-order IPv4 uint32 so bytes in guest RAM are network order.
+            addr_host_be = ntohl(ip_nbo);
+        }
     }
     if (ARG0 && rbrew_memory_accessible(MEM, ARG0, 4u)) rbrew_write32(MEM, ARG0, addr_host_be);
-    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "ip=%u.%u.%u.%u", (addr_host_be >> 24) & 0xFFu,
-                  (addr_host_be >> 16) & 0xFFu, (addr_host_be >> 8) & 0xFFu, addr_host_be & 0xFFu);
+    std::snprintf(s_trace_detail, sizeof(s_trace_detail), "ip=%u.%u.%u.%u%s", (addr_host_be >> 24) & 0xFFu,
+                  (addr_host_be >> 16) & 0xFFu, (addr_host_be >> 8) & 0xFFu, addr_host_be & 0xFFu,
+                  relay_is_active() ? " (relay)" : "");
     RET = 0;
 }
 

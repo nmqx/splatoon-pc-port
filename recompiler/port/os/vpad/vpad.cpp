@@ -211,6 +211,8 @@ static constexpr float kCameraDegreesPerCount = 0.08f;
 // GamePad and the game's motion aiming follows - with the game's own gain
 // (about 3.5), tremor filter and lag.
 static float s_mouse_yaw = 0.0f, s_mouse_pitch = 0.0f; // degrees this frame (under s_motion_lock)
+static float s_fallback_pad_pitch = 0.0f;              // net pad pitch added while camera absent (under s_motion_lock)
+static bool s_mouse_pitch_is_fallback = false;         // s_mouse_pitch came from fallback path (under s_motion_lock)
 static constexpr float kMouseDegreesPerCount = 0.035f; // 0.09 was far too fast
 // RBREW_MOUSE_LOG=<file> (diagnostics): per VPADRead the mouse counts, the
 // rotation given to the virtual pad and the game's camera direction.
@@ -255,13 +257,17 @@ void vpad_update_motion(uint8_t* mem, uint32_t buf, float rx, float ry, float dt
     }();
     const bool use_gyro = phys_gyro && physical_gyro_enabled();
     float yaw_rate = stick_yaw ? -rx * std::fabs(rx) * kYawRate : 0.0f;
-    float pitch_rate = use_gyro && !stick_pitch_with_gyro ? 0.0f : -ry * std::fabs(ry) * kPitchRate;
+    const float base_pitch_rate = use_gyro && !stick_pitch_with_gyro ? 0.0f : -ry * std::fabs(ry) * kPitchRate;
+    float pitch_rate = base_pitch_rate;
+    bool track_fallback_pitch = false;
     if (dt > 0 && (s_mouse_yaw != 0.0f || s_mouse_pitch != 0.0f)) {
         yaw_rate += s_mouse_yaw / dt;
         pitch_rate += s_mouse_pitch / dt;
+        track_fallback_pitch = s_mouse_pitch_is_fallback && !use_gyro;
         s_dbg_sent_yaw = s_mouse_yaw;
         s_dbg_sent_pitch = s_mouse_pitch;
         s_mouse_yaw = s_mouse_pitch = 0.0f;
+        s_mouse_pitch_is_fallback = false;
     }
     // Without a gyro the virtual pad starts at the attitude the game's motion
     // aiming takes as level (tilted back 30 degrees). It started upright, which
@@ -291,6 +297,10 @@ void vpad_update_motion(uint8_t* mem, uint32_t buf, float rx, float ry, float dt
     }
     v.yaw = std::fmod(v.yaw + yaw_rate * dt, 360.0f);
     const float pitch = std::fmax(-kPitchLimit, std::fmin(kPitchLimit, v.pitch + pitch_rate * dt));
+    if (track_fallback_pitch) {
+        const float pitch_no_mouse = std::fmax(-kPitchLimit, std::fmin(kPitchLimit, v.pitch + base_pitch_rate * dt));
+        s_fallback_pad_pitch += (pitch - pitch_no_mouse);
+    }
     const float applied_pitch_rate = dt > 0 ? (pitch - v.pitch) / dt : 0.0f;
     v.pitch = pitch;
     const Mat3 r = mat_mul(mat_mul(rotation_y(v.yaw * kPi / 180), v.base), rotation_x(v.pitch * kPi / 180));
@@ -332,6 +342,9 @@ static void VPADSetGyroDirection(CPUState* cpu) {
             s_motion.base.m[component][axis] = float(rbrew_read_f32(MEM, dir + 12 * axis + 4 * component));
     s_motion.yaw = s_motion.pitch = 0;
     s_motion.rested = false;
+    s_mouse_yaw = s_mouse_pitch = 0.0f;
+    s_fallback_pad_pitch = 0.0f;
+    s_mouse_pitch_is_fallback = false;
 }
 
 // Edge state for VPADStatus trigger/release (the console reports presses and
@@ -446,6 +459,7 @@ static void VPADRead(CPUState* cpu) {
     // Keyboard + mouse input (Splatoon layout, active in TV view)
     // KB+M additively overlays controller: pressing a key overrides that axis.
     // -----------------------------------------------------------------------
+    static bool s_prev_mouse_relative = false;
     if (g_screen_mode == ScreenMode::TV && !testing) {
         const uint8_t* keys = SDL_GetKeyboardState(nullptr);
 
@@ -454,6 +468,11 @@ static void VPADRead(CPUState* cpu) {
         // raw-input ownership before take_buttons queries button state.
         SDL_GetRelativeMouseState(&mdx, &mdy);
         const bool mouse_relative = SDL_GetRelativeMouseMode() == SDL_TRUE;
+        // Drop deltas while relative mode is off (ESC menu, RBREW_NO_MOUSE_GRAB)
+        // and on the single transition frame into relative mode (cursor-center
+        // warp / accumulated GamePad-view cursor delta).
+        if (!mouse_relative || !s_prev_mouse_relative) mdx = mdy = 0;
+        s_prev_mouse_relative = mouse_relative;
         // The raw input thread's counts join SDL's (hooks/mouse_aim.h: the
         // in-between frames turn the view with the mouse at the display's rate).
         rbrew_aim::take_counts(mdx, mdy, mouse_relative, mdx, mdy);
@@ -507,7 +526,9 @@ static void VPADRead(CPUState* cpu) {
             if (bound(action)) buttons |= kActionButtons[action];
         player_input = player_input || key_held;
     } else if (!testing) {
-        int unused_dx = 0, unused_dy = 0; // GamePad view: the raw thread stops counting
+        int unused_dx = 0, unused_dy = 0; // GamePad view: drain SDL relative deltas and stop raw counting
+        SDL_GetRelativeMouseState(&unused_dx, &unused_dy);
+        s_prev_mouse_relative = false;
         rbrew_aim::take_counts(0, 0, false, unused_dx, unused_dy);
     }
 
@@ -693,17 +714,22 @@ static void VPADRead(CPUState* cpu) {
     // (menus, loading) is taken back when it returns: with motion controls the
     // game aims vertically by the pad's attitude, so the tilt would otherwise
     // stay as a vertical offset the camera path cannot undo.
-    static float s_fallback_pad_pitch = 0.0f; // under s_motion_lock
     if (rbrew_aim::vpad_frame(mouse_yaw, mouse_pitch, ry, input_blocked)) {
         std::lock_guard lock(s_motion_lock);
-        s_mouse_pitch -= s_fallback_pad_pitch;
-        s_fallback_pad_pitch = 0.0f;
+        if (s_mouse_pitch_is_fallback) {
+            s_mouse_yaw = s_mouse_pitch = 0.0f;
+            s_mouse_pitch_is_fallback = false;
+        }
+        if (s_fallback_pad_pitch != 0.0f) {
+            s_mouse_pitch -= s_fallback_pad_pitch;
+            s_fallback_pad_pitch = 0.0f;
+        }
     } else if (!input_blocked && (mouse_yaw != 0.0f || mouse_pitch != 0.0f)) {
         constexpr float kPadPerCamera = kMouseDegreesPerCount / kCameraDegreesPerCount;
         std::lock_guard lock(s_motion_lock);
         s_mouse_yaw += mouse_yaw * kPadPerCamera;
         s_mouse_pitch -= mouse_pitch * kPadPerCamera;
-        if (rbrew_aim::enabled()) s_fallback_pad_pitch -= mouse_pitch * kPadPerCamera;
+        if (rbrew_aim::enabled()) s_mouse_pitch_is_fallback = true;
     }
     vpad_update_motion(MEM, buf, rx, ry, motion_dt >= 0 ? motion_dt : motion_seconds(),
                        has_phys_gyro ? phys_gyro : nullptr, has_phys_accel ? phys_accel : nullptr);

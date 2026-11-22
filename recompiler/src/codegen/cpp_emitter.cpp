@@ -585,20 +585,24 @@ void CppEmitter::emit_function(const ir::IRFunction& func, std::ostream& out) {
 
     std::string fname = m_names.function_name(func.entry_addr, func.name);
     if (m_cfg.hooked.contains(func.entry_addr)) {
-        // The hook's "call original" target is the 1-arg adapter; the entry
-        // wrapper runs the registered hook or the body directly.
-        out << "void " << fname << "_unhooked(CPUState* cpu) { " << fname << "(cpu, cpu->mem); }\n"
-            << "void " << fname << "_entry(CPUState* cpu) {\n"
+        // Check the guest hook inside the 2-arg function too so direct `bl`
+        // call sites (which emit `fname(cpu, mem)` rather than `fname_entry`)
+        // cannot bypass `[hooks]` entries in the manifest.
+        out << "static void " << fname << "_body(CPUState* __restrict cpu, uint8_t* __restrict mem);\n"
+            << "void " << fname << "_unhooked(CPUState* cpu) { " << fname << "_body(cpu, cpu->mem); }\n"
+            << "void " << fname << "_entry(CPUState* cpu) { " << fname << "(cpu, cpu->mem); }\n"
+            << "void " << fname << "(CPUState* __restrict cpu, uint8_t* __restrict mem) {\n"
             << "    if (const RbrewGuestHook hook = rbrew_guest_hook(0x" << std::hex << func.entry_addr
             << "u)) { hook(cpu, 0x" << func.entry_addr << "u, " << fname << "_unhooked); return; }\n"
-            << "    " << fname << "(cpu, cpu->mem);\n}\n";
+            << "    " << fname << "_body(cpu, mem);\n}\n"
+            << "static void " << fname << "_body(CPUState* __restrict cpu, uint8_t* __restrict mem) {\n";
     } else {
         out << "void " << fname << "_entry(CPUState* cpu) { " << fname << "(cpu, cpu->mem); }\n";
+        // The body receives the arena base explicitly: host compilers then know
+        // guest-memory accesses (through mem) cannot alias CPUState registers
+        // (through cpu) and keep r[]/f[]/cr[] in host registers across them.
+        out << "void " << fname << "(CPUState* __restrict cpu, uint8_t* __restrict mem) {\n";
     }
-    // The body receives the arena base explicitly: host compilers then know
-    // guest-memory accesses (through mem) cannot alias CPUState registers
-    // (through cpu) and keep r[]/f[]/cr[] in host registers across them.
-    out << "void " << fname << "(CPUState* __restrict cpu, uint8_t* __restrict mem) {\n";
     if (m_cfg.emit_coverage)
         out << "#ifdef RBREW_ENABLE_COVERAGE\n    RBREW_COVERAGE_FUNCTION(0x" << std::hex << func.entry_addr
             << "u);\n#endif\n";

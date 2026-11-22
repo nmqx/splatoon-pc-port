@@ -4,6 +4,7 @@
 namespace {
 std::atomic<uint64_t> s_watch_batch_id{0};
 thread_local uint64_t t_watch_batch_id = 0;
+thread_local bool t_epoch_reuse = false;
 } // namespace
 
 uint64_t gx2_write_watch_batch_id() {
@@ -11,6 +12,7 @@ uint64_t gx2_write_watch_batch_id() {
 }
 void gx2_write_watch_end_batch() {
     t_watch_batch_id = 0;
+    t_epoch_reuse = false;
 }
 
 #if defined(_WIN32)
@@ -57,7 +59,6 @@ uint64_t s_range_hits = 0;
 // RBREW_WRITE_WATCH_REUSE=0 asks the OS on every query again.
 std::vector<uint32_t> s_page_epoch; // guest page -> epoch of its last collection
 std::atomic<uint32_t> s_epoch{1};
-thread_local bool t_epoch_reuse = false;
 thread_local const uint8_t* t_observed_mem = nullptr;
 
 struct FastRangeMru {
@@ -68,7 +69,14 @@ struct FastRangeMru {
     uint32_t epoch = ~0u;
     uint64_t generation = 0;
 };
-thread_local FastRangeMru t_fast_mru[16]{};
+constexpr size_t kFastMruSize = 1024;
+thread_local FastRangeMru t_fast_mru[kFastMruSize]{};
+
+inline size_t fast_mru_slot(uint32_t addr, uint32_t size) noexcept {
+    uint32_t h = ((addr >> 4) * 2654435761u) ^ (size * 2246822519u);
+    h ^= h >> 16;
+    return size_t(h) & (kFastMruSize - 1);
+}
 
 // RBREW_WRITE_WATCH_DISABLE=1 reports every range untracked, so all
 // geometry/uniform caches re-read guest memory each use (slow; for A/B tests).
@@ -121,7 +129,7 @@ void observe_render_writes(const uint8_t* mem) {
     rbrew_set_write_observer({const_cast<uint8_t*>(mem), forget_collected, nullptr});
     t_observed_mem = mem;
 }
-bool collect_pages(const uint8_t* mem, uint64_t first, uint64_t last) {
+bool collect_pages(const uint8_t* mem, uint64_t first, uint64_t last, bool bump_revision = true) {
     // Room for every page of the range: a reset must not drop unreported pages.
     s_written.resize(size_t(last - first + 1));
     ULONG_PTR count = s_written.size();
@@ -132,16 +140,19 @@ bool collect_pages(const uint8_t* mem, uint64_t first, uint64_t last) {
         return false;
     if (count) {
         ++s_generation;
-        // Collections by non-batch callers also update shared page history.
-        // Batch range answers must observe those newer generations.
-        ++s_range_revision;
+        // Collections by non-batch callers (or overlapping queries) also update
+        // shared page history; batch range answers must observe those newer
+        // generations. Strictly-uncollected batch runs never touch pages already
+        // collected in s_epoch, so existing batch range memos stay exact.
+        if (bump_revision) ++s_range_revision;
         for (ULONG_PTR i = 0; i < count; ++i) {
             const size_t page = size_t((static_cast<const uint8_t*>(s_written[i]) - mem) / kPage);
             s_page_generation[page] = s_generation;
             s_page_collected[page / 64] |= 1ull << (page % 64);
         }
     }
-    for (uint64_t page = first; page <= last; ++page) s_page_epoch[page] = s_epoch;
+    const uint32_t ep = s_epoch.load(std::memory_order_relaxed);
+    for (uint64_t page = first; page <= last; ++page) s_page_epoch[page] = ep;
     return true;
 }
 // Render batch only: collect the aligned 64 KiB window around an uncollected
@@ -150,8 +161,10 @@ bool collect_pages(const uint8_t* mem, uint64_t first, uint64_t last) {
 // neighbouring pages that the batch asks for one draw at a time. Writes found
 // on the neighbours enter the page history like any other collection, so
 // later queries in this epoch answer from it with unchanged results; the next
-// batch asks the OS again. A window outside the watched allocation falls back
-// to the exact range.
+// batch asks the OS again. Only contiguous runs of pages not yet collected in
+// this epoch are queried, so already-collected pages in s_epoch are never
+// re-reset or invalidated within the batch. A window outside the watched
+// allocation falls back to the uncollected runs of the exact range.
 // RBREW_WRITE_WATCH_WINDOW=<pages, power of two> (testing; 256 and 2048 were
 // no faster than 16 in the 2026-10-25 plaza replay).
 uint64_t window_pages() {
@@ -162,15 +175,29 @@ uint64_t window_pages() {
     }();
     return pages;
 }
+bool collect_uncollected_runs(const uint8_t* mem, uint64_t first, uint64_t last, bool bump_revision) {
+    const uint32_t ep = s_epoch.load(std::memory_order_relaxed);
+    uint64_t page = first;
+    while (page <= last) {
+        while (page <= last && s_page_epoch[page] == ep) ++page;
+        if (page > last) break;
+        const uint64_t run_first = page;
+        while (page <= last && s_page_epoch[page] != ep) ++page;
+        if (!collect_pages(mem, run_first, page - 1, bump_revision)) return false;
+    }
+    return true;
+}
 bool collect_batch_pages(const uint8_t* mem, uint64_t first, uint64_t last) {
     const uint64_t kWindowPages = window_pages();
     if (t_epoch_reuse && mem == t_observed_mem) {
         const uint64_t window_first = first & ~(kWindowPages - 1);
         const uint64_t window_last = std::min<uint64_t>(last | (kWindowPages - 1), s_page_epoch.size() - 1);
-        if ((window_first != first || window_last != last) && collect_pages(mem, window_first, window_last))
+        if ((window_first != first || window_last != last) &&
+            collect_uncollected_runs(mem, window_first, window_last, /*bump_revision=*/false))
             return true;
+        return collect_uncollected_runs(mem, first, last, /*bump_revision=*/false);
     }
-    return collect_pages(mem, first, last);
+    return collect_pages(mem, first, last, /*bump_revision=*/true);
 }
 uint64_t newest(uint64_t first, uint64_t last) {
     uint32_t generation = 0;
@@ -203,7 +230,7 @@ uint64_t gx2_write_generation(const uint8_t* mem, uint32_t addr, uint32_t size) 
 
     const uint64_t cur_rev = s_range_revision.load(std::memory_order_relaxed);
     const uint32_t cur_epoch = s_epoch.load(std::memory_order_relaxed);
-    const size_t slot = ((addr >> 4) ^ size) & 15;
+    const size_t slot = fast_mru_slot(addr, size);
     if (t_epoch_reuse && t_fast_mru[slot].mem == mem && t_fast_mru[slot].addr == addr &&
         t_fast_mru[slot].size == size && t_fast_mru[slot].revision == cur_rev && t_fast_mru[slot].epoch == cur_epoch) {
         return t_fast_mru[slot].generation;
@@ -220,28 +247,38 @@ uint64_t gx2_write_generation(const uint8_t* mem, uint32_t addr, uint32_t size) 
     if (gx2interp::replaying()) return newest(first, last);
     uint64_t generation;
     if (memoized(mem, addr, size, generation)) {
-        if (t_epoch_reuse) t_fast_mru[slot] = {mem, addr, size, cur_rev, cur_epoch, generation};
+        if (t_epoch_reuse)
+            t_fast_mru[slot] = {mem, addr, size, s_range_revision.load(std::memory_order_relaxed), cur_epoch, generation};
         return generation;
     }
     generation = (collected_this_epoch(mem, first, last) || collect_batch_pages(mem, first, last)) ? newest(first, last)
                                                                                                    : kGx2WriteUntracked;
     remember_range(mem, addr, size, generation);
-    if (t_epoch_reuse) t_fast_mru[slot] = {mem, addr, size, cur_rev, cur_epoch, generation};
+    if (t_epoch_reuse)
+        t_fast_mru[slot] = {mem, addr, size, s_range_revision.load(std::memory_order_relaxed), cur_epoch, generation};
     return generation;
 }
 void gx2_write_generations(const uint8_t* mem, Gx2WriteRange* ranges, uint32_t count) {
     if (!ranges || !count) return;
     const uint64_t cur_rev = s_range_revision.load(std::memory_order_relaxed);
     const uint32_t cur_epoch = s_epoch.load(std::memory_order_relaxed);
+    uint32_t mru_hit_mask = 0;
     if (t_epoch_reuse && mem) {
         uint32_t hits = 0;
         for (uint32_t i = 0; i < count; ++i) {
             auto& range = ranges[i];
-            const size_t slot = ((range.address >> 4) ^ range.size) & 15;
-            if (t_fast_mru[slot].mem == mem && t_fast_mru[slot].addr == range.address &&
-                t_fast_mru[slot].size == range.size && t_fast_mru[slot].revision == cur_rev &&
-                t_fast_mru[slot].epoch == cur_epoch) {
-                range.generation = t_fast_mru[slot].generation;
+            if (!range.size) {
+                range.generation = 0;
+                if (i < 32) mru_hit_mask |= 1u << i;
+                ++hits;
+                continue;
+            }
+            const size_t slot = fast_mru_slot(range.address, range.size);
+            const auto& entry = t_fast_mru[slot];
+            if (entry.mem == mem && entry.addr == range.address && entry.size == range.size &&
+                entry.revision == cur_rev && entry.epoch == cur_epoch) {
+                range.generation = entry.generation;
+                if (i < 32) mru_hit_mask |= 1u << i;
                 ++hits;
             }
         }
@@ -252,6 +289,7 @@ void gx2_write_generations(const uint8_t* mem, Gx2WriteRange* ranges, uint32_t c
     if (mem) select_arena(mem);
     if (mem && gx2interp::replaying()) { // see gx2_write_generation
         for (uint32_t i = 0; i < count; ++i) {
+            if (i < 32 && (mru_hit_mask & (1u << i))) continue;
             auto& range = ranges[i];
             range.generation = !range.size ? 0
                                : uint64_t(range.address) + range.size > (1ull << 32) || tracking_disabled()
@@ -261,7 +299,10 @@ void gx2_write_generations(const uint8_t* mem, Gx2WriteRange* ranges, uint32_t c
         return;
     }
     s_ranges.clear();
+    const uint64_t lock_rev = s_range_revision.load(std::memory_order_relaxed);
+    const bool mru_valid = (lock_rev == cur_rev);
     for (uint32_t i = 0; i < count; ++i) {
+        if (mru_valid && i < 32 && (mru_hit_mask & (1u << i))) continue;
         auto& range = ranges[i];
         range.generation = 0;
         if (!mem || !range.size) continue;
@@ -270,11 +311,18 @@ void gx2_write_generations(const uint8_t* mem, Gx2WriteRange* ranges, uint32_t c
             continue;
         }
         ++s_checks;
-        if (!memoized(mem, range.address, range.size, range.generation)) s_ranges.push_back(&range);
+        if (memoized(mem, range.address, range.size, range.generation)) {
+            if (t_epoch_reuse)
+                t_fast_mru[fast_mru_slot(range.address, range.size)] = {mem, range.address, range.size, lock_rev,
+                                                                        cur_epoch, range.generation};
+        } else {
+            s_ranges.push_back(&range);
+        }
     }
     if (s_ranges.empty()) return;
-    select_arena(mem);
-    std::sort(s_ranges.begin(), s_ranges.end(), [](const auto* a, const auto* b) { return a->address < b->address; });
+    if (s_ranges.size() > 1)
+        std::sort(s_ranges.begin(), s_ranges.end(),
+                  [](const auto* a, const auto* b) { return a->address < b->address; });
     for (size_t first_range = 0; first_range < s_ranges.size();) {
         const auto* first = s_ranges[first_range];
         const uint64_t first_page = first->address / kPage;
@@ -289,16 +337,16 @@ void gx2_write_generations(const uint8_t* mem, Gx2WriteRange* ranges, uint32_t c
         }
         const bool tracked =
             collected_this_epoch(mem, first_page, last_page) || collect_batch_pages(mem, first_page, last_page);
+        const uint64_t final_rev = s_range_revision.load(std::memory_order_relaxed);
         for (size_t i = first_range; i < end; ++i) {
             auto& range = *s_ranges[i];
             range.generation = tracked
                                    ? newest(range.address / kPage, (uint64_t(range.address) + range.size - 1) / kPage)
                                    : kGx2WriteUntracked;
             remember_range(mem, range.address, range.size, range.generation);
-            if (t_epoch_reuse) {
-                const size_t slot = ((range.address >> 4) ^ range.size) & 15;
-                t_fast_mru[slot] = {mem, range.address, range.size, cur_rev, cur_epoch, range.generation};
-            }
+            if (t_epoch_reuse)
+                t_fast_mru[fast_mru_slot(range.address, range.size)] = {mem, range.address, range.size, final_rev,
+                                                                        cur_epoch, range.generation};
         }
         first_range = end;
     }
@@ -308,7 +356,10 @@ void gx2_write_watch_begin_batch() {
     t_watch_batch_id = s_watch_batch_id.fetch_add(1, std::memory_order_relaxed) + 1;
     t_epoch_reuse = true;
     std::lock_guard lock(s_lock);
-    s_range_generations.clear();
+    // Invalidate memoized entries by revision instead of freeing all hash nodes
+    // every batch; cap size to keep memory bounded across long sessions.
+    ++s_range_revision;
+    if (s_range_generations.size() > 4096) s_range_generations.clear();
     if (++s_epoch == 0) s_epoch = 1; // 0 means "never collected"
 }
 uint64_t gx2_write_query_count() {

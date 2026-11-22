@@ -132,7 +132,9 @@ void r700_shader_registers(uint32_t* r, const uint8_t* p, bool pixel) {
         r[mmSQ_PGM_EXPORTS_PS] = be(4);
         r[mmSPI_PS_IN_CONTROL_0] = be(8);
         r[mmSPI_PS_IN_CONTROL_1] = be(12);
-        for (unsigned i = 0; i < std::min(be(16), 32u); ++i) r[mmSPI_PS_INPUT_CNTL_0 + i] = be(20 + i * 4);
+        const unsigned ps_in = std::min(be(16), 32u);
+        for (unsigned i = 0; i < ps_in; ++i) r[mmSPI_PS_INPUT_CNTL_0 + i] = be(20 + i * 4);
+        for (unsigned i = ps_in; i < 32u; ++i) r[mmSPI_PS_INPUT_CNTL_0 + i] = 0u;
         r[mmCB_SHADER_MASK] = be(0x94);
         r[mmCB_SHADER_CONTROL] = be(0x98);
         r[mmDB_SHADER_CONTROL] = be(0x9C);
@@ -141,7 +143,9 @@ void r700_shader_registers(uint32_t* r, const uint8_t* p, bool pixel) {
         r[mmSQ_PGM_RESOURCES_VS] = be(0);
         r[mmVGT_PRIMITIVEID_EN] = be(4);
         r[mmSPI_VS_OUT_CONFIG] = be(8);
-        for (unsigned i = 0; i < std::min(be(12), 10u); ++i) r[mmSPI_VS_OUT_ID_0 + i] = be(16 + i * 4);
+        const unsigned vs_out = std::min(be(12), 10u);
+        for (unsigned i = 0; i < vs_out; ++i) r[mmSPI_VS_OUT_ID_0 + i] = be(16 + i * 4);
+        for (unsigned i = vs_out; i < 10u; ++i) r[mmSPI_VS_OUT_ID_0 + i] = 0xFFFFFFFFu;
         r[mmPA_CL_VS_OUT_CNTL] = be(0x38);
         r[mmSQ_VTX_SEMANTIC_CLEAR] = be(0x3C);
         for (unsigned i = 0; i < 32; ++i)
@@ -284,18 +288,89 @@ char* r700_to_glsl(const R700TranslateInput& in) {
             if (out.textureUnitMask[t]) s_last_reads.texture_unit_mask |= 1u << t;
         const auto* src = out.shader->strBuf_shaderSource->c_str();
         const size_t length = out.shader->strBuf_shaderSource->size();
+        const std::string_view src_view(src, length);
+        // On R700 hardware, any PS input declared in SPI_PS_INPUT_CNTL_i whose
+        // semantic is not exported by the VS receives DEFAULT_VAL (bits 8..9).
+        // In Vulkan, leaving that location undeclared in the VS violates
+        // VUID-RuntimeSpirv-OpEntryPoint-08743 and feeds undefined values to
+        // the fragment shader. Emit matching default-initialized VS outputs.
+        std::string default_decls;
+        std::string default_inits;
+        if (!in.is_pixel && in.context_registers && !out.streamoutBufferWriteMask.any()) {
+            uint32_t exported_locations = 0;
+            for (const auto& output : vertex_outputs(src_view)) {
+                uint32_t loc = 0;
+                bool valid_loc = !output.location.empty();
+                for (char ch : output.location) {
+                    loc = loc * 10u + uint32_t(ch - '0');
+                    if (loc >= 32u) {
+                        valid_loc = false;
+                        break;
+                    }
+                }
+                if (valid_loc) exported_locations |= 1u << loc;
+            }
+            static constexpr const char* kDefaultVec4[4] = {
+                "vec4(0.0, 0.0, 0.0, 0.0)",
+                "vec4(0.0, 0.0, 0.0, 1.0)",
+                "vec4(1.0, 1.0, 1.0, 0.0)",
+                "vec4(1.0, 1.0, 1.0, 1.0)",
+            };
+            const LatteShaderPSInputTable* ps_table = LatteSHRC_GetPSInputTable();
+            const int ps_count = std::min<int>(ps_table->count, 32);
+            for (int i = 0; i < ps_count; ++i) {
+                if (ps_table->import[i].semanticId > LATTE_ANALYZER_IMPORT_INDEX_PARAM_MAX) continue;
+                if ((exported_locations >> i) & 1u) continue;
+                const uint32_t def = (regs[mmSPI_PS_INPUT_CNTL_0 + i] >> 8) & 3u;
+                default_decls += "layout(location = " + std::to_string(i) + ") ";
+                if (ps_table->import[i].isFlat) default_decls += "flat ";
+                if (ps_table->import[i].isNoPerspective) default_decls += "noperspective ";
+                default_decls += "out vec4 rbrew_default_out_" + std::to_string(i) + ";\n";
+                if (default_inits.empty()) default_inits = "\n";
+                default_inits += "rbrew_default_out_" + std::to_string(i) + " = " + kDefaultVec4[def] + ";\n";
+            }
+        }
         constexpr std::string_view push =
             "layout(push_constant) uniform RbrewPushConstants { int rbrew_base_instance; };\n";
         const size_t extra = in.is_pixel ? 0 : push.size();
-        char* result = static_cast<char*>(std::malloc(length + extra + 1));
+        const char* line = extra ? static_cast<const char*>(std::memchr(src, '\n', length)) : nullptr;
+        const size_t prefix = line ? size_t(line - src) + 1 : 0;
+        size_t main_pos = std::string_view::npos;
+        size_t body_pos = std::string_view::npos;
+        if (!default_decls.empty()) {
+            main_pos = src_view.find("void main()");
+            if (main_pos != std::string_view::npos && main_pos >= prefix) {
+                const size_t brace = src_view.find('{', main_pos);
+                if (brace != std::string_view::npos) body_pos = brace + 1;
+            }
+            if (body_pos == std::string_view::npos) {
+                default_decls.clear();
+                default_inits.clear();
+            }
+        }
+        const size_t total = length + extra + default_decls.size() + default_inits.size();
+        char* result = static_cast<char*>(std::malloc(total + 1));
         if (result) {
             // Assemble directly into the API's final buffer, avoiding an
             // intermediate string, insertion/reallocation and strlen pass.
-            const char* line = extra ? static_cast<const char*>(std::memchr(src, '\n', length)) : nullptr;
-            const size_t prefix = line ? size_t(line - src) + 1 : 0;
-            std::memcpy(result, src, prefix);
-            if (extra) std::memcpy(result + prefix, push.data(), extra);
-            std::memcpy(result + prefix + extra, src + prefix, length - prefix + 1);
+            char* dst = result;
+            auto emit = [&](const char* p, size_t n) {
+                if (n) {
+                    std::memcpy(dst, p, n);
+                    dst += n;
+                }
+            };
+            emit(src, prefix);
+            if (extra) emit(push.data(), extra);
+            if (!default_decls.empty()) {
+                emit(src + prefix, main_pos - prefix);
+                emit(default_decls.data(), default_decls.size());
+                emit(src + main_pos, body_pos - main_pos);
+                emit(default_inits.data(), default_inits.size());
+                emit(src + body_pos, length - body_pos + 1);
+            } else {
+                emit(src + prefix, length - prefix + 1);
+            }
         }
         delete out.shader->strBuf_shaderSource;
         delete out.shader;
