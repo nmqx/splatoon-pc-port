@@ -555,33 +555,53 @@ void rbrew_register_func(CPUState* cpu, uint32_t guest_addr, HostFunc fn) {
     if (idx < cpu->dispatch_size) cpu->dispatch_table[idx] = fn;
 }
 
-// Few hooks, set at startup before guest threads run; read on every wrapped call.
+// Hooks are set at startup before guest threads run; read on every wrapped call.
+// Power-of-2 open-addressed table keeps lookup O(1) even for hot leaf hooks.
 namespace {
 struct GuestHookEntry {
     uint32_t address;
     RbrewGuestHook hook;
 };
-constexpr unsigned kMaxGuestHooks = 32;
-GuestHookEntry s_guest_hooks[kMaxGuestHooks];
+constexpr unsigned kGuestHookSlots = 64;
+constexpr unsigned kGuestHookMask = kGuestHookSlots - 1;
+constexpr unsigned kMaxGuestHooks = 48;
+GuestHookEntry s_guest_hooks[kGuestHookSlots]{};
 std::atomic<unsigned> s_guest_hook_count{0};
+inline unsigned guest_hook_slot(uint32_t addr) {
+    return ((addr >> 2) * 2654435761u) & kGuestHookMask;
+}
 } // namespace
 RbrewGuestHook rbrew_guest_hook(uint32_t guest_addr) {
-    const unsigned count = s_guest_hook_count.load(std::memory_order_acquire);
-    for (unsigned i = 0; i < count; ++i)
-        if (s_guest_hooks[i].address == guest_addr) return s_guest_hooks[i].hook;
+    if (s_guest_hook_count.load(std::memory_order_acquire) == 0) return nullptr;
+    unsigned slot = guest_hook_slot(guest_addr);
+    for (unsigned probe = 0; probe < kGuestHookSlots; ++probe) {
+        const uint32_t a = s_guest_hooks[slot].address;
+        if (a == guest_addr) return s_guest_hooks[slot].hook;
+        if (a == 0) return nullptr;
+        slot = (slot + 1) & kGuestHookMask;
+    }
     return nullptr;
 }
 bool rbrew_set_guest_hook(uint32_t guest_addr, RbrewGuestHook hook) {
-    const unsigned count = s_guest_hook_count.load(std::memory_order_relaxed);
-    for (unsigned i = 0; i < count; ++i)
-        if (s_guest_hooks[i].address == guest_addr) {
-            s_guest_hooks[i].hook = hook;
+    if (guest_addr == 0) return false;
+    unsigned slot = guest_hook_slot(guest_addr);
+    for (unsigned probe = 0; probe < kGuestHookSlots; ++probe) {
+        const uint32_t a = s_guest_hooks[slot].address;
+        if (a == guest_addr) {
+            s_guest_hooks[slot].hook = hook;
+            s_guest_hook_count.fetch_add(0, std::memory_order_release);
             return true;
         }
-    if (count == kMaxGuestHooks) return false;
-    s_guest_hooks[count] = {guest_addr, hook};
-    s_guest_hook_count.store(count + 1, std::memory_order_release);
-    return true;
+        if (a == 0) {
+            const unsigned count = s_guest_hook_count.load(std::memory_order_relaxed);
+            if (count >= kMaxGuestHooks) return false;
+            s_guest_hooks[slot] = {guest_addr, hook};
+            s_guest_hook_count.store(count + 1, std::memory_order_release);
+            return true;
+        }
+        slot = (slot + 1) & kGuestHookMask;
+    }
+    return false;
 }
 
 #ifdef RBREW_ENABLE_COVERAGE

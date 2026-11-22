@@ -65,14 +65,14 @@ template <class T> double load_quantized(uint8_t* mem, uint32_t ea, double facto
     else
         return double(T(rbrew_read16(mem, ea))) * factor;
 }
-template <class T> void load_pair(CPUState* cpu, uint32_t frd, uint32_t ea, uint32_t w, uint32_t scale) {
+template <class T> void load_pair(CPUState* cpu, uint8_t* mem, uint32_t frd, uint32_t ea, uint32_t w, uint32_t scale) {
     // A 16-bit integer times 2^[-31,32] is exactly representable as a normal
     // double. Construct that power directly: no libm call or per-lane type
     // dispatch, with precisely the same ldexp result for every GQR scale.
     const double factor =
         std::is_same_v<T, float> ? 1.0 : std::bit_cast<double>(uint64_t(1023 - signed_scale(scale)) << 52);
-    const double p0 = load_quantized<T>(cpu->mem, ea, factor);
-    const double p1 = w ? 1.0 : load_quantized<T>(cpu->mem, ea + uint32_t(sizeof(T)), factor);
+    const double p0 = load_quantized<T>(mem, ea, factor);
+    const double p1 = w ? 1.0 : load_quantized<T>(mem, ea + uint32_t(sizeof(T)), factor);
     cpu->f[frd] = p0;
     cpu->ps1[frd] = p1;
 }
@@ -80,13 +80,13 @@ template <typename T> T saturate(double v) {
     const double lo = double(std::numeric_limits<T>::min()), hi = double(std::numeric_limits<T>::max());
     return T(std::max(lo, std::min(v, hi)));
 }
-template <class T> void store_quantized(CPUState* cpu, uint32_t ea, double v, double factor) {
+template <class T> void store_quantized(uint8_t* mem, uint32_t ea, double v, double factor) {
     if constexpr (std::is_same_v<T, float>) {
         uint64_t d;
         std::memcpy(&d, &v, 8);
         const uint32_t exponent = uint32_t(d >> 52) & 0x7FF;
         // Values below the single range store a signed zero (decaf).
-        rbrew_write32(cpu->mem, ea, exponent <= 896 ? (std::signbit(v) ? 0x80000000u : 0u) : as_bits(float(v)));
+        rbrew_write32(mem, ea, exponent <= 896 ? (std::signbit(v) ? 0x80000000u : 0u) : as_bits(float(v)));
     } else {
         // The factor is an exact, normal double. Saturation and signed-NaN
         // treatment stay identical to the ldexp path for every GQR scale.
@@ -94,40 +94,46 @@ template <class T> void store_quantized(CPUState* cpu, uint32_t ea, double v, do
                             ? (std::signbit(v) ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max())
                             : saturate<T>(v * factor);
         if constexpr (sizeof(T) == 1)
-            rbrew_write8(cpu->mem, ea, uint8_t(value));
+            rbrew_write8(mem, ea, uint8_t(value));
         else
-            rbrew_write16(cpu->mem, ea, uint16_t(value));
+            rbrew_write16(mem, ea, uint16_t(value));
     }
 }
-template <class T> void store_pair(CPUState* cpu, uint32_t frs, uint32_t ea, uint32_t w, uint32_t scale) {
+template <class T> void store_pair(CPUState* cpu, uint8_t* mem, uint32_t frs, uint32_t ea, uint32_t w, uint32_t scale) {
     const double factor =
         std::is_same_v<T, float> ? 1.0 : std::bit_cast<double>(uint64_t(1023 + signed_scale(scale)) << 52);
-    store_quantized<T>(cpu, ea, cpu->f[frs], factor);
+    store_quantized<T>(mem, ea, cpu->f[frs], factor);
     // Preserve separate ordered stores, with existing bounds and write observers.
-    if (!w) store_quantized<T>(cpu, ea + uint32_t(sizeof(T)), cpu->ps1[frs], factor);
+    if (!w) store_quantized<T>(mem, ea + uint32_t(sizeof(T)), cpu->ps1[frs], factor);
 }
 
-void psq_load(CPUState* cpu, uint32_t frd, uint32_t ea, uint32_t w, uint32_t i) {
-    const uint32_t g = cpu->gqr[i], type = (g >> 16) & 7, scale = (g >> 24) & 0x3F;
+void psq_load_gqr(CPUState* cpu, uint8_t* mem, uint32_t frd, uint32_t ea, uint32_t w, uint32_t g) {
+    const uint32_t type = (g >> 16) & 7, scale = (g >> 24) & 0x3F;
     switch (type) {
-    case QFloat: return load_pair<float>(cpu, frd, ea, w, scale);
-    case QU8: return load_pair<uint8_t>(cpu, frd, ea, w, scale);
-    case QU16: return load_pair<uint16_t>(cpu, frd, ea, w, scale);
-    case QS8: return load_pair<int8_t>(cpu, frd, ea, w, scale);
-    case QS16: return load_pair<int16_t>(cpu, frd, ea, w, scale);
+    case QFloat: return load_pair<float>(cpu, mem, frd, ea, w, scale);
+    case QU8: return load_pair<uint8_t>(cpu, mem, frd, ea, w, scale);
+    case QU16: return load_pair<uint16_t>(cpu, mem, frd, ea, w, scale);
+    case QS8: return load_pair<int8_t>(cpu, mem, frd, ea, w, scale);
+    case QS16: return load_pair<int16_t>(cpu, mem, frd, ea, w, scale);
     default: require_type(type); return;
     }
 }
-void psq_store(CPUState* cpu, uint32_t frs, uint32_t ea, uint32_t w, uint32_t i) {
-    const uint32_t g = cpu->gqr[i], type = g & 7, scale = (g >> 8) & 0x3F;
+void psq_store_gqr(CPUState* cpu, uint8_t* mem, uint32_t frs, uint32_t ea, uint32_t w, uint32_t g) {
+    const uint32_t type = g & 7, scale = (g >> 8) & 0x3F;
     switch (type) {
-    case QFloat: return store_pair<float>(cpu, frs, ea, w, scale);
-    case QU8: return store_pair<uint8_t>(cpu, frs, ea, w, scale);
-    case QU16: return store_pair<uint16_t>(cpu, frs, ea, w, scale);
-    case QS8: return store_pair<int8_t>(cpu, frs, ea, w, scale);
-    case QS16: return store_pair<int16_t>(cpu, frs, ea, w, scale);
+    case QFloat: return store_pair<float>(cpu, mem, frs, ea, w, scale);
+    case QU8: return store_pair<uint8_t>(cpu, mem, frs, ea, w, scale);
+    case QU16: return store_pair<uint16_t>(cpu, mem, frs, ea, w, scale);
+    case QS8: return store_pair<int8_t>(cpu, mem, frs, ea, w, scale);
+    case QS16: return store_pair<int16_t>(cpu, mem, frs, ea, w, scale);
     default: require_type(type); return;
     }
+}
+void psq_load(CPUState* cpu, uint32_t frd, uint32_t ea, uint32_t w, uint32_t i) {
+    psq_load_gqr(cpu, cpu->mem, frd, ea, w, cpu->gqr[i]);
+}
+void psq_store(CPUState* cpu, uint32_t frs, uint32_t ea, uint32_t w, uint32_t i) {
+    psq_store_gqr(cpu, cpu->mem, frs, ea, w, cpu->gqr[i]);
 }
 
 void set_pair(CPUState* cpu, uint32_t d, double p0, double p1) {
@@ -150,7 +156,29 @@ void compare(CPUState* cpu, uint32_t crf, double a, double b) {
 }
 } // namespace
 
-extern "C" void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t w) {
+extern "C" void rbrew_psq_load_quant(CPUState* cpu, uint8_t* mem, uint32_t d, uint32_t ea, uint32_t single,
+                                     uint32_t gqr) noexcept(false) {
+    psq_load_gqr(cpu, mem, d, ea, single, gqr);
+}
+
+extern "C" void rbrew_psq_store_quant(CPUState* cpu, uint8_t* mem, uint32_t d, uint32_t ea, uint32_t single,
+                                      uint32_t gqr) noexcept(false) {
+    psq_store_gqr(cpu, mem, d, ea, single, gqr);
+}
+
+extern "C" double rbrew_ps_truncate_single_slow(double v) noexcept {
+    return double(truncate_single(v));
+}
+
+extern "C" double rbrew_ps_merge_slot1_slow(double v) noexcept {
+    uint64_t sb;
+    std::memcpy(&sb, &v, 8);
+    const uint32_t exponent = uint32_t(sb >> 52) & 0x7FF;
+    const float s = exponent >= 1151 && exponent < 2047 ? FLT_MAX : truncate_single(v);
+    return double(s);
+}
+
+extern "C" void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t w) noexcept(false) {
     // mem is carried for the caller's alias analysis; helpers read the arena
     // through cpu->mem, which holds the same base.
     (void)mem;
@@ -204,27 +232,27 @@ extern "C" void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t w) {
     const double c0 = cpu->f[c], c1 = cpu->ps1[c];
     switch (xo5) {
     case 10:
-        set_pair(cpu, d, round_single(a0 + b1), round_single(c1));
+        set_pair(cpu, d, round_single(rbrew_ps_add_sd(a0, b1)), round_single(c1));
         record(cpu, w);
         return; // ps_sum0
     case 11:
-        set_pair(cpu, d, round_single(c0), round_single(a0 + b1));
+        set_pair(cpu, d, round_single(c0), round_single(rbrew_ps_add_sd(a0, b1)));
         record(cpu, w);
         return; // ps_sum1
     case 12:
-        set_pair(cpu, d, round_single(a0 * c0), round_single(a1 * c0));
+        set_pair(cpu, d, round_single(rbrew_ps_mul_sd(a0, c0)), round_single(rbrew_ps_mul_sd(a1, c0)));
         record(cpu, w);
         return; // ps_muls0
     case 13:
-        set_pair(cpu, d, round_single(a0 * c1), round_single(a1 * c1));
+        set_pair(cpu, d, round_single(rbrew_ps_mul_sd(a0, c1)), round_single(rbrew_ps_mul_sd(a1, c1)));
         record(cpu, w);
         return; // ps_muls1
     case 14:
-        set_pair(cpu, d, round_single(std::fma(a0, c0, b0)), round_single(std::fma(a1, c0, b1)));
+        set_pair(cpu, d, round_single(rbrew_ps_fma_sd(a0, c0, b0)), round_single(rbrew_ps_fma_sd(a1, c0, b1)));
         record(cpu, w);
         return; // ps_madds0
     case 15:
-        set_pair(cpu, d, round_single(std::fma(a0, c1, b0)), round_single(std::fma(a1, c1, b1)));
+        set_pair(cpu, d, round_single(rbrew_ps_fma_sd(a0, c1, b0)), round_single(rbrew_ps_fma_sd(a1, c1, b1)));
         record(cpu, w);
         return; // ps_madds1
     case 18:
@@ -236,7 +264,7 @@ extern "C" void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t w) {
         record(cpu, w);
         return; // ps_sub
     case 21:
-        set_pair(cpu, d, round_single(a0 + b0), round_single(a1 + b1));
+        set_pair(cpu, d, round_single(rbrew_ps_add_sd(a0, b0)), round_single(rbrew_ps_add_sd(a1, b1)));
         record(cpu, w);
         return; // ps_add
     case 23:
@@ -248,7 +276,7 @@ extern "C" void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t w) {
         record(cpu, w);
         return; // ps_res
     case 25:
-        set_pair(cpu, d, round_single(a0 * c0), round_single(a1 * c1));
+        set_pair(cpu, d, round_single(rbrew_ps_mul_sd(a0, c0)), round_single(rbrew_ps_mul_sd(a1, c1)));
         record(cpu, w);
         return; // ps_mul
     case 26:
@@ -256,19 +284,19 @@ extern "C" void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t w) {
         record(cpu, w);
         return; // ps_rsqrte
     case 28:
-        set_pair(cpu, d, round_single(std::fma(a0, c0, -b0)), round_single(std::fma(a1, c1, -b1)));
+        set_pair(cpu, d, round_single(rbrew_ps_fma_sd(a0, c0, -b0)), round_single(rbrew_ps_fma_sd(a1, c1, -b1)));
         record(cpu, w);
         return; // ps_msub
     case 29:
-        set_pair(cpu, d, round_single(std::fma(a0, c0, b0)), round_single(std::fma(a1, c1, b1)));
+        set_pair(cpu, d, round_single(rbrew_ps_fma_sd(a0, c0, b0)), round_single(rbrew_ps_fma_sd(a1, c1, b1)));
         record(cpu, w);
         return; // ps_madd
     case 30:
-        set_pair(cpu, d, -round_single(std::fma(a0, c0, -b0)), -round_single(std::fma(a1, c1, -b1)));
+        set_pair(cpu, d, -round_single(rbrew_ps_fma_sd(a0, c0, -b0)), -round_single(rbrew_ps_fma_sd(a1, c1, -b1)));
         record(cpu, w);
         return; // ps_nmsub
     case 31:
-        set_pair(cpu, d, -round_single(std::fma(a0, c0, b0)), -round_single(std::fma(a1, c1, b1)));
+        set_pair(cpu, d, -round_single(rbrew_ps_fma_sd(a0, c0, b0)), -round_single(rbrew_ps_fma_sd(a1, c1, b1)));
         record(cpu, w);
         return; // ps_nmadd
     }
@@ -315,11 +343,11 @@ extern "C" void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t w) {
     undefined(w);
 }
 
-extern "C" void rbrew_ps(CPUState* cpu, uint32_t w) {
+extern "C" void rbrew_ps(CPUState* cpu, uint32_t w) noexcept(false) {
     rbrew_ps_mem(cpu, cpu->mem, w);
 }
 
-extern "C" void rbrew_trap(CPUState* cpu, uint32_t w, uint32_t pc) {
+extern "C" void rbrew_trap(CPUState* cpu, uint32_t w, uint32_t pc) noexcept(false) {
     const uint32_t to = bits(w, 6, 10), a = cpu->r[bits(w, 11, 15)];
     const uint32_t b = (w >> 26) == 3 ? uint32_t(int32_t(int16_t(w & 0xFFFFu))) : cpu->r[bits(w, 16, 20)];
     const bool hit = ((to & 16u) && int32_t(a) < int32_t(b)) || ((to & 8u) && int32_t(a) > int32_t(b)) ||

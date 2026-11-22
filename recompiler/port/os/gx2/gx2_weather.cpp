@@ -409,17 +409,18 @@ uint32_t rewrite_weather_ubo(uint32_t captured_offset) {
     return out_offset;
 }
 bool dispatch(VkPipeline pipeline, const Bind& b, const Params& params, uint32_t x, uint32_t y, uint32_t z,
-              gx2vk::Image* written, bool camera_dependent = false) {
+              gx2vk::Image* written, bool camera_dependent = false, bool need_barrier = true) {
     const uint32_t dyn_offset = upload(params, camera_dependent);
     if (dyn_offset == UINT32_MAX) return false;
     VkDescriptorSet set = make_set(b);
     if (!set) return false;
     const auto cb = gx2vk::cmd();
-    gx2vk::barrier_if_dirty();
+    if (need_barrier) gx2vk::barrier_for(gx2vk::kSyncCompute);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_layout, 0, 1, &set, 1, &dyn_offset);
     vkCmdDispatch(cb, x, y, z);
-    if (written) gx2vk::note_gpu_write(*written);
+    gx2vk::note_gpu_read(gx2vk::kSyncCompute);
+    if (written) gx2vk::note_gpu_write(*written, gx2vk::kSyncCompute);
     return true;
 }
 
@@ -658,13 +659,13 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
     if (!s_static_ready) {
         // Zero all dummy images once so unbound descriptor slots (e.g. raysTexture
         // when rays are disabled) never sample uninitialized VRAM.
-        gx2vk::barrier_if_dirty();
+        gx2vk::barrier_for(gx2vk::kSyncTransfer);
         const VkClearColorValue zero{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         const auto cb = gx2vk::cmd();
         for (auto* dummy : {&s_dummy2d, &s_dummy3d, &s_dummy_storage2d, &s_dummy_storage2d_u32, &s_dummy_storage3d}) {
             vkCmdClearColorImage(cb, dummy->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
-            gx2vk::note_gpu_write(*dummy);
+            gx2vk::note_gpu_write(*dummy, gx2vk::kSyncTransfer);
         }
         Bind b;
         b.images[kOut2D] = &s_t_lut;
@@ -677,11 +678,11 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
         n.effects[0] = 0;
         Bind shape;
         shape.images[kOut3D] = &s_shape;
-        dispatch(s_noise, shape, n, 128 / 4, 128 / 4, 128 / 4, &s_shape);
+        dispatch(s_noise, shape, n, 128 / 4, 128 / 4, 128 / 4, &s_shape, false, false);
         n.effects[0] = 1;
         Bind detail;
         detail.images[kOut3D] = &s_detail;
-        dispatch(s_noise, detail, n, 32 / 4, 32 / 4, 32 / 4, &s_detail);
+        dispatch(s_noise, detail, n, 32 / 4, 32 / 4, 32 / 4, &s_detail, false, false);
         s_static_ready = true;
     }
     Bind sv;
@@ -884,9 +885,9 @@ bool set_rain_cover(const RainCover& cover) {
     copy.bufferOffset = span.offset;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {cover.size, cover.size, 1};
-    gx2vk::barrier_if_dirty();
+    gx2vk::barrier_for(gx2vk::kSyncTransfer);
     vkCmdCopyBufferToImage(gx2vk::cmd(), span.buffer, s_cover.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-    gx2vk::note_gpu_write(s_cover);
+    gx2vk::note_gpu_write(s_cover, gx2vk::kSyncTransfer);
     s_cover_mapping = cover.mapping;
     gx2r::note_framebuffer_changed();
     return true;
@@ -968,13 +969,18 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
                         kStorageSampled))
             return false;
         const auto cb = gx2vk::cmd();
-        gx2vk::barrier_if_dirty();
+        gx2vk::barrier_for(gx2vk::kSyncTransfer);
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = blit.dstOffsets[1] = {int32_t(w), int32_t(h), 1};
         vkCmdBlitImage(cb, color.image, VK_IMAGE_LAYOUT_GENERAL, s_scene_copy.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                        VK_FILTER_NEAREST);
-        gx2vk::note_gpu_write(s_scene_copy);
+        gx2vk::note_gpu_write(s_scene_copy, gx2vk::kSyncTransfer);
+        gx2vk::note_gpu_read(gx2vk::kSyncTransfer);
+        // s_rays, s_ao, and s_bloom[0] read already-completed scene targets and
+        // write disjoint outputs: sync Compute once on the first pass so all
+        // three overlap concurrently on the GPU.
+        bool compute_synced = false;
         if (rays) {
             Bind r;
             r.images[kDepth] = &depth;
@@ -983,14 +989,18 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
             r.images[kOut2D] = &s_rays;
             r.images[kShape] = &s_shape;
             r.images[kDetail] = &s_detail; // volumetric shafts sample the clouds
-            dispatch(s_rays_pass, r, p, (s_rays.desc.width + 7) / 8, (s_rays.desc.height + 7) / 8, 1, &s_rays, true);
+            dispatch(s_rays_pass, r, p, (s_rays.desc.width + 7) / 8, (s_rays.desc.height + 7) / 8, 1, &s_rays, true,
+                     !compute_synced);
+            compute_synced = true;
         }
         if (p.depth_range[3] > 0) {
             Bind a;
             a.images[kDepth] = &depth;
             a.depth = true;
             a.images[kOut2D] = &s_ao;
-            dispatch(s_ao_pass, a, p, (s_ao.desc.width + 7) / 8, (s_ao.desc.height + 7) / 8, 1, &s_ao, true);
+            dispatch(s_ao_pass, a, p, (s_ao.desc.width + 7) / 8, (s_ao.desc.height + 7) / 8, 1, &s_ao, true,
+                     !compute_synced);
+            compute_synced = true;
         }
         // Bloom chain from the HDR scene target (compute, kBloom).
         // Keyed by logical game frame (not gx2vk::present_count(), which advances
@@ -1011,8 +1021,10 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
                 Bind b;
                 b.images[kColor] = from;
                 b.images[kOut2D] = &s_bloom[i];
+                const bool need_sync = i == 0 ? !compute_synced : true;
                 dispatch(s_bloom_pass, b, bp, (s_bloom[i].desc.width + 7) / 8, (s_bloom[i].desc.height + 7) / 8, 1,
-                         &s_bloom[i]);
+                         &s_bloom[i], false, need_sync);
+                compute_synced = true;
                 from = &s_bloom[i];
             }
             bp.effects[0] = 2.f;
@@ -1039,11 +1051,11 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
         if (!hist_was && s_hist) s_hist_cleared = false;
         if (curve) {
             if (!s_hist_cleared) {
-                gx2vk::barrier_if_dirty();
+                gx2vk::barrier_for(gx2vk::kSyncTransfer);
                 const VkClearColorValue zero{};
                 const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 vkCmdClearColorImage(gx2vk::cmd(), s_hist.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
-                gx2vk::note_gpu_write(s_hist);
+                gx2vk::note_gpu_write(s_hist, gx2vk::kSyncTransfer);
                 s_hist_cleared = true;
             }
             Params hp = p;
@@ -1112,7 +1124,7 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
             t.images[kOut2D] = &s_taa_out;
             t.images[kDomeImage] = &s_next_history;
             if (dispatch(s_taa_pass, t, tp, (w + 7) / 8, (h + 7) / 8, 1, &s_taa_out)) {
-                gx2vk::note_gpu_write(s_next_history);
+                gx2vk::note_gpu_write(s_next_history, gx2vk::kSyncCompute);
                 std::swap(s_history, s_next_history);
                 final_image = &s_taa_out;
                 s_history_valid = true;
@@ -1120,10 +1132,11 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
                 s_history_valid = false;
         } else
             s_history_valid = false;
-        gx2vk::barrier_if_dirty();
+        gx2vk::barrier_for(gx2vk::kSyncTransfer);
         vkCmdBlitImage(gx2vk::cmd(), final_image->image, VK_IMAGE_LAYOUT_GENERAL, color.image, VK_IMAGE_LAYOUT_GENERAL,
                        1, &blit, VK_FILTER_NEAREST);
-        gx2vk::note_gpu_write(color);
+        gx2vk::note_gpu_write(color, gx2vk::kSyncTransfer);
+        gx2vk::note_gpu_read(gx2vk::kSyncTransfer);
     }
     if (p.clouds[1] > 0.001f && s_cover && (color.desc.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
         if (const auto pipeline = rain_pipeline(color.desc.format)) {
@@ -1136,7 +1149,7 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
             VkDescriptorSet set = dyn_offset != UINT32_MAX ? make_set(b) : VK_NULL_HANDLE;
             if (set) {
                 const auto cb = gx2vk::cmd();
-                gx2vk::barrier_if_dirty();
+                gx2vk::barrier_for(gx2vk::kSyncGraphics);
                 VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                 attachment.imageView = view(color);
                 attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1167,7 +1180,8 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
                 gx2_count_gpu_draw();
                 vkCmdEndRendering(cb);
                 gx2_render_reset_command_tracking();
-                gx2vk::note_gpu_write(color);
+                gx2vk::note_gpu_write(color, gx2vk::kSyncColorDepth);
+                gx2vk::note_gpu_read(gx2vk::kSyncGraphics);
             }
         }
     }
@@ -1197,8 +1211,8 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
     }
     s_prev_camera = camera;
     s_prev_camera_valid = true;
-    // The next frame's sky draw samples the LUTs and the dome inside rendering.
-    gx2vk::barrier_if_dirty();
+    // The next frame's sky/HUD draws sample the LUTs, dome and colour target inside rendering.
+    gx2vk::barrier_for(gx2vk::kSyncGraphics);
     gx2r::note_framebuffer_changed();
     return true;
 }
@@ -1339,7 +1353,8 @@ bool draw_sky(uint8_t* memory, VkCommandBuffer cb, const VkFormat* colors, VkFor
     vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
     vkCmdDraw(cb, 3, 1, 0, 0);
     gx2_count_gpu_draw();
-    gx2vk::note_gpu_write(target->image);
+    gx2vk::note_gpu_write(target->image, gx2vk::kSyncColorDepth);
+    gx2vk::note_gpu_read(gx2vk::kSyncGraphics);
     s_hdr = &target->image;
     s_hdr_frame = gx2interp::logical_frame();
     return true;

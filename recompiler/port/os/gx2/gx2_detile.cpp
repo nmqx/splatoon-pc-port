@@ -139,8 +139,8 @@ uint32_t element_address(const Gx2DetileDesc& d, uint32_t x, uint32_t y) {
 
 template <class F> bool with_addresses(const Gx2DetileDesc& d, F&& transfer) {
     // Hoist invariant tile geometry, bank rotation and the 8x8 pixel-index
-    // table out of the texel loop. Small surfaces avoid the table setup cost.
-    if (d.tile_mode >= 4 && d.tile_mode <= 15 && uint64_t(d.width) * d.height >= 512) {
+    // table out of the texel loop. Also covers small macro-tiled mipmaps (>= 64).
+    if (d.tile_mode >= 4 && d.tile_mode <= 15 && uint64_t(d.width) * d.height >= 64) {
         LatteAddrLib::CachedSurfaceAddrInfo info{};
         LatteAddrLib::SetupCachedSurfaceAddrInfo(
             &info, d.slice, 0, d.bits_per_element, d.pitch, d.surface_height ? d.surface_height : d.height, 1, 1,
@@ -159,13 +159,112 @@ template <class F> bool with_addresses(const Gx2DetileDesc& d, F&& transfer) {
 }
 template <size_t Bytes>
 bool detile_elements(const Gx2DetileDesc& d, const uint8_t* tiled, size_t tiled_size, uint8_t* out) {
+    // Fast 8x8 tile-block path for 1D Micro-Tiled surfaces (tile_mode 2/3,
+    // used by virtually all mipmap levels >= 2 and 1D-tiled UI textures).
+    // ComputeSurfaceAddrFromCoordMicroTiled is strictly additive per 8x8 tile:
+    //   addr(x, y) = addr(x & 7, y & 7) + micro_tile_bytes * ((x >> 3) + (pitch >> 3) * (y >> 3))
+    if ((d.tile_mode == 2 || d.tile_mode == 3) && d.width >= 8) {
+        const uint32_t micro_thickness = (d.tile_mode == 3) ? 4u : 1u;
+        const uint32_t micro_tile_bytes = micro_thickness * 64u * uint32_t(Bytes);
+        const uint32_t tiles_per_row = d.pitch >> 3;
+        const uint32_t full_tx = d.width >> 3;
+        std::array<uint32_t, 64> tile_addrs;
+        uint32_t max_tile_addr = 0;
+        for (unsigned yy = 0; yy < 8; ++yy)
+            for (unsigned xx = 0; xx < 8; ++xx) {
+                const uint32_t a = element_address(d, xx, yy);
+                tile_addrs[yy * 8 + xx] = a;
+                if (a > max_tile_addr) max_tile_addr = a;
+            }
+        const size_t row_stride = size_t(d.width) * Bytes;
+        auto micro_rows = [&](uint32_t y0, uint32_t y1) {
+            uint32_t y = y0;
+            // Fast 8-row microtile block loop (1 base calculation per 64 elements).
+            if ((y & 7u) == 0) {
+                for (; y + 8 <= y1; y += 8) {
+                    const uint64_t row_tile_base = uint64_t(micro_tile_bytes) * uint64_t(tiles_per_row) * (y >> 3);
+                    for (uint32_t tx = 0; tx < full_tx; ++tx) {
+                        const uint64_t delta = row_tile_base + uint64_t(micro_tile_bytes) * tx;
+                        const size_t x_off = size_t(tx) * 8 * Bytes;
+                        if (delta + max_tile_addr + Bytes <= tiled_size) {
+                            for (unsigned yy = 0; yy < 8; ++yy) {
+                                uint8_t* dst = out + size_t(y + yy) * row_stride + x_off;
+                                const uint32_t* ta = tile_addrs.data() + yy * 8;
+                                for (unsigned xx = 0; xx < 8; ++xx)
+                                    std::memcpy(dst + size_t(xx) * Bytes, tiled + (delta + ta[xx]), Bytes);
+                            }
+                        } else {
+                            for (unsigned yy = 0; yy < 8; ++yy) {
+                                uint8_t* dst = out + size_t(y + yy) * row_stride + x_off;
+                                const uint32_t* ta = tile_addrs.data() + yy * 8;
+                                for (unsigned xx = 0; xx < 8; ++xx) {
+                                    const uint64_t addr = delta + ta[xx];
+                                    if (addr + Bytes > tiled_size) return false;
+                                    std::memcpy(dst + size_t(xx) * Bytes, tiled + addr, Bytes);
+                                }
+                            }
+                        }
+                    }
+                    if (full_tx * 8 < d.width) {
+                        for (unsigned yy = 0; yy < 8; ++yy) {
+                            uint8_t* dst_row = out + size_t(y + yy) * row_stride;
+                            for (uint32_t x = full_tx * 8; x < d.width; ++x) {
+                                const uint32_t addr = element_address(d, x, y + yy);
+                                if (uint64_t(addr) + Bytes > tiled_size) return false;
+                                std::memcpy(dst_row + size_t(x) * Bytes, tiled + addr, Bytes);
+                            }
+                        }
+                    }
+                }
+            }
+            for (; y < y1; ++y) {
+                uint8_t* dst_row = out + size_t(y) * row_stride;
+                const uint64_t row_tile_base = uint64_t(micro_tile_bytes) * uint64_t(tiles_per_row) * (y >> 3);
+                const uint32_t* ta = tile_addrs.data() + (y & 7u) * 8;
+                uint32_t x = 0;
+                for (uint32_t tx = 0; tx < full_tx; ++tx, x += 8) {
+                    const uint64_t delta = row_tile_base + uint64_t(micro_tile_bytes) * tx;
+                    uint8_t* dst = dst_row + size_t(x) * Bytes;
+                    if (delta + max_tile_addr + Bytes <= tiled_size) {
+                        for (unsigned xx = 0; xx < 8; ++xx)
+                            std::memcpy(dst + size_t(xx) * Bytes, tiled + (delta + ta[xx]), Bytes);
+                    } else {
+                        for (unsigned xx = 0; xx < 8; ++xx) {
+                            const uint64_t addr = delta + ta[xx];
+                            if (addr + Bytes > tiled_size) return false;
+                            std::memcpy(dst + size_t(xx) * Bytes, tiled + addr, Bytes);
+                        }
+                    }
+                }
+                for (; x < d.width; ++x) {
+                    const uint32_t addr = element_address(d, x, y);
+                    if (uint64_t(addr) + Bytes > tiled_size) return false;
+                    std::memcpy(dst_row + size_t(x) * Bytes, tiled + addr, Bytes);
+                }
+            }
+            return true;
+        };
+        BandPool& pool = BandPool::get();
+        if (!pool.workers() || uint64_t(d.width) * d.height < kParallelElements || d.height < 16)
+            return micro_rows(0, d.height);
+        const uint32_t tile_rows = (d.height + 7) / 8;
+        const unsigned bands = std::min<unsigned>(tile_rows, (pool.workers() + 1) * 4);
+        std::atomic<bool> ok{true};
+        pool.run(bands, [&](unsigned band) {
+            const uint32_t y0 = std::min(d.height, uint32_t(uint64_t(tile_rows) * band / bands) * 8);
+            const uint32_t y1 = std::min(d.height, uint32_t(uint64_t(tile_rows) * (band + 1) / bands) * 8);
+            if (y0 < y1 && ok.load(std::memory_order_relaxed) && !micro_rows(y0, y1))
+                ok.store(false, std::memory_order_relaxed);
+        });
+        return ok.load();
+    }
     return with_addresses(d, [&](auto address_of) {
         // Within an 8x8 microtile only the pixel-index bits change. Bank,
         // pipe, macro-tile and slice bits belong to the tile base. Derive the
         // byte-address XORs from AddrLib itself (including depth/thick modes),
-        // then calculate the expensive base once per eight output texels.
+        // then calculate the expensive base once per 8x8 tile (64 texels).
         const bool tiled_rows =
-            d.width >= 8 && d.tile_mode >= 4 && d.tile_mode <= 15 && uint64_t(d.width) * d.height >= 512;
+            d.width >= 8 && d.tile_mode >= 4 && d.tile_mode <= 15 && uint64_t(d.width) * d.height >= 64;
         std::array<uint32_t, 64> offsets;
         uint32_t offsets_or = 0;
         if (tiled_rows) {
@@ -177,16 +276,55 @@ bool detile_elements(const Gx2DetileDesc& d, const uint8_t* tiled, size_t tiled_
                     offsets_or |= o;
                 }
         }
+        const size_t row_stride = size_t(d.width) * Bytes;
         auto rows = [&](uint32_t y0, uint32_t y1) {
-            for (uint32_t y = y0; y < y1; ++y) {
+            uint32_t y = y0;
+            if (tiled_rows && (y & 7u) == 0) {
+                for (; y + 8 <= y1; y += 8) {
+                    uint32_t x = 0;
+                    for (; uint64_t(x) + 8 <= d.width; x += 8) {
+                        const uint32_t base = address_of(x, y);
+                        const size_t x_off = size_t(x) * Bytes;
+                        // (base ^ o) <= (base | o) <= (base | offsets_or) for all o in offsets.
+                        if (uint64_t(base | offsets_or) + Bytes <= tiled_size) {
+                            for (unsigned yy = 0; yy < 8; ++yy) {
+                                uint8_t* dst = out + size_t(y + yy) * row_stride + x_off;
+                                const uint32_t* row_offsets = offsets.data() + yy * 8;
+                                for (unsigned i = 0; i < 8; ++i)
+                                    std::memcpy(dst + size_t(i) * Bytes, tiled + (base ^ row_offsets[i]), Bytes);
+                            }
+                        } else {
+                            for (unsigned yy = 0; yy < 8; ++yy) {
+                                uint8_t* dst = out + size_t(y + yy) * row_stride + x_off;
+                                const uint32_t* row_offsets = offsets.data() + yy * 8;
+                                for (unsigned i = 0; i < 8; ++i) {
+                                    const uint32_t address = base ^ row_offsets[i];
+                                    if (uint64_t(address) + Bytes > tiled_size) return false;
+                                    std::memcpy(dst + size_t(i) * Bytes, tiled + address, Bytes);
+                                }
+                            }
+                        }
+                    }
+                    if (x < d.width) {
+                        for (unsigned yy = 0; yy < 8; ++yy) {
+                            uint8_t* dst_row = out + size_t(y + yy) * row_stride;
+                            for (uint32_t tx = x; tx < d.width; ++tx) {
+                                const uint32_t address = address_of(tx, y + yy);
+                                if (uint64_t(address) + Bytes > tiled_size) return false;
+                                std::memcpy(dst_row + size_t(tx) * Bytes, tiled + address, Bytes);
+                            }
+                        }
+                    }
+                }
+            }
+            for (; y < y1; ++y) {
                 uint32_t x = 0;
-                uint8_t* dst_row = out + size_t(y) * d.width * Bytes;
+                uint8_t* dst_row = out + size_t(y) * row_stride;
                 if (tiled_rows) {
                     const uint32_t* row_offsets = offsets.data() + (y & 7) * 8;
                     for (; uint64_t(x) + 8 <= d.width; x += 8) {
                         const uint32_t base = address_of(x, y & ~7u);
                         uint8_t* dst = dst_row + size_t(x) * Bytes;
-                        // (base ^ o) <= (base | o) <= (base | offsets_or) for all o in offsets.
                         if (uint64_t(base | offsets_or) + Bytes <= tiled_size) {
                             for (unsigned i = 0; i < 8; ++i)
                                 std::memcpy(dst + size_t(i) * Bytes, tiled + (base ^ row_offsets[i]), Bytes);
@@ -210,6 +348,19 @@ bool detile_elements(const Gx2DetileDesc& d, const uint8_t* tiled, size_t tiled_
         BandPool& pool = BandPool::get();
         if (!pool.workers() || uint64_t(d.width) * d.height < kParallelElements || d.height < 2)
             return rows(0, d.height);
+        if (tiled_rows && d.height >= 16) {
+            // Align band boundaries to 8-row tile rows so every band hits the 8x8 tile-block path.
+            const uint32_t tile_rows = (d.height + 7) / 8;
+            const unsigned bands = std::min<unsigned>(tile_rows, (pool.workers() + 1) * 4);
+            std::atomic<bool> ok{true};
+            pool.run(bands, [&](unsigned band) {
+                const uint32_t y0 = std::min(d.height, uint32_t(uint64_t(tile_rows) * band / bands) * 8);
+                const uint32_t y1 = std::min(d.height, uint32_t(uint64_t(tile_rows) * (band + 1) / bands) * 8);
+                if (y0 < y1 && ok.load(std::memory_order_relaxed) && !rows(y0, y1))
+                    ok.store(false, std::memory_order_relaxed);
+            });
+            return ok.load();
+        }
         const unsigned bands = std::min<unsigned>(d.height, (pool.workers() + 1) * 4);
         std::atomic<bool> ok{true};
         pool.run(bands, [&](unsigned band) {

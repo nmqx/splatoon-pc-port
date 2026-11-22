@@ -46,6 +46,8 @@ static EngineEvent s_event_ring[kEventRingCapacity] = {};
 
 static std::atomic<uint32_t> s_frame_write_index{0};
 static std::atomic<uint32_t> s_event_write_index{0};
+static std::atomic<uint32_t> s_frame_shader_compiles{0};
+static std::atomic<uint32_t> s_frame_texture_uploads{0};
 
 static std::atomic<bool> s_initialized{false};
 static std::atomic<DiagnosticLevel> s_level{DiagnosticLevel::FlightRecorder};
@@ -375,10 +377,25 @@ uint64_t process_resident_bytes() {
 }
 } // namespace
 
+void NoteShaderCompile(uint32_t count) {
+    if (count) s_frame_shader_compiles.fetch_add(count, std::memory_order_relaxed);
+}
+
+void NoteTextureUpload(uint32_t count) {
+    if (count) s_frame_texture_uploads.fetch_add(count, std::memory_order_relaxed);
+}
+
 void RecordFrame(uint32_t frame_index, float frame_time_ms, float cpu_time_ms, float present_wait_ms,
                  float vsync_wait_ms, float render_wait_ms, uint16_t draw_calls, uint16_t shader_compiles,
                  uint16_t texture_uploads, uint8_t screen_mode) {
+    const uint32_t sc_accum = s_frame_shader_compiles.exchange(0, std::memory_order_relaxed);
+    const uint32_t tu_accum = s_frame_texture_uploads.exchange(0, std::memory_order_relaxed);
     if (!IsEnabled()) return;
+
+    const uint32_t total_sc = uint32_t(shader_compiles) + sc_accum;
+    const uint32_t total_tu = uint32_t(texture_uploads) + tu_accum;
+    shader_compiles = total_sc > 65535u ? uint16_t(65535u) : uint16_t(total_sc);
+    texture_uploads = total_tu > 65535u ? uint16_t(65535u) : uint16_t(total_tu);
 
     Heartbeat();
 

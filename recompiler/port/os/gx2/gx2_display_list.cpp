@@ -48,10 +48,34 @@ namespace {
 // color/depth descriptors (~116 B) and <= 16-word uniform reg snapshots.
 template <typename T, size_t InlineN> class SmallBuffer {
     uint32_t count_ = 0;
-    T inline_[InlineN]{};
+    T inline_[InlineN];
     std::vector<T> heap_;
 
 public:
+    SmallBuffer() noexcept = default;
+    SmallBuffer(const SmallBuffer& other) : count_(other.count_), heap_(other.heap_) {
+        if (count_ > 0 && count_ <= InlineN) std::memcpy(inline_, other.inline_, count_ * sizeof(T));
+    }
+    SmallBuffer(SmallBuffer&& other) noexcept : count_(other.count_), heap_(std::move(other.heap_)) {
+        if (count_ > 0 && count_ <= InlineN) std::memcpy(inline_, other.inline_, count_ * sizeof(T));
+        other.count_ = 0;
+    }
+    SmallBuffer& operator=(const SmallBuffer& other) {
+        if (this == &other) return *this;
+        count_ = other.count_;
+        heap_ = other.heap_;
+        if (count_ > 0 && count_ <= InlineN) std::memcpy(inline_, other.inline_, count_ * sizeof(T));
+        return *this;
+    }
+    SmallBuffer& operator=(SmallBuffer&& other) noexcept {
+        if (this == &other) return *this;
+        count_ = other.count_;
+        heap_ = std::move(other.heap_);
+        if (count_ > 0 && count_ <= InlineN) std::memcpy(inline_, other.inline_, count_ * sizeof(T));
+        other.count_ = 0;
+        return *this;
+    }
+
     size_t size() const noexcept { return count_; }
     bool empty() const noexcept { return count_ == 0; }
     T* data() noexcept { return count_ <= InlineN ? inline_ : heap_.data(); }
@@ -60,15 +84,23 @@ public:
     const T* end() const noexcept { return data() + count_; }
     size_t heap_bytes() const noexcept { return count_ > InlineN ? heap_.size() * sizeof(T) : 0; }
     void resize(size_t n) {
+        const size_t old = count_;
         count_ = uint32_t(n);
-        if (n > InlineN)
+        if (n > InlineN) {
             heap_.resize(n);
-        else if (!heap_.empty())
-            heap_.clear();
+        } else {
+            if (!heap_.empty()) heap_.clear();
+            if (n > old) std::memset(inline_ + old, 0, (n - old) * sizeof(T));
+        }
     }
     void assign(const T* first, const T* last) {
         const size_t n = size_t(last - first);
-        resize(n);
+        count_ = uint32_t(n);
+        if (n > InlineN) {
+            heap_.resize(n);
+        } else if (!heap_.empty()) {
+            heap_.clear();
+        }
         if (n) std::memcpy(data(), first, n * sizeof(T));
     }
     bool operator==(const SmallBuffer& other) const noexcept {
@@ -1287,6 +1319,150 @@ void replay(CPUState* cpu, const std::vector<Command>& commands, unsigned depth)
     if (draws_done) rbrew_benchmark::guest_draws.fetch_add(draws_done, std::memory_order_relaxed);
 }
 
+// Two-tier slab + thread-local batch freelist for StreamCommand and ListCall:
+// eliminates per-command process heap allocations across the game -> render
+// thread boundary while amortizing central-pool locking by 64x.
+template <typename T, size_t SlabItems, size_t MaxSlabs> class AsyncWorkPool {
+    struct alignas(alignof(T)) Slot {
+        union {
+            Slot* next;
+            alignas(T) uint8_t storage[sizeof(T)];
+        };
+        uint32_t from_pool; // 1 = slab-backed, 0 = heap fallback
+    };
+    static constexpr size_t kBatch = 64;
+    static constexpr size_t kHighWater = 128;
+
+    std::mutex mutex_;
+    std::vector<std::unique_ptr<Slot[]>> slabs_;
+    Slot* central_free_ = nullptr;
+    size_t central_free_count_ = 0;
+    size_t total_slab_slots_ = 0;
+    std::atomic<bool> alive_{true};
+
+    struct LocalCache {
+        AsyncWorkPool* owner = nullptr;
+        Slot* head = nullptr;
+        size_t count = 0;
+        ~LocalCache() {
+            if (owner && head) owner->return_chain(head, count);
+        }
+    };
+
+    LocalCache& local_cache() {
+        thread_local LocalCache cache;
+        if (!cache.owner) cache.owner = this;
+        return cache;
+    }
+
+    void return_chain(Slot* head, size_t count) noexcept {
+        if (!head || !count || !alive_.load(std::memory_order_acquire)) return;
+        Slot* tail = head;
+        while (tail->next) tail = tail->next;
+        std::lock_guard lock(mutex_);
+        if (!alive_.load(std::memory_order_relaxed)) return;
+        tail->next = central_free_;
+        central_free_ = head;
+        central_free_count_ += count;
+    }
+
+    Slot* refill_local(LocalCache& cache) {
+        std::lock_guard lock(mutex_);
+        if (!alive_.load(std::memory_order_relaxed)) return nullptr;
+        if (!central_free_ && slabs_.size() < MaxSlabs) {
+            auto slab = std::make_unique<Slot[]>(SlabItems);
+            for (size_t i = 0; i < SlabItems; ++i) {
+                slab[i].from_pool = 1;
+                slab[i].next = (i + 1 < SlabItems) ? &slab[i + 1] : central_free_;
+            }
+            central_free_ = &slab[0];
+            central_free_count_ += SlabItems;
+            total_slab_slots_ += SlabItems;
+            slabs_.push_back(std::move(slab));
+        }
+        if (!central_free_) return nullptr;
+        Slot* first = central_free_;
+        size_t taken = 0;
+        Slot* batch_head = nullptr;
+        Slot* batch_tail = nullptr;
+        // Take 1 slot to return immediately + up to kBatch - 1 for thread-local cache.
+        central_free_ = first->next;
+        --central_free_count_;
+        while (central_free_ && taken + 1 < kBatch) {
+            Slot* s = central_free_;
+            central_free_ = s->next;
+            --central_free_count_;
+            s->next = nullptr;
+            if (!batch_head)
+                batch_head = batch_tail = s;
+            else {
+                batch_tail->next = s;
+                batch_tail = s;
+            }
+            ++taken;
+        }
+        if (batch_head) {
+            batch_tail->next = cache.head;
+            cache.head = batch_head;
+            cache.count += taken;
+        }
+        return first;
+    }
+
+public:
+    ~AsyncWorkPool() {
+        alive_.store(false, std::memory_order_release);
+        std::lock_guard lock(mutex_);
+        // If another TU's static destructor still owns live pointers into slabs,
+        // avoid freeing backing memory underneath it during process exit.
+        if (central_free_count_ != total_slab_slots_) {
+            for (auto& slab : slabs_) slab.release();
+        }
+        slabs_.clear();
+        central_free_ = nullptr;
+        central_free_count_ = 0;
+    }
+
+    void* allocate() {
+        if (alive_.load(std::memory_order_acquire)) {
+            LocalCache& cache = local_cache();
+            if (cache.head) {
+                Slot* s = cache.head;
+                cache.head = s->next;
+                --cache.count;
+                return s->storage;
+            }
+            if (Slot* s = refill_local(cache)) return s->storage;
+        }
+        auto* fallback = static_cast<Slot*>(::operator new(sizeof(Slot)));
+        fallback->from_pool = 0;
+        return fallback->storage;
+    }
+
+    void deallocate(void* p) noexcept {
+        if (!p) return;
+        auto* s = reinterpret_cast<Slot*>(p);
+        if (!s->from_pool) {
+            ::operator delete(s);
+            return;
+        }
+        if (!alive_.load(std::memory_order_acquire)) return;
+        LocalCache& cache = local_cache();
+        s->next = cache.head;
+        cache.head = s;
+        ++cache.count;
+        if (cache.count >= kHighWater) {
+            Slot* batch_head = cache.head;
+            Slot* batch_tail = batch_head;
+            for (size_t i = 1; i < kBatch; ++i) batch_tail = batch_tail->next;
+            cache.head = batch_tail->next;
+            cache.count -= kBatch;
+            batch_tail->next = nullptr;
+            return_chain(batch_head, kBatch);
+        }
+    }
+};
+
 // Commands issued outside a display list while the render thread runs: the
 // same recorded form, posted to the render thread instead of waiting for it.
 // GX2 command functions only use r3..r10, f1..f8, lr and the arena pointer.
@@ -1296,6 +1472,8 @@ struct StreamCommand final : Gx2AsyncWork {
     uint8_t* mem;
     uint32_t lr;
     StreamCommand(Command&& c, uint8_t* m, uint32_t l) : command(std::move(c)), mem(m), lr(l) {}
+    static void* operator new(size_t sz);
+    static void operator delete(void* p) noexcept;
     void run() override {
         thread_local CPUState call{};
         call.mem = mem;
@@ -1356,6 +1534,8 @@ struct ListCall final : Gx2AsyncWork {
     uint32_t lr;
     ListCall(Commands c, std::shared_ptr<const BakedList> b, uint8_t* m, uint32_t l)
         : commands(std::move(c)), baked(std::move(b)), mem(m), lr(l) {}
+    static void* operator new(size_t sz);
+    static void operator delete(void* p) noexcept;
     void run() override {
         Gx2PerfScope perf_scope(kPerfDisplayList);
         thread_local CPUState call{};
@@ -1374,6 +1554,26 @@ struct ListCall final : Gx2AsyncWork {
         t_stream_replay = false;
     }
 };
+AsyncWorkPool<StreamCommand, 256, 64>& stream_command_pool() {
+    static AsyncWorkPool<StreamCommand, 256, 64> pool;
+    return pool;
+}
+void* StreamCommand::operator new(size_t sz) {
+    return sz == sizeof(StreamCommand) ? stream_command_pool().allocate() : ::operator new(sz);
+}
+void StreamCommand::operator delete(void* p) noexcept {
+    stream_command_pool().deallocate(p);
+}
+AsyncWorkPool<ListCall, 512, 64>& list_call_pool() {
+    static AsyncWorkPool<ListCall, 512, 64> pool;
+    return pool;
+}
+void* ListCall::operator new(size_t sz) {
+    return sz == sizeof(ListCall) ? list_call_pool().allocate() : ::operator new(sz);
+}
+void ListCall::operator delete(void* p) noexcept {
+    list_call_pool().deallocate(p);
+}
 bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out,
                     std::shared_ptr<const BakedList>& baked_out);
 bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out);
@@ -1403,6 +1603,9 @@ void push_command(Command&& c, uint8_t* mem, uint32_t lr) {
 
 thread_local unsigned t_depth = 0;
 
+constexpr size_t kDlMruSize = 256;
+constexpr size_t kDlMruMask = kDlMruSize - 1;
+
 bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out,
                     std::shared_ptr<const BakedList>& baked_out) {
     if (size >= 12 && rbrew_memory_accessible(mem, list, 12) && rbrew_read32(mem, list) == kTagNop &&
@@ -1413,8 +1616,8 @@ bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out,
             Commands commands;
             std::shared_ptr<const BakedList> baked;
         };
-        thread_local DlMru t_find_mru[16]{};
-        const size_t slot = id & 15;
+        thread_local DlMru t_find_mru[kDlMruSize]{};
+        const size_t slot = id & kDlMruMask;
         if (t_find_mru[slot].id == id && (t_find_mru[slot].commands || t_find_mru[slot].baked)) {
             out = t_find_mru[slot].commands;
             baked_out = t_find_mru[slot].baked;
@@ -1450,8 +1653,8 @@ void call_display_list(CPUState* cpu, const char* api) {
             Commands commands;
             std::shared_ptr<const BakedList> baked;
         };
-        thread_local DlMru t_call_mru[16]{};
-        const size_t slot = id & 15;
+        thread_local DlMru t_call_mru[kDlMruSize]{};
+        const size_t slot = id & kDlMruMask;
         if (t_call_mru[slot].id == id && (t_call_mru[slot].commands || t_call_mru[slot].baked)) {
             recorded = t_call_mru[slot].commands;
             baked = t_call_mru[slot].baked;
@@ -1485,10 +1688,10 @@ void call_display_list(CPUState* cpu, const char* api) {
         std::vector<Gx2RegisterWrite> writes;
         bool ok = false;
     };
-    static thread_local StaticListCache t_static_mru[4]{};
+    static thread_local StaticListCache t_static_mru[32]{};
     const uint32_t w0 = rbrew_read32(MEM, list);
     const uint32_t w1 = size >= 8 ? rbrew_read32(MEM, list + 4) : 0;
-    const size_t slot = ((list >> 4) ^ size) & 3;
+    const size_t slot = ((list >> 4) ^ size) & 31;
     if (t_static_mru[slot].list == list && t_static_mru[slot].size == size && t_static_mru[slot].w0 == w0 &&
         t_static_mru[slot].w1 == w1 && t_static_mru[slot].ok) {
         gx2_render_apply_registers(t_static_mru[slot].writes.data(), t_static_mru[slot].writes.size());
@@ -1571,8 +1774,47 @@ struct ListQueries {
     std::vector<uint32_t> begins;
     std::vector<std::pair<uint32_t, uint32_t>> calls; // list, size
 };
+// Lock-free 2-level bitset (4096 chunks * 4096 bits = 16,777,216 recording IDs)
+// so count_list_queries() skips s_list_queries_mutex and hash lookups on the
+// ~99% of display lists that contain no occlusion queries or nested list calls.
+class QueryBitset {
+    static constexpr uint32_t kChunkWords = 64; // 4096 bits per chunk
+    static constexpr uint32_t kMaxChunks = 4096;
+    std::array<std::atomic<std::atomic<uint64_t>*>, kMaxChunks> chunks_{};
+
+public:
+    ~QueryBitset() {
+        for (auto& slot : chunks_) {
+            if (auto* p = slot.exchange(nullptr, std::memory_order_acq_rel)) delete[] p;
+        }
+    }
+    // Caller holds s_list_queries_mutex.
+    void set(uint32_t id) {
+        const uint32_t ci = id >> 12;
+        if (ci >= kMaxChunks) return;
+        auto* chunk = chunks_[ci].load(std::memory_order_relaxed);
+        if (!chunk) {
+            chunk = new std::atomic<uint64_t>[kChunkWords];
+            for (uint32_t i = 0; i < kChunkWords; ++i) chunk[i].store(0, std::memory_order_relaxed);
+            chunks_[ci].store(chunk, std::memory_order_release);
+        }
+        const uint32_t bit = id & 4095u;
+        chunk[bit >> 6].fetch_or(1ull << (bit & 63u), std::memory_order_release);
+    }
+    // Lock-free fast path. Returns true conservatively past kMaxChunks * 4096.
+    bool test(uint32_t id) const noexcept {
+        if (id == UINT32_MAX) return false;
+        const uint32_t ci = id >> 12;
+        if (ci >= kMaxChunks) return true;
+        const auto* chunk = chunks_[ci].load(std::memory_order_acquire);
+        if (!chunk) return false;
+        const uint32_t bit = id & 4095u;
+        return (chunk[bit >> 6].load(std::memory_order_acquire) & (1ull << (bit & 63u))) != 0;
+    }
+};
 std::mutex s_list_queries_mutex;
 std::unordered_map<uint32_t, std::shared_ptr<const ListQueries>> s_list_queries;
+QueryBitset s_query_bits;
 std::atomic<bool> s_any_list_queries{false};
 static bool is_list_call(Gx2CommandFn fn) {
     return fn == s_list_call_fns[0] || fn == s_list_call_fns[1];
@@ -1600,6 +1842,7 @@ static void count_list_queries(uint8_t* mem, uint32_t list, uint32_t size, unsig
         RegistryLock lock;
         if (auto it = s_lists.find(list); it != s_lists.end()) id = it->second;
     }
+    if (!s_query_bits.test(id)) return;
     std::shared_ptr<const ListQueries> queries;
     {
         std::lock_guard lock(s_list_queries_mutex);
@@ -1635,15 +1878,13 @@ uint64_t gx2_dl_archive_seek_count() {
 
 void gx2_dl_record(Gx2CommandFn fn, const CPUState* cpu) {
     // A list call posted to the render stream (not into another list).
-    if (is_list_call(fn) && s_any_list_queries.load(std::memory_order_relaxed) && gx2_query_list_counting() &&
+    if (is_list_call(fn) && s_any_list_queries.load(std::memory_order_acquire) && gx2_query_list_counting() &&
         !gx2_dl_list_open())
         count_list_queries(cpu->mem, cpu->r[3], cpu->r[4], 0);
     Command c{};
     c.fn = fn;
-    for (unsigned i = 0; i < 8; ++i) {
-        c.r[i] = cpu->r[3 + i];
-        c.f[i] = cpu->f[1 + i];
-    }
+    std::memcpy(c.r.data(), &cpu->r[3], sizeof(c.r));
+    std::memcpy(c.f.data(), &cpu->f[1], sizeof(c.f));
     push_command(std::move(c), cpu->mem, cpu->lr);
 }
 
@@ -1660,10 +1901,8 @@ void gx2_dl_record_descriptor(Gx2DescriptorFn fn, const CPUState* cpu, uint32_t 
     if (!address || !rbrew_memory_accessible(cpu->mem, address, bytes)) return;
     Command c{};
     c.descriptor_fn = fn;
-    for (unsigned i = 0; i < 8; ++i) {
-        c.r[i] = cpu->r[3 + i];
-        c.f[i] = cpu->f[1 + i];
-    }
+    std::memcpy(c.r.data(), &cpu->r[3], sizeof(c.r));
+    std::memcpy(c.f.data(), &cpu->f[1], sizeof(c.f));
     c.descriptor.assign(cpu->mem + address, cpu->mem + address + bytes);
     push_command(std::move(c), cpu->mem, cpu->lr);
 }
@@ -1672,10 +1911,8 @@ void gx2_dl_record_snapshot(Gx2DescriptorFn fn, const CPUState* cpu, std::span<c
     Command c{};
     c.descriptor_fn = fn;
     c.descriptor.assign(bytes.data(), bytes.data() + bytes.size());
-    for (unsigned i = 0; i < 8; ++i) {
-        c.r[i] = cpu->r[3 + i];
-        c.f[i] = cpu->f[1 + i];
-    }
+    std::memcpy(c.r.data(), &cpu->r[3], sizeof(c.r));
+    std::memcpy(c.f.data(), &cpu->f[1], sizeof(c.f));
     push_command(std::move(c), cpu->mem, cpu->lr);
 }
 
@@ -1777,7 +2014,8 @@ static void GX2EndDisplayList(CPUState* cpu) {
         if (queries) {
             std::lock_guard queries_lock(s_list_queries_mutex);
             s_list_queries[id] = std::move(queries);
-            s_any_list_queries.store(true, std::memory_order_relaxed);
+            s_query_bits.set(id);
+            s_any_list_queries.store(true, std::memory_order_release);
         }
     }
     s_lists[buffer] = id;

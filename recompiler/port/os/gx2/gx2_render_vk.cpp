@@ -1,5 +1,6 @@
 #include "../../runtime/rbrew_diagnostics.h"
 #include "../../runtime/benchmark_input.h"
+#include "../../runtime/splatoon_diagnostics.h"
 #include "gx2_texture_diagnostics.h"
 // gx2_render_vk.cpp - Vulkan back-end for GX2 (render targets, textures,
 // samplers, raster state, surface copies, scan buffers, presentation).
@@ -2117,6 +2118,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
     if (img_ptr != 0 && upload) {
         Gx2PerfScope upload_scope(kPerfTexUpload);
         ++C.texture_uploads;
+        SplatoonDiagnostics::NoteTextureUpload();
         entry.image_addr = img_ptr;
         entry.image_size = img_sz;
         entry.width = w;
@@ -2163,6 +2165,16 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
         }
         const bool storage_ready = !hd_done && storage_ok &&
                                    ensure_texture_storage(entry, target, vf.format, w, h, layers, mip_levels, vf.depth);
+        const uint32_t surf_use = descriptor_word(data, GX2SURF_USE);
+        const uint32_t surf_tile = descriptor_word(data, GX2SURF_TILE_MODE);
+        const uint32_t surf_swizzle = descriptor_word(data, GX2SURF_SWIZZLE);
+        // Compute Latte surface layout once for level 0 + all mip levels
+        // (level 0 padded_height is independent of mip_levels).
+        std::optional<RbrewGx2SurfaceLayout> surf_layout;
+        if (storage_ready && !vf.depth && ((pixels && img_sz) || mip_levels > 1)) {
+            RbrewGx2SurfaceDesc sd{dim, w, h, surface_layers, mip_levels, fmt, 0, surf_use, surf_tile, surf_swizzle};
+            surf_layout = rbrew_gx2_calc_surface_layout(sd);
+        }
         std::vector<uint8_t> linear;
         gx2vk::Span decoded_span;
         bool detiled = false;
@@ -2172,11 +2184,9 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             d.height = vf.compressed ? (h + 3) / 4 : h;
             d.pitch = descriptor_word(data, GX2SURF_PITCH);
             d.bits_per_element = vf.compressed ? vf.block * 8 : vf.bpp * 8;
-            d.tile_mode = descriptor_word(data, GX2SURF_TILE_MODE);
-            d.swizzle = descriptor_word(data, GX2SURF_SWIZZLE);
-            RbrewGx2SurfaceDesc sd{
-                dim, w, h, surface_layers, 1, fmt, 0, descriptor_word(data, GX2SURF_USE), d.tile_mode, d.swizzle};
-            if (const auto layout = rbrew_gx2_calc_surface_layout(sd)) d.surface_height = layout->padded_height;
+            d.tile_mode = surf_tile;
+            d.swizzle = surf_swizzle;
+            if (surf_layout) d.surface_height = surf_layout->padded_height;
             const size_t slice_bytes = size_t(d.width) * d.height * (d.bits_per_element / 8);
             decoded_span = gx2vk::upload(slice_bytes * layers, 16);
             // Retain the established path if mapped storage could not be
@@ -2267,56 +2277,49 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             entry.tex.params.min_filter = entry.tex.params.mag_filter = vf.integer ? wire::NEAREST : wire::LINEAR;
             entry.tex.params.wrap_s = entry.tex.params.wrap_t = wire::CLAMP_TO_EDGE;
             if (target != wire::TEXTURE_2D) entry.tex.params.wrap_r = wire::CLAMP_TO_EDGE;
-            // Mip levels use the surface calculator's per-level Latte layout.
-            RbrewGx2SurfaceDesc sd{dim,
-                                   w,
-                                   h,
-                                   surface_layers,
-                                   mip_levels,
-                                   fmt,
-                                   0,
-                                   descriptor_word(data, GX2SURF_USE),
-                                   descriptor_word(data, GX2SURF_TILE_MODE),
-                                   descriptor_word(data, GX2SURF_SWIZZLE)};
-            const auto layout = rbrew_gx2_calc_surface_layout(sd);
-            const uint32_t mip_ptr = descriptor_word(data, GX2SURF_MIPMAPS),
-                           mip_bytes = descriptor_word(data, GX2SURF_MIPMAP_SIZE);
-            for (uint32_t level = 1; level < mip_levels; ++level) {
-                if (vf.depth) continue;
-                const auto mw = std::max(1u, w >> level), mh = std::max(1u, h >> level),
-                           ml = dim == 2 ? std::max(1u, layers >> level) : layers;
-                const uint32_t offset = level == 1 ? 0 : descriptor_word(data, GX2SURF_MIP_OFFSETS + 4 * (level - 1));
+            // Mip levels reuse the surface layout computed above.
+            if (!vf.depth && mip_levels > 1) {
+                const uint32_t mip_ptr = descriptor_word(data, GX2SURF_MIPMAPS),
+                               mip_bytes = descriptor_word(data, GX2SURF_MIPMAP_SIZE);
+                const bool mip_accessible =
+                    surf_layout && mip_ptr && mip_bytes && rbrew_memory_accessible(mem, mip_ptr, mip_bytes);
                 std::vector<uint8_t> decoded;
-                const uint8_t* source = nullptr;
-                Gx2DetileDesc d;
-                d.width = vf.compressed ? (mw + 3) / 4 : mw;
-                d.height = vf.compressed ? (mh + 3) / 4 : mh;
-                d.bits_per_element = (vf.compressed ? vf.block : vf.bpp) * 8;
-                const size_t plane = size_t(d.width) * d.height * (d.bits_per_element / 8);
-                const auto span = gx2vk::upload(plane * ml, 16);
-                if (!span.data) decoded.resize(plane * ml);
-                uint8_t* output = span.data ? span.data : decoded.data();
-                if (!vf.depth && layout && mip_ptr && offset < mip_bytes &&
-                    rbrew_memory_accessible(mem, mip_ptr, mip_bytes)) {
-                    d.pitch = layout->level_pitch[level];
-                    d.surface_height = layout->level_height[level];
-                    d.tile_mode = layout->level_tile[level];
-                    d.swizzle = sd.swizzle;
-                    bool ok = output != nullptr;
-                    for (unsigned z = 0; z < ml && ok; ++z) {
-                        d.slice = first_slice + z;
-                        ok = gx2_detile_mip0(d, mem + mip_ptr + offset, mip_bytes - offset, output + z * plane);
+                for (uint32_t level = 1; level < mip_levels; ++level) {
+                    const auto mw = std::max(1u, w >> level), mh = std::max(1u, h >> level),
+                               ml = dim == 2 ? std::max(1u, layers >> level) : layers;
+                    const uint32_t offset =
+                        level == 1 ? 0 : descriptor_word(data, GX2SURF_MIP_OFFSETS + 4 * (level - 1));
+                    const uint8_t* source = nullptr;
+                    Gx2DetileDesc d;
+                    d.width = vf.compressed ? (mw + 3) / 4 : mw;
+                    d.height = vf.compressed ? (mh + 3) / 4 : mh;
+                    d.bits_per_element = (vf.compressed ? vf.block : vf.bpp) * 8;
+                    const size_t plane = size_t(d.width) * d.height * (d.bits_per_element / 8);
+                    const auto span = gx2vk::upload(plane * ml, 16);
+                    if (!span.data) decoded.resize(plane * ml);
+                    uint8_t* output = span.data ? span.data : decoded.data();
+                    if (mip_accessible && offset < mip_bytes) {
+                        d.pitch = surf_layout->level_pitch[level];
+                        d.surface_height = surf_layout->level_height[level];
+                        d.tile_mode = surf_layout->level_tile[level];
+                        d.swizzle = surf_swizzle;
+                        bool ok = output != nullptr;
+                        for (unsigned z = 0; z < ml && ok; ++z) {
+                            d.slice = first_slice + z;
+                            ok = gx2_detile_mip0(d, mem + mip_ptr + offset, mip_bytes - offset, output + z * plane);
+                        }
+                        if (ok) source = output;
                     }
-                    if (ok) source = output;
+                    TXDIAG(if (!source) txdiag::event(
+                        "mip_decode_failed",
+                        "\"cache_id\":%u,\"mip\":%u,\"mip_address\":%u,\"mip_bytes\":%u,\"offset\":%u", entry.tex.id,
+                        level, mip_ptr, mip_bytes, offset));
+                    if (!source && output) std::memset(output, 0, plane * ml);
+                    if (span.data)
+                        upload_image_span(entry.image, level, 0, ml, mw, mh, ml, span);
+                    else
+                        upload_image_level(entry.image, level, 0, ml, mw, mh, ml, output, plane * ml, 0);
                 }
-                TXDIAG(if (!source) txdiag::event(
-                    "mip_decode_failed", "\"cache_id\":%u,\"mip\":%u,\"mip_address\":%u,\"mip_bytes\":%u,\"offset\":%u",
-                    entry.tex.id, level, mip_ptr, mip_bytes, offset));
-                if (!source && output) std::memset(output, 0, plane * ml);
-                if (span.data)
-                    upload_image_span(entry.image, level, 0, ml, mw, mh, ml, span);
-                else
-                    upload_image_level(entry.image, level, 0, ml, mw, mh, ml, output, plane * ml, 0);
             }
             entry.tex.params.max_level = mip_levels - 1;
             if (mip_levels > 1)

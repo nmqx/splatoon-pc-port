@@ -10,7 +10,7 @@ add_library(cemu_shader STATIC
     Cafe/HW/Latte/LatteAddrLib/LatteAddrLib_Tiling.cpp)
 target_include_directories(cemu_shader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(MSVC)
-    target_compile_options(cemu_shader PRIVATE /FIStandalone.h /utf-8 /W0)
+    target_compile_options(cemu_shader PRIVATE /FIStandalone.h /utf-8 /W0 "$<$<CONFIG:Release>:/arch:AVX2>")
 else()
     target_compile_options(cemu_shader PRIVATE -include Standalone.h)
 endif()

@@ -142,9 +142,21 @@ bool finish();
 uint64_t submission_count();
 
 // ---- barriers ------------------------------------------------------------
-void note_gpu_write(); // a draw/clear/copy wrote device memory
+// Scoped Vulkan Synchronization2 domains (replaces global ALL_COMMANDS stalls
+// with exact producer->consumer stage/access dependencies).
+enum SyncStage : uint32_t {
+    kSyncNone = 0u,
+    kSyncTransfer = 1u << 0,   // vkCmdCopy*, vkCmdBlitImage, vkCmdClear*Image
+    kSyncCompute = 1u << 1,    // vkCmdDispatch (weather / post-processing compute)
+    kSyncColorDepth = 1u << 2, // graphics color/depth-stencil attachment writes
+    kSyncGraphics = 1u << 3,   // graphics draws (attachments + shaders + optional XFB)
+    kSyncAll = kSyncTransfer | kSyncCompute | kSyncGraphics,
+};
+void note_gpu_write(uint32_t stages = kSyncTransfer | kSyncGraphics); // a draw/clear/copy/compute wrote device memory
+void note_gpu_read(uint32_t stages);                                  // records reader stage for WAR execution ordering
 bool gpu_dirty();
-void barrier_if_dirty(); // must be outside a rendering instance
+void barrier_for(uint32_t dst_stages); // scoped barrier for pending writes/WARs needed by dst_stages
+void barrier_if_dirty();               // must be outside a rendering instance (scoped to dirty producers -> kSyncAll)
 void full_barrier();
 uint64_t barrier_count();
 
@@ -195,9 +207,9 @@ struct Image {
     std::vector<View> views;
     explicit operator bool() const { return image != VK_NULL_HANDLE; }
 };
-// Also marks the global synchronization dependency dirty. Generations track
+// Also marks the synchronization dependency dirty. Generations track
 // recorded writes, so alias copies can be reused before GPU completion.
-void note_gpu_write(Image& image);
+void note_gpu_write(Image& image, uint32_t stages = kSyncTransfer | kSyncGraphics);
 VkImageAspectFlags format_aspect(VkFormat format);
 bool format_is_depth(VkFormat format);
 bool format_has_stencil(VkFormat format);

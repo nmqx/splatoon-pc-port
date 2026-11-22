@@ -215,12 +215,16 @@ void leave_rendering() {
     if (s_leave_rendering) s_leave_rendering();
 }
 struct Deferred {
-    uint64_t serial;
+    uint64_t created_serial; // submission when defer() was called; never bumped by replay retention
+    uint64_t serial;         // safe-to-destroy serial (>= created_serial)
     std::function<void()> f;
 };
 std::deque<Deferred> s_deferred;
 uint64_t s_capture_hold_serial = 0; // while > 0, never destroy/recycle serials >= this
-bool s_dirty = false;
+// Per-consumer pending write domains (RAW/WAW) and active read domains (WAR),
+// indexed by consumer slot: 0 = Transfer, 1 = Compute, 2 = Graphics.
+uint32_t s_pending_write[3]{};
+uint32_t s_pending_war[3]{};
 uint64_t s_barriers = 0;
 
 void poll_completed() {
@@ -263,7 +267,8 @@ struct Chunk {
 };
 struct ChunkMeta {
     uint64_t id = 0;
-    uint64_t last_serial = 0;
+    uint64_t last_serial = 0;  // latest real submission that wrote/referenced this chunk
+    uint64_t retain_until = 0; // safe-to-recycle serial (>= last_serial, bumped by 120/165 Hz replay)
 };
 std::vector<Chunk> s_chunks;
 std::vector<ChunkMeta> s_chunk_meta; // parallel to s_chunks; 16 B/entry for fast span_alive/span_resident scans
@@ -1669,7 +1674,8 @@ void shutdown() {
     s_next_serial = 1;
     s_completed = 0;
     s_recorded = false;
-    s_dirty = false;
+    std::memset(s_pending_write, 0, sizeof(s_pending_write));
+    std::memset(s_pending_war, 0, sizeof(s_pending_war));
     s_allocated = 0;
     s_allocated_by_type = {};
     s_before_end = nullptr;
@@ -1894,7 +1900,7 @@ bool wait_serial(uint64_t serial, uint64_t timeout_ns) {
 }
 
 void defer(std::function<void()> f) {
-    s_deferred.push_back({s_next_serial, std::move(f)});
+    s_deferred.push_back({s_next_serial, s_next_serial, std::move(f)});
 }
 // 120 FPS replay (gx2_vk_capture.h): frame N's spans and resources stay until
 // the submission now being recorded, which holds the in-between frame.
@@ -1905,13 +1911,15 @@ void set_capture_hold(uint64_t since_serial) {
     s_capture_hold_serial = since_serial;
 }
 void retain_until_current_submission(uint64_t since_serial, uint32_t later_submissions) {
-    // Only what frame N used (its serials): retaining every chunk each frame
-    // kept all of them busy and allocated new 32 MB chunks every frame.
+    // Compare against the real usage/creation serial (last_serial / created_serial)
+    // and only extend retain_until / serial: mutating last_serial itself into the
+    // future caused every chunk and deferred destruction from frame N to still
+    // satisfy >= since_serial on frame N+1, extending them forever in 120/165 Hz mode.
     const uint64_t until = s_next_serial + later_submissions;
     for (auto& meta : s_chunk_meta)
-        if (meta.last_serial >= since_serial) meta.last_serial = std::max(meta.last_serial, until);
+        if (meta.last_serial >= since_serial) meta.retain_until = std::max(meta.retain_until, until);
     for (auto& entry : s_deferred)
-        if (entry.serial >= since_serial) entry.serial = std::max(entry.serial, until);
+        if (entry.created_serial >= since_serial) entry.serial = std::max(entry.serial, until);
 }
 
 namespace {
@@ -2031,7 +2039,11 @@ uint64_t submit_with(const VkSemaphore* wait, VkPipelineStageFlags2 wait_stage, 
     s_recorded = false;
     ++s_submissions;
     // The ring chunk in use stays reserved until this submission completes.
-    if (s_active_chunk >= 0) s_chunk_meta[s_active_chunk].last_serial = serial;
+    if (s_active_chunk >= 0) {
+        auto& meta = s_chunk_meta[s_active_chunk];
+        meta.last_serial = std::max(meta.last_serial, serial);
+        meta.retain_until = std::max(meta.retain_until, serial);
+    }
     // Commands in later command buffers are ordered after this one by the
     // barrier rules (first scope includes earlier submissions); writes made
     // here still require a barrier before later reads.
@@ -2068,43 +2080,165 @@ uint64_t submission_count() {
 }
 
 // ---------------------------------------------------------------------------
-// Barriers
+// Barriers (scoped Vulkan Synchronization2)
 // ---------------------------------------------------------------------------
-void note_gpu_write() {
-    s_dirty = true;
+namespace {
+constexpr uint32_t kConsumerTransfer = 0;
+constexpr uint32_t kConsumerCompute = 1;
+constexpr uint32_t kConsumerGraphics = 2;
+
+VkPipelineStageFlags2 graphics_shader_stages() {
+    VkPipelineStageFlags2 s = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    if (s_caps.geometry_shader) s |= VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT;
+    if (s_caps.transform_feedback) s |= VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT;
+    return s;
 }
-void note_gpu_write(Image& image) {
+
+void build_src_masks(uint32_t raw_stages, uint32_t war_stages, VkPipelineStageFlags2& stage,
+                     VkAccessFlags2& access) {
+    stage = 0;
+    access = 0;
+    if (raw_stages & kSyncTransfer) {
+        stage |= VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        access |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    }
+    if (raw_stages & kSyncCompute) {
+        stage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        access |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    }
+    if (raw_stages & (kSyncColorDepth | kSyncGraphics)) {
+        stage |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        access |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        if ((raw_stages & kSyncGraphics) && s_caps.transform_feedback) {
+            stage |= VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT;
+            access |= VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT | VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT;
+        }
+    }
+    // WAR dependencies require execution ordering only (zero srcAccessMask flush).
+    if (war_stages & kSyncTransfer) stage |= VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    if (war_stages & kSyncCompute) stage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    if (war_stages & (kSyncColorDepth | kSyncGraphics)) stage |= graphics_shader_stages();
+}
+
+void build_dst_masks(uint32_t dst_stages, VkPipelineStageFlags2& stage, VkAccessFlags2& access) {
+    stage = 0;
+    access = 0;
+    if (dst_stages & kSyncTransfer) {
+        stage |= VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        access |= VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    }
+    if (dst_stages & kSyncCompute) {
+        stage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        access |= VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    }
+    if (dst_stages & (kSyncColorDepth | kSyncGraphics)) {
+        stage |= graphics_shader_stages();
+        access |= VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        if (s_caps.transform_feedback) {
+            access |= VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
+                      VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT |
+                      VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT;
+        }
+    }
+}
+
+void emit_memory_barrier(VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                         VkAccessFlags2 dst_access) {
+    TXDIAG(txdiag::count(txdiag::Barriers); if (txdiag::sample("barrier", 0))
+               txdiag::event("barrier", "\"src_stage\":%llu,\"dst_stage\":%llu,\"src_access\":%llu,\"dst_access\":%llu",
+                             uint64_t(src_stage), uint64_t(dst_stage), uint64_t(src_access), uint64_t(dst_access)));
+    leave_rendering();
+    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = src_stage;
+    barrier.srcAccessMask = src_access;
+    barrier.dstStageMask = dst_stage;
+    barrier.dstAccessMask = dst_access;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd(), &dependency);
+    ++s_barriers;
+}
+} // namespace
+
+void note_gpu_write(uint32_t stages) {
+    if (!stages) return;
+    for (uint32_t c = 0; c < 3; ++c) s_pending_write[c] |= stages;
+    // Untagged graphics/transfer writers may also have sampled textures/buffers in
+    // the same pass; record WAR read stages so subsequent overwrites stay ordered.
+    if (stages & (kSyncGraphics | kSyncTransfer)) {
+        const uint32_t war = stages & (kSyncGraphics | kSyncTransfer);
+        for (uint32_t c = 0; c < 3; ++c) s_pending_war[c] |= war;
+    }
+}
+void note_gpu_read(uint32_t stages) {
+    if (!stages) return;
+    for (uint32_t c = 0; c < 3; ++c) s_pending_war[c] |= stages;
+}
+void note_gpu_write(Image& image, uint32_t stages) {
     image.content_generation = ++s_image_generation;
-    note_gpu_write();
+    note_gpu_write(stages);
     TXDIAG(txdiag::count(txdiag::ImageWrites); txdiag::use("image", txdiag::handle(image.image), s_next_serial);
            if (txdiag::sample("image_write", txdiag::resource_id("image", txdiag::handle(image.image))))
                txdiag::event("image_write", "\"image_id\":%llu,\"content\":%llu",
                              txdiag::resource_id("image", txdiag::handle(image.image)), image.content_generation));
 }
 bool gpu_dirty() {
-    return s_dirty;
+    return (s_pending_write[0] | s_pending_write[1] | s_pending_write[2]) != 0;
+}
+void barrier_for(uint32_t dst_stages) {
+    if (!dst_stages) return;
+    uint32_t raw = 0, war = 0;
+    if (dst_stages & kSyncTransfer) {
+        raw |= s_pending_write[kConsumerTransfer];
+        war |= s_pending_war[kConsumerTransfer];
+    }
+    if (dst_stages & kSyncCompute) {
+        raw |= s_pending_write[kConsumerCompute];
+        war |= s_pending_war[kConsumerCompute];
+    }
+    if (dst_stages & (kSyncColorDepth | kSyncGraphics)) {
+        raw |= s_pending_write[kConsumerGraphics];
+        war |= s_pending_war[kConsumerGraphics];
+    }
+    if (!raw && !war) return;
+    VkPipelineStageFlags2 src_stage = 0, dst_stage = 0;
+    VkAccessFlags2 src_access = 0, dst_access = 0;
+    build_src_masks(raw, war, src_stage, src_access);
+    build_dst_masks(dst_stages, dst_stage, dst_access);
+    emit_memory_barrier(src_stage, src_access, dst_stage, dst_access);
+    if (dst_stages & kSyncTransfer) {
+        s_pending_write[kConsumerTransfer] = 0;
+        s_pending_war[kConsumerTransfer] = 0;
+    }
+    if (dst_stages & kSyncCompute) {
+        s_pending_write[kConsumerCompute] = 0;
+        s_pending_war[kConsumerCompute] = 0;
+    }
+    if (dst_stages & (kSyncColorDepth | kSyncGraphics)) {
+        s_pending_write[kConsumerGraphics] = 0;
+        s_pending_war[kConsumerGraphics] = 0;
+    }
 }
 void full_barrier() {
-    TXDIAG(txdiag::count(txdiag::Barriers); if (txdiag::sample("barrier", 0))
-               txdiag::event("barrier", "\"src_stage\":%llu,\"dst_stage\":%llu,\"src_access\":%llu,\"dst_access\":%llu",
-                             uint64_t(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
-                             uint64_t(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT), uint64_t(VK_ACCESS_2_MEMORY_WRITE_BIT),
-                             uint64_t(VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT)));
-    leave_rendering();
-    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    dependency.memoryBarrierCount = 1;
-    dependency.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd(), &dependency);
-    s_dirty = false;
-    ++s_barriers;
+    VkPipelineStageFlags2 src_stage = 0, dst_stage = 0;
+    VkAccessFlags2 src_access = 0, dst_access = 0;
+    build_src_masks(kSyncAll, kSyncAll, src_stage, src_access);
+    build_dst_masks(kSyncAll, dst_stage, dst_access);
+    emit_memory_barrier(src_stage, src_access, dst_stage, dst_access);
+    std::memset(s_pending_write, 0, sizeof(s_pending_write));
+    std::memset(s_pending_war, 0, sizeof(s_pending_war));
 }
 void barrier_if_dirty() {
-    if (s_dirty) full_barrier();
+    barrier_for(kSyncAll);
 }
 uint64_t barrier_count() {
     return s_barriers;
@@ -2144,11 +2278,13 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
             const VkDeviceSize start = memory_detail::align_up(chunk.used, std::max(alignment, atom));
             if (start + bytes <= kChunkSize) {
                 chunk.used = memory_detail::align_up(start + bytes, atom);
-                meta.last_serial = s_next_serial;
+                meta.last_serial = std::max(meta.last_serial, s_next_serial);
+                meta.retain_until = std::max(meta.retain_until, s_next_serial);
                 queue_upload_flush(chunk.buffer.memory, start, bytes);
                 return {chunk.buffer.buffer, start, bytes, chunk.buffer.memory.mapped + start, meta.id};
             }
-            meta.last_serial = s_next_serial;
+            meta.last_serial = std::max(meta.last_serial, s_next_serial);
+            meta.retain_until = std::max(meta.retain_until, s_next_serial);
         }
         // Retire the active chunk and pick the oldest completed one (or make one).
         poll_completed();
@@ -2158,21 +2294,23 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
         const uint64_t chunk_limit =
             s_capture_hold_serial ? std::min(s_completed, s_capture_hold_serial - 1) : s_completed;
         for (int i = 0; i < int(s_chunk_meta.size()); ++i)
-            if (i != s_active_chunk && s_chunk_meta[i].last_serial <= chunk_limit) {
+            if (i != s_active_chunk && s_chunk_meta[i].retain_until <= chunk_limit) {
                 ++completed_free;
                 if (s_chunk_meta[i].id < next_id) {
                     next = i;
                     next_id = s_chunk_meta[i].id;
                 }
             }
-        // Under sustained upload pressure, proactively unpin the oldest non-held
-        // chunk whenever fewer than 2 completed chunks remain so it finishes on
-        // the GPU before the next rotation (eliminating further 32 MiB allocs).
+        // Under sustained upload pressure, proactively unpin the oldest chunk
+        // whenever fewer than 2 completed chunks remain so callers stop extending
+        // its last_serial via span_alive(). Unpinning never recycles a chunk
+        // early: chunk_limit (< s_capture_hold_serial) and
+        // retain_until_current_submission() still keep any chunk used by an active
+        // 120/165 Hz capture/replay alive until the GPU finishes all replays.
         if (s_chunk_meta.size() >= kChunkReclaimThreshold && completed_free < 2) {
             uint64_t oldest_id = UINT64_MAX;
             for (int i = 0; i < int(s_chunk_meta.size()); ++i) {
                 if (i == s_active_chunk || i == next) continue;
-                if (s_capture_hold_serial && s_chunk_meta[i].last_serial >= s_capture_hold_serial) continue;
                 if (s_chunk_meta[i].id >= s_reclaim_before_id && s_chunk_meta[i].id < oldest_id)
                     oldest_id = s_chunk_meta[i].id;
             }
@@ -2197,6 +2335,28 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
         s_chunks[next].used = 0;
         s_chunk_meta[next].id = ++s_chunk_ids;
         s_chunk_meta[next].last_serial = s_next_serial;
+        s_chunk_meta[next].retain_until = s_next_serial;
+        // Trim excess completed upload chunks left over from transient bursts
+        // (e.g. stage loads) so process RAM never stays permanently elevated.
+        constexpr size_t kChunkTrimHigh = 16;
+        constexpr size_t kChunkTrimTarget = 12;
+        if (s_chunks.size() > kChunkTrimHigh) {
+            for (int i = int(s_chunks.size()) - 1; i >= 0 && s_chunks.size() > kChunkTrimTarget; --i) {
+                if (i == s_active_chunk) continue;
+                if (s_chunk_meta[i].retain_until > chunk_limit) continue;
+                Chunk doomed = std::move(s_chunks[i]);
+                const int last = int(s_chunks.size()) - 1;
+                if (i != last) {
+                    s_chunks[i] = std::move(s_chunks[last]);
+                    s_chunk_meta[i] = s_chunk_meta[last];
+                    if (s_active_chunk == last) s_active_chunk = i;
+                }
+                s_chunks.pop_back();
+                s_chunk_meta.pop_back();
+                if (doomed.buffer.buffer) vkDestroyBuffer(s_device, doomed.buffer.buffer, nullptr);
+                free_now(doomed.buffer.memory);
+            }
+        }
     }
     return {};
 }
@@ -2216,6 +2376,7 @@ bool span_alive(const Span& span) {
         // chunk reserved until that submission completes, or the ring would
         // recycle (and overwrite) it while those commands still read it.
         meta.last_serial = std::max(meta.last_serial, s_next_serial);
+        meta.retain_until = std::max(meta.retain_until, s_next_serial);
         return true;
     }
     return false;
@@ -2442,8 +2603,16 @@ bool create_image(Image& image, const ImageDesc& desc) {
     // first scope covers earlier commands only for the new image.
     VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                           VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           (s_caps.geometry_shader ? VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT : 0ull);
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2767,7 +2936,7 @@ bool present(Image& source, uint32_t width, uint32_t height) {
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return false;
     const auto acquire_end = std::chrono::steady_clock::now();
     VkCommandBuffer cb = cmd();
-    barrier_if_dirty();
+    barrier_for(kSyncTransfer);
     VkImage target = s_swapchain.images[index];
     VkImageMemoryBarrier2 to_transfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     to_transfer.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT; // acquire semaphore wait stage
@@ -2795,6 +2964,7 @@ bool present(Image& source, uint32_t width, uint32_t height) {
         blit.dstOffsets[1] = {int32_t(s_swapchain.extent.width), int32_t(s_swapchain.extent.height), 1};
         vkCmdBlitImage(cb, source.image, VK_IMAGE_LAYOUT_GENERAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                        &blit, VK_FILTER_LINEAR);
+        note_gpu_read(kSyncTransfer);
     } else {
         vkCmdClearColorImage(cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     }
@@ -2918,7 +3088,7 @@ bool read_image(Image& image, VkImageAspectFlags aspect, uint32_t level, uint32_
     Buffer staging = create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryUse::Readback);
     if (!staging.buffer) return false;
     VkCommandBuffer cb = cmd();
-    barrier_if_dirty();
+    barrier_for(kSyncTransfer);
     VkBufferImageCopy region{};
     region.imageSubresource = {aspect, level, image.desc.type == VK_IMAGE_TYPE_3D ? 0u : layer, 1};
     region.imageOffset = {0, 0, image.desc.type == VK_IMAGE_TYPE_3D ? int32_t(layer) : 0};

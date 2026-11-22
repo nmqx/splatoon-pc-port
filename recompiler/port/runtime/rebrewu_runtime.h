@@ -19,6 +19,11 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
+#if defined(__AVX2__) || defined(__FMA__)
+#include <immintrin.h>
+#elif defined(_M_X64) || defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #ifndef RBREW_HOST_API
 #define RBREW_HOST_API
@@ -119,11 +124,17 @@ struct CPUState {
 // executed on the register file; implemented per decaf-emu's interpreter.
 // The _mem form is what generated code calls: it passes the arena base
 // explicitly so host compilers know a paired-single may touch guest memory.
-extern "C" RBREW_HOST_API void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t word);
-extern "C" RBREW_HOST_API void rbrew_ps(CPUState* cpu, uint32_t word);
+extern "C" RBREW_HOST_API void rbrew_ps_mem(CPUState* cpu, uint8_t* mem, uint32_t word) noexcept(false);
+extern "C" RBREW_HOST_API void rbrew_ps(CPUState* cpu, uint32_t word) noexcept(false);
+extern "C" RBREW_HOST_API void rbrew_psq_load_quant(CPUState* cpu, uint8_t* mem, uint32_t d, uint32_t ea,
+                                                    uint32_t single, uint32_t gqr) noexcept(false);
+extern "C" RBREW_HOST_API void rbrew_psq_store_quant(CPUState* cpu, uint8_t* mem, uint32_t d, uint32_t ea,
+                                                     uint32_t single, uint32_t gqr) noexcept(false);
+extern "C" RBREW_HOST_API double rbrew_ps_truncate_single_slow(double v) noexcept;
+extern "C" RBREW_HOST_API double rbrew_ps_merge_slot1_slow(double v) noexcept;
 // tw/twi: evaluate the TO condition (signed lt/gt, eq, unsigned lt/gt) and,
 // when it holds, stop with a guest-trap error instead of continuing.
-extern "C" RBREW_HOST_API void rbrew_trap(CPUState* cpu, uint32_t word, uint32_t pc);
+extern "C" RBREW_HOST_API void rbrew_trap(CPUState* cpu, uint32_t word, uint32_t pc) noexcept(false);
 // Thread start values set by coreinit (decaf OSCreateThread): GQR2-5 hold
 // the u8/u16/s8/s16 quantization types, the rest are 0.
 static inline void rbrew_init_thread_gqrs(CPUState* cpu) {
@@ -612,36 +623,54 @@ static inline double rbrew_fround(double v) {
 
 extern RBREW_HOST_API const bool rbrew_paired_inline_enabled;
 
-// psq quantization: the 2^[-31,32] scale factor is built exactly (no libm),
-// matching the ldexp reference for every GQR scale.
-static inline int rbrew_psq_signed_scale(uint32_t scale) {
-    const int e = int(scale & 0x3F);
-    return e - ((e & 32) << 1);
+// Deterministic operand-order FP ops for paired-single arithmetic: keeps NaN
+// propagation identical between inline rbrew_ps_constant and rbrew_ps_mem and
+// lowers FMA directly to hardware vfmadd213sd when AVX2/FMA is enabled.
+static inline double rbrew_ps_add_sd(double a, double b) {
+#if defined(_M_X64) || defined(__SSE2__)
+    return _mm_cvtsd_f64(_mm_add_sd(_mm_set_sd(a), _mm_set_sd(b)));
+#else
+    return a + b;
+#endif
 }
-static inline double rbrew_psq_factor(uint32_t scale, bool store) {
-    const int k = rbrew_psq_signed_scale(scale);
-    const uint64_t bits = uint64_t(1023 + (store ? k : -k)) << 52;
-    double f;
-    memcpy(&f, &bits, sizeof(f));
-    return f;
+static inline double rbrew_ps_mul_sd(double a, double b) {
+#if defined(_M_X64) || defined(__SSE2__)
+    return _mm_cvtsd_f64(_mm_mul_sd(_mm_set_sd(a), _mm_set_sd(b)));
+#else
+    return a * b;
+#endif
 }
-// Saturating quantized store of one element (signed-NaN picks the sign's bound).
-static inline void rbrew_psq_store_int(uint8_t* __restrict mem, uint32_t ea, double v, double factor, int32_t lo,
-                                       int32_t hi, bool wide) {
+static inline double rbrew_ps_fma_sd(double a, double c, double b) {
+#if defined(__AVX2__) || defined(__FMA__)
+    return _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(c), _mm_set_sd(b)));
+#else
+    return fma(a, c, b);
+#endif
+}
+
+// Fast exact-float check for paired-single slot-1 truncation (ps_merge* and
+// ps_mr/neg/abs/nabs): values already representable as normal single-precision
+// floats or +/-0.0 pass through untouched; subnormals/overflows/general doubles
+// delegate to the exact out-of-line slow path matching rebrewu_paired.cpp.
+static inline double rbrew_ps_truncate_single_fast(double v) {
     uint64_t bits;
     memcpy(&bits, &v, sizeof(bits));
-    int32_t q;
-    if ((bits & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull) // NaN
-        q = (bits >> 63) ? lo : hi;
-    else {
-        const double scaled = v * factor;
-        q = scaled < double(lo) ? lo : scaled > double(hi) ? hi : int32_t(scaled);
-    }
-    if (wide)
-        rbrew_write16(mem, ea, uint16_t(q));
-    else
-        rbrew_write8(mem, ea, uint8_t(q));
+    const uint32_t exp = uint32_t(bits >> 52) & 0x7FFu;
+    if ((((bits & 0x1FFFFFFFull) == 0u) && exp > 896u && exp < 1151u) || (bits & 0x7FFFFFFFFFFFFFFFull) == 0u)
+        [[likely]]
+        return v;
+    return rbrew_ps_truncate_single_slow(v);
 }
+static inline double rbrew_ps_merge_slot1_fast(double v) {
+    uint64_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    const uint32_t exp = uint32_t(bits >> 52) & 0x7FFu;
+    if ((((bits & 0x1FFFFFFFull) == 0u) && exp > 896u && exp < 1151u) || (bits & 0x7FFFFFFFFFFFFFFFull) == 0u)
+        [[likely]]
+        return v;
+    return rbrew_ps_merge_slot1_slow(v);
+}
+
 // Values below the single exponent range store a signed zero (decaf).
 static inline void rbrew_psq_store_float(uint8_t* __restrict mem, uint32_t ea, double v) {
     uint64_t bits;
@@ -657,107 +686,144 @@ static inline void rbrew_psq_store_float(uint8_t* __restrict mem, uint32_t ea, d
 // explicitly so host compilers can keep guest registers in host registers
 // across the inline loads/stores.
 template <uint32_t w> static inline void rbrew_ps_constant(CPUState* cpu, uint8_t* __restrict mem) {
+#if !defined(RBREW_HYPER_OPTIMIZE)
     if (!rbrew_paired_inline_enabled) return rbrew_ps_mem(cpu, mem, w);
+#endif
     constexpr uint32_t op = w >> 26, d = (w >> 21) & 31, a = (w >> 16) & 31;
     if constexpr (op == 56 || op == 57 || op == 60 || op == 61) {
         constexpr bool load = op < 60, update = op == 57 || op == 61, single = (w >> 15) & 1;
         const uint32_t gqr = cpu->gqr[(w >> 12) & 7];
         const uint32_t type = (gqr >> (load ? 16 : 0)) & 7;
-        const uint32_t scale = (gqr >> (load ? 24 : 8)) & 0x3F;
         constexpr int32_t disp = int32_t((w & 4095u) << 20) >> 20;
         const uint32_t ea = (update || a ? cpu->r[a] : 0u) + uint32_t(disp);
         if constexpr (load) {
-            const double factor = type == 0 ? 1.0 : rbrew_psq_factor(scale, false);
-            switch (type) {
-            case 0: // float
+            if (type == 0) [[likely]] {
                 cpu->f[d] = rbrew_read_f32(mem, ea);
                 cpu->ps1[d] = single ? 1.0 : rbrew_read_f32(mem, ea + 4);
-                break;
-            case 4: // u8
-                cpu->f[d] = double(rbrew_read8(mem, ea)) * factor;
-                cpu->ps1[d] = single ? 1.0 : double(rbrew_read8(mem, ea + 1)) * factor;
-                break;
-            case 5: // u16
-                cpu->f[d] = double(rbrew_read16(mem, ea)) * factor;
-                cpu->ps1[d] = single ? 1.0 : double(rbrew_read16(mem, ea + 2)) * factor;
-                break;
-            case 6: // s8
-                cpu->f[d] = double(int8_t(rbrew_read8(mem, ea))) * factor;
-                cpu->ps1[d] = single ? 1.0 : double(int8_t(rbrew_read8(mem, ea + 1))) * factor;
-                break;
-            case 7: // s16
-                cpu->f[d] = double(int16_t(rbrew_read16(mem, ea))) * factor;
-                cpu->ps1[d] = single ? 1.0 : double(int16_t(rbrew_read16(mem, ea + 2))) * factor;
-                break;
-            default: return rbrew_ps_mem(cpu, mem, w);
+            } else {
+                rbrew_psq_load_quant(cpu, mem, d, ea, single ? 1u : 0u, gqr);
             }
         } else {
-            if (type != 0 && type < 4) return rbrew_ps_mem(cpu, mem, w); // undefined quantization
-            const double factor = type == 0 ? 1.0 : rbrew_psq_factor(scale, true);
-            auto store_one = [&](uint32_t address, double value) {
-                switch (type) {
-                case 0: rbrew_psq_store_float(mem, address, value); break;
-                case 4: rbrew_psq_store_int(mem, address, value, factor, 0, 255, false); break;
-                case 5: rbrew_psq_store_int(mem, address, value, factor, 0, 65535, true); break;
-                case 6: rbrew_psq_store_int(mem, address, value, factor, -128, 127, false); break;
-                case 7: rbrew_psq_store_int(mem, address, value, factor, -32768, 32767, true); break;
-                default: break;
-                }
-            };
-            store_one(ea, cpu->f[d]);
-            if constexpr (!single) {
-                if (type == 0)
-                    store_one(ea + 4, cpu->ps1[d]);
-                else
-                    store_one(ea + ((type & 1) ? 2u : 1u), cpu->ps1[d]); // 8-bit types 4/6, 16-bit 5/7
+            if (type == 0) [[likely]] {
+                rbrew_psq_store_float(mem, ea, cpu->f[d]);
+                if constexpr (!single) rbrew_psq_store_float(mem, ea + 4, cpu->ps1[d]);
+            } else {
+                rbrew_psq_store_quant(cpu, mem, d, ea, single ? 1u : 0u, gqr);
             }
         }
         if constexpr (update) cpu->r[a] = ea;
         return;
     } else if constexpr (op == 4) {
-        constexpr uint32_t b = (w >> 11) & 31, c = (w >> 6) & 31, xo = (w >> 1) & 31;
-        const double a0 = cpu->f[a], a1 = cpu->ps1[a], b0 = cpu->f[b], b1 = cpu->ps1[b];
-        const double c0 = cpu->f[c], c1 = cpu->ps1[c];
-        double p0, p1;
-        if constexpr (xo == 10) {
-            p0 = a0 + b1;
-            p1 = c1;
-        } else if constexpr (xo == 11) {
-            p0 = c0;
-            p1 = a0 + b1;
-        } else if constexpr (xo == 12) {
-            p0 = a0 * c0;
-            p1 = a1 * c0;
-        } else if constexpr (xo == 13) {
-            p0 = a0 * c1;
-            p1 = a1 * c1;
-        } else if constexpr (xo == 14) {
-            p0 = fma(a0, c0, b0);
-            p1 = fma(a1, c0, b1);
-        } else if constexpr (xo == 15) {
-            p0 = fma(a0, c1, b0);
-            p1 = fma(a1, c1, b1);
-        } else if constexpr (xo == 20) {
-            p0 = a0 - b0;
-            p1 = a1 - b1;
-        } else if constexpr (xo == 21) {
-            p0 = a0 + b0;
-            p1 = a1 + b1;
-        } else if constexpr (xo == 25) {
-            p0 = a0 * c0;
-            p1 = a1 * c1;
-        } else if constexpr (xo == 28) {
-            p0 = fma(a0, c0, -b0);
-            p1 = fma(a1, c1, -b1);
-        } else if constexpr (xo == 29) {
-            p0 = fma(a0, c0, b0);
-            p1 = fma(a1, c1, b1);
-        } else
-            return rbrew_ps_mem(cpu, mem, w);
-        cpu->f[d] = double(float(p0));
-        cpu->ps1[d] = double(float(p1));
-        if constexpr (w & 1) cpu->cr[1] = (cpu->fpscr >> 28) & 15;
-        return;
+        constexpr uint32_t b = (w >> 11) & 31, c = (w >> 6) & 31;
+        constexpr uint32_t xo6 = (w >> 1) & 63, xo5 = (w >> 1) & 31, xo10 = (w >> 1) & 1023;
+        if constexpr (xo6 == 6 || xo6 == 7 || xo6 == 38 || xo6 == 39) {
+            rbrew_ps_mem(cpu, mem, w);
+            return;
+        } else if constexpr (xo5 == 10 || xo5 == 11 || xo5 == 12 || xo5 == 13 || xo5 == 14 || xo5 == 15 || xo5 == 18 ||
+                             xo5 == 20 || xo5 == 21 || xo5 == 24 || xo5 == 25 || xo5 == 26 || xo5 == 28 || xo5 == 29 ||
+                             xo5 == 30 || xo5 == 31) {
+            const double a0 = cpu->f[a], a1 = cpu->ps1[a], b0 = cpu->f[b], b1 = cpu->ps1[b];
+            const double c0 = cpu->f[c], c1 = cpu->ps1[c];
+            double p0, p1;
+            if constexpr (xo5 == 10) {
+                p0 = rbrew_ps_add_sd(a0, b1);
+                p1 = c1;
+            } else if constexpr (xo5 == 11) {
+                p0 = c0;
+                p1 = rbrew_ps_add_sd(a0, b1);
+            } else if constexpr (xo5 == 12) {
+                p0 = rbrew_ps_mul_sd(a0, c0);
+                p1 = rbrew_ps_mul_sd(a1, c0);
+            } else if constexpr (xo5 == 13) {
+                p0 = rbrew_ps_mul_sd(a0, c1);
+                p1 = rbrew_ps_mul_sd(a1, c1);
+            } else if constexpr (xo5 == 14) {
+                p0 = rbrew_ps_fma_sd(a0, c0, b0);
+                p1 = rbrew_ps_fma_sd(a1, c0, b1);
+            } else if constexpr (xo5 == 15) {
+                p0 = rbrew_ps_fma_sd(a0, c1, b0);
+                p1 = rbrew_ps_fma_sd(a1, c1, b1);
+            } else if constexpr (xo5 == 18) {
+                p0 = a0 / b0;
+                p1 = a1 / b1;
+            } else if constexpr (xo5 == 20) {
+                p0 = a0 - b0;
+                p1 = a1 - b1;
+            } else if constexpr (xo5 == 21) {
+                p0 = rbrew_ps_add_sd(a0, b0);
+                p1 = rbrew_ps_add_sd(a1, b1);
+            } else if constexpr (xo5 == 24) {
+                p0 = 1.0 / b0;
+                p1 = 1.0 / b1;
+            } else if constexpr (xo5 == 25) {
+                p0 = rbrew_ps_mul_sd(a0, c0);
+                p1 = rbrew_ps_mul_sd(a1, c1);
+            } else if constexpr (xo5 == 26) {
+                p0 = 1.0 / sqrt(b0);
+                p1 = 1.0 / sqrt(b1);
+            } else if constexpr (xo5 == 28 || xo5 == 30) {
+                p0 = rbrew_ps_fma_sd(a0, c0, -b0);
+                p1 = rbrew_ps_fma_sd(a1, c1, -b1);
+            } else { // xo5 == 29 || xo5 == 31
+                p0 = rbrew_ps_fma_sd(a0, c0, b0);
+                p1 = rbrew_ps_fma_sd(a1, c1, b1);
+            }
+            if constexpr (xo5 == 30 || xo5 == 31) {
+                cpu->f[d] = -double(float(p0));
+                cpu->ps1[d] = -double(float(p1));
+            } else {
+                cpu->f[d] = double(float(p0));
+                cpu->ps1[d] = double(float(p1));
+            }
+            if constexpr (w & 1) cpu->cr[1] = (cpu->fpscr >> 28) & 15u;
+            return;
+        } else if constexpr (xo5 == 23) { // ps_sel
+            const double a0 = cpu->f[a], a1 = cpu->ps1[a];
+            const double b0 = cpu->f[b], b1 = cpu->ps1[b];
+            const double c0 = cpu->f[c], c1 = cpu->ps1[c];
+            cpu->f[d] = a0 >= 0.0 ? c0 : b0;
+            cpu->ps1[d] = a1 >= 0.0 ? c1 : b1;
+            if constexpr (w & 1) cpu->cr[1] = (cpu->fpscr >> 28) & 15u;
+            return;
+        } else if constexpr (xo10 == 528 || xo10 == 560 || xo10 == 592 || xo10 == 624) { // ps_merge00/01/10/11
+            const double first = (xo10 == 528 || xo10 == 560) ? cpu->f[a] : cpu->ps1[a];
+            const double second = (xo10 == 528 || xo10 == 592) ? cpu->f[b] : cpu->ps1[b];
+            cpu->f[d] = double(float(first));
+            cpu->ps1[d] = rbrew_ps_merge_slot1_fast(second);
+            if constexpr (w & 1) cpu->cr[1] = (cpu->fpscr >> 28) & 15u;
+            return;
+        } else if constexpr (xo10 == 72 || xo10 == 40 || xo10 == 264 || xo10 == 136) { // ps_mr/neg/abs/nabs
+            const float f0 = float(cpu->f[b]);
+            const float f1 = float(rbrew_ps_truncate_single_fast(cpu->ps1[b]));
+            uint32_t p0, p1;
+            memcpy(&p0, &f0, 4);
+            memcpy(&p1, &f1, 4);
+            if constexpr (xo10 == 40) { // ps_neg
+                p0 ^= 0x80000000u;
+                p1 ^= 0x80000000u;
+            } else if constexpr (xo10 == 264) { // ps_abs
+                p0 &= 0x7FFFFFFFu;
+                p1 &= 0x7FFFFFFFu;
+            } else if constexpr (xo10 == 136) { // ps_nabs
+                p0 |= 0x80000000u;
+                p1 |= 0x80000000u;
+            }
+            float o0, o1;
+            memcpy(&o0, &p0, 4);
+            memcpy(&o1, &p1, 4);
+            cpu->f[d] = double(o0);
+            cpu->ps1[d] = double(o1);
+            if constexpr (w & 1) cpu->cr[1] = (cpu->fpscr >> 28) & 15u;
+            return;
+        } else if constexpr (xo10 == 0 || xo10 == 32 || xo10 == 64 || xo10 == 96) { // ps_cmpu0/cmpo0/cmpu1/cmpo1
+            constexpr uint32_t crf = (w >> 23) & 7u;
+            const double lhs = (xo10 < 64) ? cpu->f[a] : cpu->ps1[a];
+            const double rhs = (xo10 < 64) ? cpu->f[b] : cpu->ps1[b];
+            const uint32_t cmp = (lhs < rhs) ? 8u : (lhs > rhs) ? 4u : (lhs == rhs) ? 2u : 1u;
+            cpu->cr[crf] = cmp;
+            cpu->fpscr = (cpu->fpscr & ~0xF000u) | (cmp << 12);
+            return;
+        }
     }
     rbrew_ps_mem(cpu, mem, w);
 }

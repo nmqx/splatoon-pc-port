@@ -1,6 +1,7 @@
 #include <utility>
 #include "../../runtime/game_revision.h"
 #include "../../runtime/rbrew_diagnostics.h"
+#include "../../runtime/splatoon_diagnostics.h"
 #include "gx2_texture_diagnostics.h"
 // gx2_render_vk_draw.cpp - Vulkan draw submission for GX2: translated
 // programs, pipelines, rendering instances, dynamic state, vertex/index
@@ -346,7 +347,9 @@ static VkImageView depth_attachment_view(DepthTarget& t) {
 bool gx2r::ensure_rendering(bool streamout_only) {
     if (!S.framebuffer.valid && !streamout_only) return false;
     if (s_rendering && s_active_fb == S.framebuffer && s_streamout_only == streamout_only) return true;
+    const bool was_streamout = s_streamout_only;
     end_rendering();
+    if (was_streamout && !streamout_only) reset_command_tracking();
     const auto& fb = S.framebuffer;
     uint32_t w = UINT32_MAX, h = UINT32_MAX;
     for (auto* t : fb.colors) {
@@ -2219,6 +2222,45 @@ void (*s_warm_progress)(double) = nullptr;
 void warm_record_program(uint64_t key, uint32_t rect, uint32_t points);
 void warm_record_masks(uint64_t base, const ExactReads& reads);
 
+bool async_translation_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("RBREW_ASYNC_TRANSLATE");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+struct AsyncTranslationInput {
+    std::vector<uint8_t> vs_code;
+    std::vector<uint8_t> ps_code;
+    std::vector<uint32_t> regs;
+    std::vector<R700FetchAttribute> attributes;
+    uint32_t vs_attribs = 0;
+    uint32_t rect = 0;
+    bool negative_one_to_one = false;
+    bool solid_ps = false;
+};
+struct AsyncTranslationResult {
+    std::string vs_glsl;
+    std::string ps_glsl;
+    std::array<R700TranslationInfo, 2> info;
+    R700TranslationReads vs_reads;
+    R700TranslationReads ps_reads;
+    bool ok = false;
+};
+struct AsyncTranslation {
+    gx2vk::CompileQueue::Job<std::shared_ptr<AsyncTranslationResult>> job;
+    uint64_t disk_key = 0;
+    uint64_t exact_base = 0;
+    uint64_t canon = 0;
+    uint32_t rect = 0;
+    uint32_t points = 0;
+    uint32_t vs_addr = 0;
+    uint32_t ps_addr = 0;
+    bool exact = false;
+};
+std::unordered_map<uint64_t, AsyncTranslation> s_pending_translations;
+bool s_last_async_translate_skip = false;
+
 Program* resolve_active_program(uint8_t* mem) {
     Gx2PerfScope perf_scope(kPerfShader);
     warm_start(); // first draw: rebuild the recorded programs and pipelines
@@ -2516,6 +2558,53 @@ Program* resolve_active_program(uint8_t* mem) {
             warm_record_program(key, rect, points);
             return prog;
         }
+    if (auto pending_it = s_pending_translations.find(key); pending_it != s_pending_translations.end()) {
+        if (s_async_draw && !pending_it->second.job.ready()) {
+            if (s_compile_queue) s_compile_queue->promote(pending_it->second.job);
+            s_last_async_translate_skip = true;
+            return nullptr;
+        }
+        AsyncTranslation pending = std::move(pending_it->second);
+        s_pending_translations.erase(pending_it);
+        auto res = await_compile(pending.job);
+        if (!res || !res->ok) {
+            s_prog_cache[key] = nullptr;
+            pm = {key, nullptr, true};
+            return nullptr;
+        }
+        store_translation(pending.disk_key, res->vs_glsl.c_str(), res->ps_glsl.c_str(), res->info);
+        if (pending.exact && res->vs_reads.valid && res->ps_reads.valid)
+            if (s_exact_reads
+                    .try_emplace(pending.exact_base,
+                                 ExactReads{res->vs_reads.vs_parameter_mask, res->vs_reads.texture_unit_mask,
+                                            res->ps_reads.texture_unit_mask})
+                    .second)
+                warm_record_masks(pending.exact_base, s_exact_reads[pending.exact_base]);
+        bool reused = false;
+        Program* prog =
+            link_program(res->vs_glsl.c_str(), res->ps_glsl.c_str(), res->info, pending.rect, pending.points, true, reused);
+        if (prog && pending.exact) {
+            if (!prog->warm_key) prog->warm_key = key;
+            warm_record_program(key, pending.rect, pending.points);
+            if (pending.canon) {
+                auto& entry = s_canonical[pending.canon];
+                if (!entry.program) entry.program = prog;
+                if (!entry.reads_valid && res->vs_reads.valid && res->ps_reads.valid) {
+                    entry.reads = ExactReads{res->vs_reads.vs_parameter_mask, res->vs_reads.texture_unit_mask,
+                                             res->ps_reads.texture_unit_mask};
+                    entry.reads_valid = true;
+                }
+            }
+        }
+        if (!reused)
+            RBREW_LOG_INFO("shader", "native program=%u VS=%08X%s PS=%08X%s (async-translated)\n",
+                           prog ? prog->id : 0, pending.vs_addr, S.vs_from_regs ? "(regs)" : "", pending.ps_addr,
+                           S.ps_from_regs ? "(regs)" : "");
+        trace_program_key_miss(pending.vs_addr, pending.ps_addr, reused);
+        s_prog_cache[key] = prog;
+        pm = {key, prog, true};
+        return prog;
+    }
     std::vector<R700FetchAttribute> attributes;
     if (fetch_attributes) attributes = *fetch_attributes;
 
@@ -2577,6 +2666,73 @@ Program* resolve_active_program(uint8_t* mem) {
     std::shared_ptr<TranslateJob> ps_job;
     R700TranslationReads vs_reads, ps_reads;
     const bool from_disk = load_translation(disk_key, vs_glsl, ps_glsl, info);
+    if (!from_disk && s_async_draw && async_translation_enabled() && async_shader_compile() &&
+        !parallel_translation_verify() && !rbrew_diagnostic_env("RBREW_SHADER_DUMP_DIR")) {
+        // Offload cold R700->GLSL translation + SPIR-V module pre-compilation
+        // to the shader worker pool for transient_cleared_target() draws so new
+        // zone/effect shaders never stall the render thread. Persistent targets
+        // (ink maps, cubemaps, streamout, queries) keep s_async_draw == false.
+        static const bool s_solid_ps = std::getenv("RBREW_DEBUG_SOLID_PS") != nullptr;
+        AsyncTranslationInput input;
+        input.vs_code.assign(mem + vs_program.address, mem + vs_program.address + vs_program.size);
+        input.ps_code.assign(mem + ps_program.address, mem + ps_program.address + ps_program.size);
+        input.regs.assign(S.regs.begin(), S.regs.end());
+        input.attributes = std::move(attributes);
+        input.vs_attribs = S.cur_vs_attribs;
+        input.rect = rect;
+        input.negative_one_to_one = gx2vk::caps().negative_one_to_one;
+        input.solid_ps = s_solid_ps;
+        auto job = post_compile([in = std::move(input)]() -> std::shared_ptr<AsyncTranslationResult> {
+            auto res = std::make_shared<AsyncTranslationResult>();
+            char* vs = nullptr;
+            char* ps = nullptr;
+            {
+                R700TranslateInput ti{};
+                ti.data = in.vs_code.data();
+                ti.size = uint32_t(in.vs_code.size());
+                ti.is_pixel = false;
+                ti.num_attribs = in.vs_attribs;
+                ti.context_registers = in.regs.data();
+                ti.attributes = in.attributes;
+                ti.info = &res->info[0];
+                ti.vulkan = true;
+                ti.vulkan_negative_one_to_one = in.negative_one_to_one;
+                vs = r700_to_glsl(ti);
+                res->vs_reads = r700_last_translation_reads();
+            }
+            {
+                R700TranslateInput ti{};
+                ti.data = in.ps_code.data();
+                ti.size = uint32_t(in.ps_code.size());
+                ti.is_pixel = true;
+                ti.context_registers = in.regs.data();
+                ti.info = &res->info[1];
+                ti.vulkan = true;
+                ps = r700_to_glsl(ti);
+                res->ps_reads = r700_last_translation_reads();
+            }
+            if (vs && ps) {
+                res->vs_glsl = vs;
+                res->ps_glsl = ps;
+                res->ok = true;
+                // Pre-warm thread-safe VkShaderModule cache so link_program()
+                // on the next frame hits in O(1) without a second async delay.
+                (void)gx2vk::shader_module(VK_SHADER_STAGE_VERTEX_BIT, res->vs_glsl);
+                if (!in.solid_ps) (void)gx2vk::shader_module(VK_SHADER_STAGE_FRAGMENT_BIT, res->ps_glsl);
+                if (in.rect) {
+                    const auto gs = r700_rect_geometry(res->vs_glsl.c_str(), in.rect == 2);
+                    (void)gx2vk::shader_module(VK_SHADER_STAGE_GEOMETRY_BIT, gs);
+                }
+            }
+            std::free(vs);
+            std::free(ps);
+            return res;
+        });
+        s_pending_translations.emplace(key, AsyncTranslation{std::move(job), disk_key, exact_base, canon, rect, points,
+                                                             vs_program.address, ps_program.address, exact});
+        s_last_async_translate_skip = true;
+        return nullptr;
+    }
     if (!from_disk) {
         // A cache hit already owns both translated stages. Only a miss needs the
         // helper, its bytecode/register snapshot and the eventual compiler work.
@@ -2743,6 +2899,7 @@ Program* link_program(const char* vs_glsl, const char* ps_glsl, const std::array
             p.compiled = post_compile(
                 [program = &p, background] {
                     auto& p = *program;
+                    SplatoonDiagnostics::NoteShaderCompile();
                     // A draw waits for a new program: compile its pixel stage
                     // beside the vertex/geometry stages (shader_module is thread
                     // safe) so it waits for the slowest stage, not their sum.
@@ -3114,6 +3271,7 @@ VkPipeline create_pipeline(const PipelineRequest& r, const PipelineSwitches& s) 
     info.pColorBlendState = discard ? nullptr : &blend;
     info.pDynamicState = &dynamic;
     info.layout = p.layout;
+    SplatoonDiagnostics::NoteShaderCompile();
     if (vkCreateGraphicsPipelines(gx2vk::device(), gx2vk::pipeline_cache(), 1, &info, nullptr, &pipeline) !=
         VK_SUCCESS) {
         TXDIAG(
@@ -3568,12 +3726,22 @@ struct IndexKeyHash {
 };
 struct CachedIndices {
     gx2vk::Span span;
+    gx2vk::Buffer vram_buffer;
     uint64_t written = 0;
-    uint64_t hash = 0;  // content hash when written is untracked (Linux)
-    uint64_t epoch = 0; // frame epoch the hash was last proven at
+    uint64_t hash = 0;        // content hash when written is untracked (Linux)
+    uint64_t epoch = 0;       // frame epoch the hash was last proven at
+    uint64_t last_use = 0;    // LRU clock for bounded VRAM eviction
+    uint64_t last_serial = 0; // last recording serial that bound vram_buffer
+    uint32_t vram_size = 0;   // byte size of vram_buffer
+    uint8_t rewrites = 0;
+    bool device_local = false;
 };
 std::unordered_map<IndexKey, CachedIndices, IndexKeyHash> s_index_spans;
 uint64_t s_index_chunk = 0;
+uint64_t s_index_clock = 0;
+uint64_t s_index_vram_bytes = 0;
+size_t s_index_evict_bucket = 0;
+std::vector<IndexKey> s_index_stale;
 IndexKey s_last_idx_key{};
 CachedIndices* s_last_idx_entry = nullptr;
 struct IdxMru {
@@ -5673,6 +5841,16 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         if (pipeline != s_bound_pipeline) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             s_bound_pipeline = pipeline;
+            if (streamout_only) {
+                // Binding a rasterizerDiscardEnable=VK_TRUE pipeline with null
+                // pDepthStencilState/pColorBlendState invalidates depth/stencil/blend
+                // dynamic state in the command buffer (VUID-vkCmdDrawIndexed-None-07844/07845/07847).
+                s_dyn.depth_test = s_dyn.depth_write = s_dyn.stencil_test = -1;
+                s_dyn.depth_op = VK_COMPARE_OP_MAX_ENUM;
+                s_dyn.face_valid = false;
+                s_dyn.blend[0] = NAN;
+                ++s_tracking_epoch;
+            }
         }
         if (!bind_descriptors(cb, *prog, sd.writes.data(), sd.write_count)) return any;
         const int32_t base_instance = int32_t(S.instance_uniform);
@@ -5796,9 +5974,12 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
     s_async_draw = async_shaders_enabled() && !xfb && !hook && !s_query_segment && !(S.regs[0xA2AC] & 1) &&
                    recurring_target(S.framebuffer);
 #endif
+    s_last_async_translate_skip = false;
     Program* prog = resolve_active_program(mem);
     bool drawn = false;
-    if (prog && s_async_draw && !prog->compiled.ready()) {
+    if (!prog && s_last_async_translate_skip) {
+        ++s_async_skips;
+    } else if (prog && s_async_draw && !prog->compiled.ready()) {
         if (s_compile_queue) s_compile_queue->promote(prog->compiled.pending);
         ++s_async_skips;
     } else {
@@ -6080,7 +6261,10 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
         const uint64_t epoch = g_gx2_frame_epoch.load(std::memory_order_relaxed);
         bool hit = false;
         uint64_t content = 0;
-        if (cached_idx && gx2vk::span_alive(cached_idx->span)) {
+        const bool alive = cached_idx &&
+                           ((cached_idx->device_local && cached_idx->vram_buffer.buffer != VK_NULL_HANDLE) ||
+                            gx2vk::span_alive(cached_idx->span));
+        if (alive) {
             // Epoch model (Cemu's chronon): hash at most once per frame per
             // buffer; later draws of that frame hit without re-reading.
             if (untracked) {
@@ -6095,7 +6279,16 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
             }
         }
         if (hit) {
-            stream.span = cached_idx->span;
+            cached_idx->last_use = ++s_index_clock;
+            if (cached_idx->device_local) {
+                stream.span = {};
+                stream.span.buffer = cached_idx->vram_buffer.buffer;
+                stream.span.offset = 0;
+                stream.span.size = idx_bytes;
+                cached_idx->last_serial = gx2vk::recording_serial();
+            } else {
+                stream.span = cached_idx->span;
+            }
 #ifndef RBREW_DISABLE_LOGGING
             if (cache_verify_enabled() && stream.span.data) {
                 static thread_local std::vector<uint8_t> guest;
@@ -6109,29 +6302,130 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
             }
 #endif
         } else {
-            stream.span = gx2vk::upload(idx_bytes, 16);
-            if (!stream.span.data) return;
+            const uint8_t next_rewrites =
+                cached_idx ? (cached_idx->rewrites < 255 ? uint8_t(cached_idx->rewrites + 1) : uint8_t(255))
+                           : uint8_t(1);
+            const gx2vk::Span stage = gx2vk::upload(idx_bytes, 16);
+            if (!stage.data) return;
             gx2_perf_bytes(kBytesIndex, idx_bytes);
             if (untracked && content == 0) content = hash_guest_bytes(mem + idx_guest_addr, idx_bytes);
             if (!need_swap)
-                std::memcpy(stream.span.data, mem + idx_guest_addr, idx_bytes);
+                std::memcpy(stage.data, mem + idx_guest_addr, idx_bytes);
             else
-                copy_swapped_indices(stream.span.data, mem + idx_guest_addr, count, is_u32);
-            if (stream.span.chunk_id) {
-                if (s_index_chunk != stream.span.chunk_id) {
-                    // Metadata shares the existing ring's lifetime; no extra
-                    // geometry allocation or permanent CPU byte copy is kept.
-                    std::erase_if(s_index_spans,
-                                  [](const auto& item) { return !gx2vk::span_resident(item.second.span); });
-                    s_index_chunk = stream.span.chunk_id;
-                    s_last_idx_entry = nullptr;
-                    s_idx_mru.fill({});
+                copy_swapped_indices(stage.data, mem + idx_guest_addr, count, is_u32);
+            if (stage.chunk_id && s_index_chunk != stage.chunk_id) {
+                // Ring spans share the upload ring's lifetime; DEVICE_LOCAL
+                // index buffers persist across ring wraps until overwritten or evicted.
+                std::erase_if(s_index_spans, [](const auto& item) {
+                    return !item.second.device_local && !gx2vk::span_resident(item.second.span);
+                });
+                s_index_chunk = stage.chunk_id;
+                s_last_idx_entry = nullptr;
+                s_idx_mru.fill({});
+            }
+            // Static index buffers (uploaded once or twice, 1 KiB..16 MiB) are
+            // promoted to pure DEVICE_LOCAL VRAM via the submission prologue so
+            // indexed draws read GDDR instead of PCIe upload memory and survive
+            // upload-ring wraps without re-uploading. RBREW_IBO_VRAM=0 disables.
+            static const bool s_ibo_vram = [] {
+                const char* v = std::getenv("RBREW_IBO_VRAM");
+                return !(v && v[0] == '0');
+            }();
+            bool want_vram = s_ibo_vram && idx_bytes >= 1024 && idx_bytes <= (16u << 20) && next_rewrites <= 2;
+#ifndef RBREW_DISABLE_LOGGING
+            if (cache_verify_enabled()) want_vram = false;
+#endif
+            if (want_vram) {
+                const auto& limits = vertex_cache_limits();
+                const size_t max_entries = std::min<size_t>(limits.entries, 65536);
+                const uint64_t max_vram_bytes = std::min<uint64_t>(limits.bytes / 4, 256ull << 20);
+                if (s_index_spans.size() >= max_entries || s_index_vram_bytes > max_vram_bytes) {
+                    constexpr size_t kEvictBuckets = 2048;
+                    const size_t buckets = s_index_spans.bucket_count();
+                    s_index_stale.clear();
+                    for (size_t n = 0; n < kEvictBuckets && n < buckets; ++n) {
+                        const size_t bucket = s_index_evict_bucket++ % buckets;
+                        for (auto it = s_index_spans.begin(bucket); it != s_index_spans.end(bucket); ++it) {
+                            if (it->second.device_local && it->second.last_use + 16384 < s_index_clock &&
+                                !(it->first == key)) {
+                                s_index_stale.push_back(it->first);
+                            }
+                        }
+                    }
+                    if (!s_index_stale.empty()) {
+                        for (const auto& stale : s_index_stale) {
+                            auto it = s_index_spans.find(stale);
+                            if (it != s_index_spans.end()) {
+                                if (it->second.vram_buffer.buffer) s_index_vram_bytes -= it->second.vram_size;
+                                gx2vk::destroy_buffer(it->second.vram_buffer);
+                                s_index_spans.erase(it);
+                            }
+                        }
+                        s_last_idx_entry = nullptr;
+                        s_idx_mru.fill({});
+                    }
                 }
-                auto& inserted_idx = s_index_spans[key];
-                inserted_idx = {stream.span, written, content, epoch};
+            }
+            if (want_vram || stage.chunk_id) {
+                auto& entry = s_index_spans[key];
+                bool promoted = false;
+                if (want_vram) {
+                    const bool busy = entry.vram_buffer.buffer &&
+                                      (entry.last_serial > gx2vk::known_completed_serial() ||
+                                       gx2interp::replay_may_read(entry.last_serial));
+                    if (!entry.vram_buffer.buffer || !entry.device_local || entry.vram_size != idx_bytes || busy) {
+                        if (entry.vram_buffer.buffer) {
+                            s_index_vram_bytes -= entry.vram_size;
+                            gx2vk::destroy_buffer(entry.vram_buffer);
+                            entry.vram_size = 0;
+                        }
+                        entry.vram_buffer = gx2vk::create_buffer(
+                            idx_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            gx2vk::MemoryUse::DeviceLocal);
+                        entry.device_local = entry.vram_buffer.buffer != VK_NULL_HANDLE;
+                        if (entry.device_local) {
+                            entry.vram_size = idx_bytes;
+                            s_index_vram_bytes += idx_bytes;
+                        }
+                    }
+                    if (entry.device_local) {
+                        gx2vk::stage_buffer_copy(stage.buffer, stage.offset, entry.vram_buffer.buffer, 0, idx_bytes);
+                        entry.span = {};
+                        entry.written = written;
+                        entry.hash = content;
+                        entry.epoch = epoch;
+                        entry.rewrites = next_rewrites;
+                        entry.last_use = ++s_index_clock;
+                        entry.last_serial = gx2vk::recording_serial();
+                        stream.span = {};
+                        stream.span.buffer = entry.vram_buffer.buffer;
+                        stream.span.offset = 0;
+                        stream.span.size = idx_bytes;
+                        promoted = true;
+                    }
+                }
+                if (!promoted) {
+                    if (entry.vram_buffer.buffer) {
+                        s_index_vram_bytes -= entry.vram_size;
+                        gx2vk::destroy_buffer(entry.vram_buffer);
+                        entry.vram_size = 0;
+                        entry.device_local = false;
+                    }
+                    stream.span = stage;
+                    if (stage.chunk_id) {
+                        entry.span = stage;
+                        entry.written = written;
+                        entry.hash = content;
+                        entry.epoch = epoch;
+                        entry.rewrites = next_rewrites;
+                        entry.last_use = ++s_index_clock;
+                    }
+                }
                 s_last_idx_key = key;
-                s_last_idx_entry = &inserted_idx;
-                s_idx_mru[mru_idx] = {key, &inserted_idx};
+                s_last_idx_entry = &entry;
+                s_idx_mru[mru_idx] = {key, &entry};
+            } else {
+                stream.span = stage;
             }
         }
         index_scope.stop();
@@ -6798,6 +7092,8 @@ void gx2r::shutdown_draw_state() {
     for (auto& [key, program] : s_prog_by_source) release_program_layouts(*program);
     s_prog_mru.fill({});
     s_prog_cache.clear();
+    s_pending_translations.clear();
+    s_last_async_translate_skip = false;
     s_prog_by_source.clear();
     s_exact_reads.clear();
     s_exact_key_memos.clear();
@@ -6844,8 +7140,13 @@ void gx2r::shutdown_draw_state() {
     s_last_vbo_key = 0;
     s_last_vbo_ptr = nullptr;
     s_vbo_mru.fill({});
+    for (auto& [key, idx] : s_index_spans) gx2vk::destroy_buffer(idx.vram_buffer);
     s_index_spans.clear();
     s_index_chunk = 0;
+    s_index_clock = 0;
+    s_index_vram_bytes = 0;
+    s_index_evict_bucket = 0;
+    s_index_stale.clear();
     s_last_idx_key = {};
     s_last_idx_entry = nullptr;
     s_idx_mru.fill({});

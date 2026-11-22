@@ -16,6 +16,7 @@
 #include "runtime/discord_rpc.h"
 #include "runtime/splatoon_diagnostics.h"
 #include "runtime/port_settings.h"
+#include "hooks/fast_guest_hooks.h"
 #include "os/erreula/erreula.h"
 #include "os/coreinit/coreinit_overlay.h"
 #include "os/coreinit/coreinit_system_settings.h"
@@ -543,6 +544,7 @@ int main(int argc, char** argv) {
     branch_tables_install(&cpu_reg); // link branch-table case blocks (see hooks/branch_tables.cpp)
     broadcast_guard_install();       // 0285C3D0 broadcast loop guard
     player_anim_register();
+    fast_guest_hooks_register();
     trace_hooks_register();
     pia_trace_install(&cpu_reg);
     gx2env::register_hooks(); // game camera hooks (hooks/gx2_camera_hooks.h)

@@ -229,6 +229,7 @@ add_library(gambit_runtime STATIC
     hooks/gx2_camera_hooks.cpp
     hooks/mouse_aim.cpp
     hooks/player_anim.cpp
+    hooks/fast_guest_hooks.cpp
     hooks/branch_tables.cpp
     hooks/broadcast_guard.cpp
     hooks/trace_hooks.cpp
@@ -264,14 +265,13 @@ if(HYPER_OPTIMIZE)
     message(STATUS "HYPER_OPTIMIZE enabled: zero-check guest memory, aggressive inlining")
 endif()
 # RBREW_FAST_LINK: same optimized guest code (zero-check memory, /O2, AVX2), but
-# without /GL and /LTCG. Code generation then runs in every cl.exe job in
-# parallel instead of in one mostly sequential LTCG link, and a change to one
-# file no longer regenerates the whole program. Use it to iterate; keep it OFF
-# for a release build.
-option(RBREW_FAST_LINK "Skip /GL and /LTCG (fast parallel build, quick relinks)" OFF)
+# without /GL on gambit_generated so generated parts compile in parallel and a
+# single runtime edit relinks quickly (~15-20 s). Host runtime IPO
+# (RBREW_RUNTIME_IPO, default ON) stays independent so gambit_runtime and
+# cemu_shader still get /GL+/LTCG unless explicitly turned OFF.
+option(RBREW_FAST_LINK "Skip /GL on gambit_generated (fast parallel build, quick relinks)" OFF)
 if(RBREW_FAST_LINK)
-    message(STATUS "RBREW_FAST_LINK enabled: no /GL or /LTCG, runtime IPO disabled")
-    set(RBREW_RUNTIME_IPO OFF CACHE BOOL "Enable MSVC Release interprocedural optimization of the host runtime" FORCE)
+    message(STATUS "RBREW_FAST_LINK enabled: no /GL on gambit_generated (RBREW_RUNTIME_IPO remains independent)")
 endif()
 rbrew_gx2_backend(gambit_runtime PUBLIC)
 
@@ -456,7 +456,7 @@ if(MSVC)
             target_link_options(Gambit PRIVATE /LTCG)
         endif()
     endif()
-    target_compile_options(gambit_runtime PRIVATE /utf-8 /MP)
+    target_compile_options(gambit_runtime PRIVATE /utf-8 /MP "$<$<CONFIG:Release>:/arch:AVX2>")
 endif()
 
 # Optimize host-runtime boundaries without recompiling the large generated
@@ -574,7 +574,7 @@ if(RBREW_BUILD_TESTS)
         target_compile_definitions(gambit_guest_bench PRIVATE RBREW_HYPER_OPTIMIZE=1)
     endif()
     if(MSVC)
-        target_compile_options(gambit_guest_bench PRIVATE /Zc:tlsGuards-) # as the Gambit target
+        target_compile_options(gambit_guest_bench PRIVATE /Zc:tlsGuards- "$<$<CONFIG:Release>:/arch:AVX2>") # as the Gambit target
     endif()
     foreach(case npc_1 npc_10 npc_25 npc_50 npc_100 paired_equivalence psq_equivalence)
         add_test(NAME guest_${case} COMMAND gambit_guest_bench ${case})

@@ -92,6 +92,10 @@ void RecordFrame(uint32_t frame_index, float frame_time_ms, float cpu_time_ms, f
                  float vsync_wait_ms, float render_wait_ms, uint16_t draw_calls, uint16_t shader_compiles,
                  uint16_t texture_uploads, uint8_t screen_mode);
 
+// Lock-free per-frame spike-attribution counters (sampled & reset inside RecordFrame)
+void NoteShaderCompile(uint32_t count = 1);
+void NoteTextureUpload(uint32_t count = 1);
+
 // Fast path - thread-safe, non-blocking, zero allocation event recorder
 void RecordEvent(EventCategory category, EventSeverity severity, int16_t code, const char* message);
 
