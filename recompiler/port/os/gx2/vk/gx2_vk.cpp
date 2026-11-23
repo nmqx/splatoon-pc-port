@@ -2409,8 +2409,8 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
     // Keep chunk size 32 MiB and reclaim threshold > 8 so multi-chunk residency
     // contracts hold (upload chunks already route to shared system RAM via
     // s_prefer_shared_upload on low-VRAM iGPUs); trim burst chunks tighter.
-    const size_t trim_high = s_caps.low_vram_igpu ? 12u : 16u;
-    const size_t trim_target = s_caps.low_vram_igpu ? 8u : 12u;
+    const size_t trim_high = s_caps.low_vram_igpu ? 12u : 24u;
+    const size_t trim_target = s_caps.low_vram_igpu ? 8u : 16u;
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (s_active_chunk >= 0) {
             auto& chunk = s_chunks[s_active_chunk];
