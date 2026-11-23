@@ -692,11 +692,21 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
     dispatch(s_skyview, sv, p, 192 / 8, 216 / 8, 1, &s_sv_lut);
     s_skyview_ready = true;
     const int quality = std::clamp(f.settings.shader_quality, 1, 3);
-    const uint32_t dw = quality == 1 ? 1024 : quality == 2 ? 2048 : 4096;
-    const uint32_t grid = quality >= 3 ? 8 : 4;
-    if (quality != s_dome_quality || !s_dome) {
-        if (!make_image(s_dome, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dw / 4, 1, kStorageSampled))
+    const uint32_t max_dw = gx2vk::caps().low_vram_igpu ? 2048u : 4096u;
+    const uint32_t dw = std::min(quality == 1 ? 1024u : quality == 2 ? 2048u : 4096u, max_dw);
+    const uint32_t dh = dw / 4;
+    const uint32_t grid = quality >= 3 ? 8u : 4u;
+    if (quality != s_dome_quality || !s_dome || s_dome.desc.width != dw || s_dome.desc.height != dh) {
+        if (!make_image(s_dome, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, 1,
+                        kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
             return;
+        // Clear all texels to clear sky (0 scattered radiance, 1 transmittance) so
+        // interleaved phases never sample uninitialized/recycled VRAM.
+        gx2vk::barrier_for(gx2vk::kSyncTransfer);
+        const VkClearColorValue clear_dome{{0.0f, 0.0f, 0.0f, 1.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(gx2vk::cmd(), s_dome.image, VK_IMAGE_LAYOUT_GENERAL, &clear_dome, 1, &range);
+        gx2vk::note_gpu_write(s_dome, gx2vk::kSyncTransfer);
         s_dome_quality = quality;
         s_dome_frames = 0;
         fill(p, f, w, h);
@@ -708,7 +718,7 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
     d.images[kShape] = &s_shape;
     d.images[kDetail] = &s_detail;
     d.images[kDomeImage] = &s_dome;
-    dispatch(s_dome_pass, d, p, (dw / grid + 7) / 8, (dw / 4 / grid + 7) / 8, 1, &s_dome);
+    dispatch(s_dome_pass, d, p, (dw / grid + 7) / 8, (dh / grid + 7) / 8, 1, &s_dome);
     ++s_dome_frames;
 }
 

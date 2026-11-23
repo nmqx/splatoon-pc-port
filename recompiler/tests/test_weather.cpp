@@ -616,6 +616,308 @@ void main(){
                     std::abs(half(optics[7][0]) - .39685) < .002,
                 "shadow, highlight or gamma tools did not match their controls");
         vkDestroyPipeline(device, cloud_pipeline, nullptr);
+        const auto exposed_nan_module =
+            gx2vk::shader_module(VK_SHADER_STAGE_COMPUTE_BIT, std::string(gx2weather::kCommon) + R"glsl(
+layout(local_size_x=8,local_size_y=1) in;
+layout(binding=10,rgba16f) uniform writeonly image2D outImage;
+void main(){
+    uint i=gl_GlobalInvocationID.x;if(i>=8)return;
+    float pinf=uintBitsToFloat(0x7f800000u);
+    float ninf=uintBitsToFloat(0xff800000u);
+    float qnan=uintBitsToFloat(0x7fc00000u);
+    vec3 c=vec3(0.0);
+    if(i==0)c=exposedCloud(vec3(pinf),1.0);
+    else if(i==1)c=exposedCloud(vec3(qnan),1.0);
+    else if(i==2)c=exposedCloud(vec3(ninf),1.0);
+    else if(i==3)c=exposedCloud(vec3(-10.0,-5.0,-1.0),2.0);
+    else if(i==4)c=exposedCloud(vec3(100.0,50.0,25.0),pinf);
+    else if(i==5)c=exposedCloud(vec3(100.0,50.0,25.0),-2.0);
+    else if(i==6)c=exposedCloud(vec3(10.0,pinf,5.0),1.0);
+    else c=exposedCloud(vec3(1e38,5e37,2.5e37),1.0);
+    imageStore(outImage,ivec2(i,0),vec4(c,1.0));
+})glsl");
+        require(exposed_nan_module != VK_NULL_HANDLE, "exposedCloud NaN-guard probe compilation failed");
+        ci.stage.module = exposed_nan_module;
+        VkPipeline exposed_nan_pipeline;
+        require(vkCreateComputePipelines(device, gx2vk::pipeline_cache(), 1, &ci, nullptr, &exposed_nan_pipeline) ==
+                    VK_SUCCESS,
+                "exposedCloud NaN-guard probe pipeline failed");
+        gx2vk::barrier_if_dirty();
+        vkCmdBindPipeline(gx2vk::cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, exposed_nan_pipeline);
+        vkCmdBindDescriptorSets(gx2vk::cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        vkCmdDispatch(gx2vk::cmd(), 1, 1, 1);
+        gx2vk::note_gpu_write(output);
+        std::vector<uint8_t> nan_raw;
+        require(gx2vk::read_image(output, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 73, 41, nan_raw),
+                "exposedCloud NaN-guard readback failed");
+        uint16_t nan_out[8][4];
+        std::memcpy(nan_out, nan_raw.data(), sizeof nan_out);
+        for (unsigned i = 0; i < 8; ++i)
+            for (unsigned ch = 0; ch < 3; ++ch) {
+                require(nan_out[i][ch] < 0x7c00, "exposedCloud produced non-finite or negative output");
+                if (i < 7) require(nan_out[i][ch] == 0, "exposedCloud failed to zero non-finite/negative input");
+            }
+        require(nan_out[7][0] > 0 && nan_out[7][0] < 0x7c00, "exposedCloud rejected huge finite radiance");
+        vkDestroyPipeline(device, exposed_nan_pipeline, nullptr);
+        const auto ao_module = gx2vk::shader_module(
+            VK_SHADER_STAGE_COMPUTE_BIT, std::string(gx2weather::kCommon) + gx2weather::kAmbientOcclusion);
+        require(ao_module != VK_NULL_HANDLE, "AO shader compilation failed");
+        ci.stage.module = ao_module;
+        VkPipeline ao_pipeline;
+        require(vkCreateComputePipelines(device, gx2vk::pipeline_cache(), 1, &ci, nullptr, &ao_pipeline) == VK_SUCCESS,
+                "AO shader pipeline failed");
+        for (unsigned degenerate = 0; degenerate < 2; ++degenerate) {
+            gx2vk::barrier_if_dirty();
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            const VkClearDepthStencilValue z{0.5f, 0};
+            vkCmdClearDepthStencilImage(gx2vk::cmd(), depth.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
+            gx2vk::note_gpu_write(depth);
+            gx2weather::WeatherParams ap{};
+            ap.cam0[0] = ap.cam1[1] = ap.cam2[2] = 1.f;
+            // degenerate==1 sets near=0 so viewDistance(0.5)==0 and cross(dx, dy)==0 at every pixel.
+            ap.proj[0] = ap.proj[1] = 1.f;
+            ap.proj[2] = degenerate ? 0.f : 2.f;
+            ap.proj[3] = 20000.f;
+            ap.depth_range[0] = 0.f;
+            ap.depth_range[1] = 1.f;
+            ap.exposure[3] = 3.f;
+            const auto u = gx2vk::upload(
+                sizeof ap, std::max<VkDeviceSize>(16, gx2vk::caps().limits.minUniformBufferOffsetAlignment));
+            require(u.data != nullptr, "AO test uniform upload failed");
+            std::memcpy(u.data, &ap, sizeof ap);
+            const VkDescriptorBufferInfo buf{u.buffer, u.offset, sizeof ap};
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = set;
+            w.dstBinding = 0;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            w.pBufferInfo = &buf;
+            vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+            gx2vk::barrier_if_dirty();
+            vkCmdBindPipeline(gx2vk::cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, ao_pipeline);
+            vkCmdBindDescriptorSets(gx2vk::cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+            vkCmdDispatch(gx2vk::cmd(), 10, 6, 1);
+            gx2vk::note_gpu_write(output);
+            std::vector<uint8_t> ao_raw;
+            require(gx2vk::read_image(output, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 73, 41, ao_raw),
+                    "AO test readback failed");
+            for (size_t i = 0; i < ao_raw.size(); i += 8) {
+                uint16_t px[4];
+                std::memcpy(px, ao_raw.data() + i, 8);
+                require(px[0] <= 0x3c00, "AO produced NaN, Inf or out-of-range visibility");
+                require(px[1] < 0x7c00, "AO produced non-finite or negative view depth");
+                if (!degenerate) require(px[1] > 0, "AO normal depth missing positive view depth");
+            }
+        }
+        vkDestroyPipeline(device, ao_pipeline, nullptr);
+        {
+            auto sky_out = make(VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 16, 16);
+            auto sky_dome = make(VK_FORMAT_R16G16B16A16_SFLOAT, 0, 4, 4);
+            auto lut2d = make(VK_FORMAT_R16G16B16A16_SFLOAT, 0, 1, 1);
+            gx2vk::Image noise3d;
+            {
+                gx2vk::ImageDesc nd;
+                nd.type = VK_IMAGE_TYPE_3D;
+                nd.format = VK_FORMAT_R8G8B8A8_UNORM;
+                nd.width = nd.height = nd.depth = 1;
+                nd.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                require(gx2vk::create_image(noise3d, nd), "sky test 3D noise creation failed");
+            }
+            {
+                // Populate cloudDome with +Inf, NaN, -Inf and normal texels.
+                std::vector<uint16_t> dome_px(4 * 4 * 4, 0x3c00);
+                const uint16_t bad[4] = {0x7c00, 0x7e00, 0xfc00, 0x3800};
+                for (unsigned i = 0; i < 16; ++i) {
+                    dome_px[i * 4 + 0] = bad[i & 3];
+                    dome_px[i * 4 + 1] = bad[(i + 1) & 3];
+                    dome_px[i * 4 + 2] = bad[(i + 2) & 3];
+                    dome_px[i * 4 + 3] = (i & 1) ? 0x7e00 : 0x3c00;
+                }
+                const auto span = gx2vk::upload(dome_px.size() * 2, 16);
+                require(span.data != nullptr, "sky test dome upload failed");
+                std::memcpy(span.data, dome_px.data(), dome_px.size() * 2);
+                VkBufferImageCopy copy{};
+                copy.bufferOffset = span.offset;
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageExtent = {4, 4, 1};
+                gx2vk::barrier_if_dirty();
+                vkCmdCopyBufferToImage(gx2vk::cmd(), span.buffer, sky_dome.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+                const VkClearColorValue half_clear{{0.5f, 0.5f, 0.5f, 1.0f}};
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdClearColorImage(gx2vk::cmd(), lut2d.image, VK_IMAGE_LAYOUT_GENERAL, &half_clear, 1, &range);
+                vkCmdClearColorImage(gx2vk::cmd(), noise3d.image, VK_IMAGE_LAYOUT_GENERAL, &half_clear, 1, &range);
+                gx2vk::note_gpu_write(sky_dome);
+                gx2vk::note_gpu_write(lut2d);
+                gx2vk::note_gpu_write(noise3d);
+            }
+            const VkDescriptorSetLayoutBinding sky_bindings[] = {
+                {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                {6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+            VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            sli.bindingCount = 5;
+            sli.pBindings = sky_bindings;
+            VkDescriptorSetLayout sky_set_layout;
+            require(vkCreateDescriptorSetLayout(device, &sli, nullptr, &sky_set_layout) == VK_SUCCESS,
+                    "sky test descriptor layout failed");
+            VkPipelineLayoutCreateInfo spli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            spli.setLayoutCount = 1;
+            spli.pSetLayouts = &sky_set_layout;
+            VkPipelineLayout sky_layout;
+            require(vkCreatePipelineLayout(device, &spli, nullptr, &sky_layout) == VK_SUCCESS,
+                    "sky test pipeline layout failed");
+            const VkDescriptorPoolSize sky_sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+                                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}};
+            VkDescriptorPoolCreateInfo spi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            spi.maxSets = 1;
+            spi.poolSizeCount = 2;
+            spi.pPoolSizes = sky_sizes;
+            VkDescriptorPool sky_pool;
+            require(vkCreateDescriptorPool(device, &spi, nullptr, &sky_pool) == VK_SUCCESS,
+                    "sky test descriptor pool failed");
+            VkDescriptorSetAllocateInfo sai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            sai.descriptorPool = sky_pool;
+            sai.descriptorSetCount = 1;
+            sai.pSetLayouts = &sky_set_layout;
+            VkDescriptorSet sky_set;
+            require(vkAllocateDescriptorSets(device, &sai, &sky_set) == VK_SUCCESS, "sky test set allocation failed");
+            const auto vs = gx2vk::shader_module(VK_SHADER_STAGE_VERTEX_BIT,
+                                                 std::string(gx2weather::kCommon) + gx2weather::kSkyVertex);
+            const auto fs = gx2vk::shader_module(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                 std::string(gx2weather::kCommon) + gx2weather::kSkyFragment);
+            require(vs != VK_NULL_HANDLE && fs != VK_NULL_HANDLE, "sky shader compilation failed");
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
+                         vs, "main", nullptr};
+            stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
+                         fs, "main", nullptr};
+            VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            const VkViewport vp{0, 0, 16.f, 16.f, 0.f, 1.f};
+            const VkRect2D sc{{0, 0}, {16, 16}};
+            VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            vps.viewportCount = 1;
+            vps.pViewports = &vp;
+            vps.scissorCount = 1;
+            vps.pScissors = &sc;
+            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_NONE;
+            rs.lineWidth = 1.f;
+            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            VkPipelineColorBlendAttachmentState cba{};
+            cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                                 VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            cbs.attachmentCount = 1;
+            cbs.pAttachments = &cba;
+            const VkFormat sky_fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+            VkPipelineRenderingCreateInfo pri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+            pri.colorAttachmentCount = 1;
+            pri.pColorAttachmentFormats = &sky_fmt;
+            VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            gpci.pNext = &pri;
+            gpci.stageCount = 2;
+            gpci.pStages = stages;
+            gpci.pVertexInputState = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState = &vps;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState = &ms;
+            gpci.pDepthStencilState = &ds;
+            gpci.pColorBlendState = &cbs;
+            gpci.layout = sky_layout;
+            VkPipeline sky_pipe;
+            require(vkCreateGraphicsPipelines(device, gx2vk::pipeline_cache(), 1, &gpci, nullptr, &sky_pipe) ==
+                        VK_SUCCESS,
+                    "sky zenith moon pipeline failed");
+            gx2weather::WeatherParams sp{};
+            // Camera looking straight up at zenith (0, 1, 0) where the moon sits.
+            sp.cam0[0] = 1.f;
+            sp.cam1[2] = -1.f;
+            sp.cam2[1] = 1.f;
+            sp.proj[0] = sp.proj[1] = 100.f;
+            sp.proj[2] = 1.f;
+            sp.proj[3] = 1000.f;
+            sp.target[0] = sp.target[1] = 16.f;
+            sp.target[2] = sp.target[3] = 1.f / 16.f;
+            sp.moon[1] = 1.f;
+            sp.moon[3] = 0.0011f;
+            sp.sun[0] = 0.98f;
+            sp.sun[1] = -0.15f;
+            sp.pole[1] = 1.f;
+            sp.exposure[0] = 7.5f;
+            sp.exposure[1] = 0.07f;
+            sp.exposure[3] = 3.f;
+            sp.wind[3] = 1.f;
+            const auto su = gx2vk::upload(
+                sizeof sp, std::max<VkDeviceSize>(16, gx2vk::caps().limits.minUniformBufferOffsetAlignment));
+            require(su.data != nullptr, "sky test uniform upload failed");
+            std::memcpy(su.data, &sp, sizeof sp);
+            gx2vk::ViewDesc vd3;
+            vd3.type = VK_IMAGE_VIEW_TYPE_3D;
+            vd3.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            const VkDescriptorBufferInfo sbuf{su.buffer, su.offset, sizeof sp};
+            const VkDescriptorImageInfo simgs[] = {
+                {sampler, image_view(lut2d), VK_IMAGE_LAYOUT_GENERAL},
+                {sampler, image_view(lut2d), VK_IMAGE_LAYOUT_GENERAL},
+                {sampler, gx2vk::image_view(noise3d, vd3), VK_IMAGE_LAYOUT_GENERAL},
+                {sampler, image_view(sky_dome), VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet sw[5]{};
+            for (unsigned i = 0; i < 5; ++i) {
+                sw[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                sw[i].dstSet = sky_set;
+                sw[i].dstBinding = sky_bindings[i].binding;
+                sw[i].descriptorCount = 1;
+                sw[i].descriptorType = sky_bindings[i].descriptorType;
+                if (i == 0)
+                    sw[i].pBufferInfo = &sbuf;
+                else
+                    sw[i].pImageInfo = &simgs[i - 1];
+            }
+            vkUpdateDescriptorSets(device, 5, sw, 0, nullptr);
+            gx2vk::barrier_if_dirty();
+            VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            att.imageView = image_view(sky_out);
+            att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea.extent = {16, 16};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &att;
+            vkCmdBeginRendering(gx2vk::cmd(), &ri);
+            vkCmdBindPipeline(gx2vk::cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, sky_pipe);
+            vkCmdBindDescriptorSets(gx2vk::cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, sky_layout, 0, 1, &sky_set, 0,
+                                    nullptr);
+            vkCmdDraw(gx2vk::cmd(), 3, 1, 0, 0);
+            vkCmdEndRendering(gx2vk::cmd());
+            gx2vk::note_gpu_write(sky_out, gx2vk::kSyncColorDepth);
+            std::vector<uint8_t> sky_raw;
+            require(gx2vk::read_image(sky_out, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 16, 16, sky_raw),
+                    "sky zenith moon readback failed");
+            bool lit_center = false;
+            for (unsigned y = 0; y < 16; ++y)
+                for (unsigned x = 0; x < 16; ++x) {
+                    uint16_t px[4];
+                    std::memcpy(px, sky_raw.data() + (y * 16 + x) * 8, 8);
+                    for (unsigned ch = 0; ch < 3; ++ch)
+                        require(px[ch] < 0x7c00, "zenith moonDisc or non-finite cloudDome produced NaN/Inf/negative");
+                    if (x >= 7 && x <= 8 && y >= 7 && y <= 8 && px[0] > 0) lit_center = true;
+                }
+            require(lit_center, "zenith moonDisc did not render at zenith");
+            vkDestroyPipeline(device, sky_pipe, nullptr);
+            vkDestroyDescriptorPool(device, sky_pool, nullptr);
+            vkDestroyPipelineLayout(device, sky_layout, nullptr);
+            vkDestroyDescriptorSetLayout(device, sky_set_layout, nullptr);
+            for (auto* image : {&sky_out, &sky_dome, &lut2d, &noise3d}) gx2vk::destroy_image(*image);
+        }
         vkDestroyPipeline(device, pipeline, nullptr);
         vkDestroyDescriptorPool(device, pool, nullptr);
         vkDestroyPipelineLayout(device, layout, nullptr);
@@ -628,6 +930,7 @@ void main(){
         std::puts("wet GPU: stable world grain, distance filtering, flat puddles and bounded ripples passed");
         std::puts(
             "cloud optics GPU: self shadow, forward rim, hue-preserving shoulder and day/twilight/night stars passed");
+        std::puts("weather NaN-guard GPU: exposedCloud, kAmbientOcclusion collinear depth and zenith moonDisc passed");
     }
     const gx2weather::RoofTriangle ground[] = {{{-500, 0, -500}, {500, 0, -500}, {500, 0, 500}},
                                                {{-500, 0, -500}, {500, 0, 500}, {-500, 0, 500}}};
@@ -736,6 +1039,65 @@ void main(){
         }
         gx2vk::destroy_image(c);
         gx2vk::destroy_image(d);
+    }
+    // Regression: FXAA srcLuma must stay finite on negative signed-float HDR inputs next to bright edges.
+    {
+        std::vector<float> neg_edge(73 * 41 * 4);
+        for (unsigned row = 0; row < 41; ++row)
+            for (unsigned col = 0; col < 73; ++col) {
+                const size_t at = (row * 73 + col) * 4;
+                const bool neg = (col & 1u) != 0;
+                neg_edge[at + 0] = neg ? -0.5f : 0.9f;
+                neg_edge[at + 1] = neg ? -0.25f : 0.8f;
+                neg_edge[at + 2] = neg ? -0.1f : 0.7f;
+                neg_edge[at + 3] = 0.625f;
+            }
+        const auto span = gx2vk::upload(neg_edge.size() * sizeof(float), 16);
+        require(span.data != nullptr, "FXAA negative-input upload failed");
+        std::memcpy(span.data, neg_edge.data(), neg_edge.size() * sizeof(float));
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = span.offset;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {73, 41, 1};
+        gx2vk::barrier_if_dirty();
+        vkCmdCopyBufferToImage(gx2vk::cmd(), span.buffer, color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        const VkClearDepthStencilValue z{0.5f, 0};
+        vkCmdClearDepthStencilImage(gx2vk::cmd(), depth.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
+        gx2vk::note_gpu_write(color);
+        gx2vk::note_gpu_write(depth);
+        rbrew_settings::Values fxaa_v;
+        fxaa_v.shader_quality = 2;
+        fxaa_v.antialiasing = true;
+        fxaa_v.motion_blur = false;
+        fxaa_v.clouds = false;
+        fxaa_v.sun_rays = false;
+        fxaa_v.bloom = 0;
+        fxaa_v.film_look = false;
+        require(gx2weather::apply(color, depth, cam, fxaa_v, 0), "FXAA negative-input dispatch failed");
+        read();
+    }
+    // Regression: s_dome must be cleared to finite clear-sky (0,0,0,1) on creation and quality transitions so
+    // frame 0 of interleaved quality=3 (63/64ths unwritten) never leaks uninitialized VRAM into sky/fog/rays.
+    gx2vk::finish();
+    gx2weather::shutdown();
+    {
+        rbrew_settings::Values dome_v;
+        dome_v.day_cycle = false;
+        dome_v.clouds = true;
+        dome_v.sun_rays = true;
+        dome_v.fog = 100;
+        dome_v.antialiasing = true;
+        dome_v.realistic_look = true;
+        dome_v.bloom = 0;
+        dome_v.film_look = false;
+        dome_v.time_of_day = 720;
+        for (int q : {3, 1, 3, 2, 3}) {
+            reset(0.8f);
+            dome_v.shader_quality = q;
+            require(gx2weather::apply(color, depth, cam, dome_v, 0), "s_dome frame-0 init/resize dispatch failed");
+            read();
+        }
     }
     gx2vk::finish();
     gx2weather::shutdown();

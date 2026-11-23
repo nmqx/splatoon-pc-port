@@ -133,7 +133,9 @@ vec3 domeDirection(vec2 uv) {
 vec4 cloudsAt(vec3 d) {
     vec4 c = textureLod(cloudDome, domeUv(d), 0.0);
     float horizon = smoothstep(-0.03, 0.01, d.y);
-    return vec4(c.rgb * horizon, mix(1.0, c.a, horizon));
+    vec3 rgb = (any(isnan(c.rgb)) || any(isinf(c.rgb))) ? vec3(0.0) : max(c.rgb, vec3(0.0));
+    float a = (isnan(c.a) || isinf(c.a)) ? 1.0 : saturate(c.a);
+    return vec4(rgb * horizon, mix(1.0, a, horizon));
 }
 
 // Light reaching the clouds and the camera, before exposure.
@@ -180,9 +182,13 @@ float cloudScattering(float cosine,float opticalDepth,float extinction) {
     return scattered;
 }
 vec3 exposedCloud(vec3 radiance,float exposure) {
-    vec3 c=max(radiance*exposure,vec3(0));
+    vec3 c=radiance*exposure;
+    if(any(isnan(c)) || any(isinf(c))) return vec3(0.0);
+    c=max(c,vec3(0.0));
+    float lum=luminance(c);
+    if(isnan(lum) || isinf(lum)) return vec3(0.0);
     // Preserve colour ratios and structure before the game's highlight clipping.
-    return c/(1.0+luminance(c)*.12);
+    return c/(1.0+lum*.12);
 }
 float starVisibility(float sunHeight,float skyBrightness) {
     return (1.0-smoothstep(-.20,-.035,sunHeight))*(1.0-saturate(skyBrightness*12.0));
@@ -636,12 +642,16 @@ vec3 moonDisc(vec3 d, float pixel) {
     float visible = smoothstep(-0.03, 0.02, m.y);
     vec3 halo = vec3(0.75, 0.82, 1.0) * (exp(-dist * 70.0) * 0.06 + exp(-dist * 14.0) * 0.012) * visible;
     if (dist > radius * 1.5) return halo;
-    vec3 tx = normalize(cross(m, vec3(0.0, 1.0, 0.0))), ty = cross(tx, m);
+    vec3 rawTx = cross(m, vec3(0.0, 1.0, 0.0));
+    if (dot(rawTx, rawTx) <= 1e-12) rawTx = cross(m, vec3(1.0, 0.0, 0.0));
+    vec3 tx = dot(rawTx, rawTx) > 1e-12 ? normalize(rawTx) : vec3(1.0, 0.0, 0.0), ty = cross(tx, m);
     vec2 xy = vec2(dot(d - m, tx), dot(d - m, ty)) / radius;
     float rr = dot(xy, xy);
-    float edge = 1.0 - smoothstep(1.0 - pixel / radius * 1.5, 1.0, sqrt(rr));
+    float edge = 1.0 - smoothstep(1.0 - max(pixel, 1e-6) / radius * 1.5, 1.0, sqrt(rr));
     vec3 n = normalize(xy.x * tx + xy.y * ty + sqrt(max(1.0 - rr, 0.0)) * m);
-    float lit = saturate(dot(n, normalize(p.sun.xyz - m * 0.02)) * 1.4 + 0.03);
+    vec3 sunDir = p.sun.xyz - m * 0.02;
+    sunDir = dot(sunDir, sunDir) > 1e-12 ? normalize(sunDir) : vec3(0.0, 1.0, 0.0);
+    float lit = saturate(dot(n, sunDir) * 1.4 + 0.03);
     float maria = 0.68 + 0.32 * smoothstep(0.3, 0.7, textureLod(detailNoise, vec3(xy * 0.22 + 0.5, 0.4), 0.0).r);
     return vec3(1.0, 0.97, 0.92) * lit * maria * edge * .65 * visible + halo*.35;
 }
@@ -821,7 +831,8 @@ void main() {
     vec3 py = viewPos(uv + vec2(0.0, texel.y)), ny = viewPos(uv - vec2(0.0, texel.y));
     vec3 dx = abs(px.z - P.z) < abs(nx.z - P.z) ? px - P : P - nx;
     vec3 dy = abs(py.z - P.z) < abs(ny.z - P.z) ? py - P : P - ny;
-    vec3 N = normalize(cross(dx, dy));
+    vec3 N = cross(dx, dy);
+    N = dot(N, N) > 1e-12 ? normalize(N) : vec3(0.0, 0.0, 1.0);
     if (dot(N, -P) < 0.0) N = -N;
     const float radius = 9.0;                         // game units (an Inkling is ~16)
     float screenRadius = clamp(radius * p.proj.y / max(-P.z, 1.0) * 0.5, 3.0 * texel.y, 0.12);
@@ -844,7 +855,11 @@ void main() {
         occlusion += best;
     }
     float visibility = pow(saturate(1.0 - occlusion / float(dirs)), 1.6);
-    imageStore(outImage, id, vec4(visibility, -P.z, 0.0, 1.0));
+    vec4 outAo = vec4(visibility, -P.z, 0.0, 1.0);
+    if (isnan(outAo.r) || isinf(outAo.r)) outAo.r = 1.0;
+    outAo.r = saturate(outAo.r);
+    outAo.g = (isnan(outAo.g) || isinf(outAo.g)) ? 0.0 : clamp(outAo.g, 0.0, 65504.0);
+    imageStore(outImage, id, outAo);
 }
 )glsl";
 
@@ -1117,7 +1132,10 @@ vec2 rippleNormal(vec2 xz, float t) {
 )glsl"
                                           R"glsl(
 vec3 srcColor(vec2 uv) { return textureLod(sceneColor, uv, 0.0).rgb; }
-float srcLuma(vec2 uv) { return sqrt(luminance(srcColor(uv))); }
+float srcLuma(vec2 uv) {
+    float l = luminance(srcColor(uv));
+    return (isnan(l) || isinf(l)) ? 0.0 : sqrt(max(l, 0.0));
+}
 // FXAA 3.11 (Lottes), quality search along the edge.
 vec3 fxaa(vec2 uv, vec2 px) {
     float lM = srcLuma(uv), lN = srcLuma(uv + vec2(0.0, -px.y)), lS = srcLuma(uv + vec2(0.0, px.y));
