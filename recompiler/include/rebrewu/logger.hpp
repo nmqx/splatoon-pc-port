@@ -12,8 +12,9 @@
 // fatal, off); the default keeps every message, like the old printf
 // diagnostics did.
 //
-// Builds with RBREW_DISABLE_LOGGING compile every call out, including its
-// arguments.
+// Builds with RBREW_DISABLE_LOGGING compile out verbose calls (Debug, Info,
+// Warning, Raw, Stream) including their arguments, while preserving Error and
+// Fatal calls so critical Vulkan, shader, and OOM failures remain visible.
 
 #include <cstdarg>
 #include <cstdio>
@@ -242,13 +243,13 @@ struct NullLine {
 #define RBREW_LOG_DEBUG(...) ((void)0)
 #define RBREW_LOG_INFO(...) ((void)0)
 #define RBREW_LOG_WARN(...) ((void)0)
-#define RBREW_LOG_ERROR(...) ((void)0)
-#define RBREW_LOG_FATAL(...) ((void)0)
+#define RBREW_LOG_ERROR(tag, ...) ::rbrew::log::write(::rbrew::log::Level::Error, tag, __VA_ARGS__)
+#define RBREW_LOG_FATAL(tag, ...) ::rbrew::log::write(::rbrew::log::Level::Fatal, tag, __VA_ARGS__)
 #define RBREW_LOG_DEBUG_BEGIN(...) ((void)0)
 #define RBREW_LOG_INFO_BEGIN(...) ((void)0)
 #define RBREW_LOG_WARN_BEGIN(...) ((void)0)
-#define RBREW_LOG_ERROR_BEGIN(...) ((void)0)
-#define RBREW_LOG_FATAL_BEGIN(...) ((void)0)
+#define RBREW_LOG_ERROR_BEGIN(tag, ...) ::rbrew::log::write(::rbrew::log::Level::Error, tag, __VA_ARGS__)
+#define RBREW_LOG_FATAL_BEGIN(tag, ...) ::rbrew::log::write(::rbrew::log::Level::Fatal, tag, __VA_ARGS__)
 #define RBREW_LOG_RAW(...) ((void)0)
 #define RBREW_LOG_STREAM(level, tag) ::rbrew::log::NullLine()
 #else

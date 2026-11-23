@@ -3929,7 +3929,7 @@ void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext,
 	}
 
 	if( shader->shaderType == LatteConst::ShaderType::Vertex )
-		src->addFmt("uvec4 attrDecoder;" _CRLF);
+		src->addFmt("uvec4 attrDecoder = uvec4(0u);" _CRLF);
 	if (shaderContext->typeTracker.genIntReg)
 		src->addFmt("int backupReg0i, backupReg1i, backupReg2i, backupReg3i, backupReg4i;" _CRLF);
 	if (shaderContext->typeTracker.genFloatReg)
@@ -3959,11 +3959,11 @@ void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext,
 	{
 		src->addFmt("bool activeMaskStack[{}];" _CRLF, shaderContext->analyzer.activeStackMaxDepth+1);
 		src->addFmt("bool activeMaskStackC[{}];" _CRLF, shaderContext->analyzer.activeStackMaxDepth+2);
-		for (sint32 i = 0; i < shaderContext->analyzer.activeStackMaxDepth; i++)
+		for (sint32 i = 0; i < shaderContext->analyzer.activeStackMaxDepth + 1; i++)
 		{
 			src->addFmt("activeMaskStack[{}] = false;" _CRLF, i);
 		}
-		for (sint32 i = 0; i < shaderContext->analyzer.activeStackMaxDepth+1; i++)
+		for (sint32 i = 0; i < shaderContext->analyzer.activeStackMaxDepth + 2; i++)
 		{
 			src->addFmt("activeMaskStackC[{}] = false;" _CRLF, i);
 		}
@@ -3981,8 +3981,8 @@ void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext,
 	// helper variables for cube maps (todo: Only emit when used)
 	if (shaderContext->analyzer.hasRedcCUBE)
 	{
-		src->add("vec3 cubeMapSTM;" _CRLF);
-		src->add("int cubeMapFaceId;" _CRLF);
+		src->add("vec3 cubeMapSTM = vec3(0.0);" _CRLF);
+		src->add("int cubeMapFaceId = 0;" _CRLF);
 	}
 	for(sint32 i=0; i<LATTE_NUM_MAX_TEX_UNITS; i++)
 	{
