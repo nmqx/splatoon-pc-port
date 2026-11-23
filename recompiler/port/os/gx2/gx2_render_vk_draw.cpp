@@ -318,6 +318,11 @@ void gx2r::end_rendering() {
     }
     vkCmdEndRendering(cb);
     s_rendering = false;
+    // Invalidate descriptor tracking across dynamic rendering pass boundaries
+    // so the next pass pushes/binds a full descriptor set cleanly.
+    s_bindings.descriptor_layout = VK_NULL_HANDLE;
+    s_bindings.descriptor_set = VK_NULL_HANDLE;
+    s_bindings.is_push = false;
     gx2vk::note_gpu_write();
 }
 
@@ -554,79 +559,8 @@ static TexObject* shadow_depth_copy(const TexObject& source) {
     return &c.tex;
 }
 
-static VkComponentSwizzle swizzle_of(uint32_t sel) {
-    static const VkComponentSwizzle map[6] = {VK_COMPONENT_SWIZZLE_R,    VK_COMPONENT_SWIZZLE_G,
-                                              VK_COMPONENT_SWIZZLE_B,    VK_COMPONENT_SWIZZLE_A,
-                                              VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
-    return sel < 6 ? map[sel] : VK_COMPONENT_SWIZZLE_ZERO;
-}
-
-static VkFormat integer_view_format(VkFormat f, bool sint) {
-    switch (f) {
-    case VK_FORMAT_R8_UNORM: return sint ? VK_FORMAT_R8_SINT : VK_FORMAT_R8_UINT;
-    case VK_FORMAT_R8G8_UNORM: return sint ? VK_FORMAT_R8G8_SINT : VK_FORMAT_R8G8_UINT;
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_R8G8B8A8_SRGB: return sint ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UINT;
-    case VK_FORMAT_R16_SFLOAT: return sint ? VK_FORMAT_R16_SINT : VK_FORMAT_R16_UINT;
-    case VK_FORMAT_R16G16_SFLOAT: return sint ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16G16_UINT;
-    case VK_FORMAT_R16G16B16A16_SFLOAT: return sint ? VK_FORMAT_R16G16B16A16_SINT : VK_FORMAT_R16G16B16A16_UINT;
-    case VK_FORMAT_R32_SFLOAT: return sint ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_UINT;
-    case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT:
-    case VK_FORMAT_R32G32B32A32_SINT: return sint ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT;
-    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
-    default: return VK_FORMAT_UNDEFINED;
-    }
-}
-
 VkImageView gx2r::tex_object_view(TexObject& tex, uint32_t dim, bool integer_sampler, bool sint_sampler) {
-    const uint8_t flags = uint8_t((dim & 7u) | (integer_sampler ? 8u : 0u) | (sint_sampler ? 16u : 0u) |
-                                  (tex.integer ? 32u : 0u) | (tex.depth ? 64u : 0u));
-    const uint64_t img_serial = tex.image ? tex.image->image_serial : 0;
-    if (tex.cached_view != VK_NULL_HANDLE && img_serial != 0 && tex.cached_image_serial == img_serial &&
-        tex.cached_view_flags == flags && tex.cached_view_format == tex.view_format &&
-        tex.cached_swizzle == tex.swizzle && tex.cached_base_level == tex.params.base_level &&
-        tex.cached_max_level == tex.params.max_level && tex.cached_levels == tex.levels &&
-        tex.cached_layers == tex.layers) {
-        return tex.cached_view;
-    }
-    gx2vk::ViewDesc v;
-    v.type = dim == 1   ? VK_IMAGE_VIEW_TYPE_1D
-             : dim == 3 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-             : dim == 4 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
-             : dim == 5 ? VK_IMAGE_VIEW_TYPE_3D
-                        : VK_IMAGE_VIEW_TYPE_2D;
-    v.format = tex.view_format;
-    if (integer_sampler && !tex.integer)
-        v.format = integer_view_format(tex.view_format, sint_sampler);
-    else if (integer_sampler && tex.integer) {
-        // usampler vs isampler of a 128-bit integer target
-        if (sint_sampler && v.format == VK_FORMAT_R32G32B32A32_UINT) v.format = VK_FORMAT_R32G32B32A32_SINT;
-        if (!sint_sampler && v.format == VK_FORMAT_R32G32B32A32_SINT) v.format = VK_FORMAT_R32G32B32A32_UINT;
-    }
-    const uint32_t w4 = tex.swizzle;
-    v.swizzle = {swizzle_of((w4 >> 16) & 7), swizzle_of((w4 >> 19) & 7), swizzle_of((w4 >> 22) & 7),
-                 swizzle_of((w4 >> 25) & 7)};
-    const uint32_t base = std::min(tex.params.base_level, tex.levels ? tex.levels - 1 : 0);
-    const uint32_t last = std::min(tex.levels ? tex.levels - 1 : 0, tex.params.max_level);
-    v.base_level = base;
-    v.levels = last >= base ? last - base + 1 : 1;
-    v.base_layer = 0;
-    v.layers = v.type == VK_IMAGE_VIEW_TYPE_3D                                        ? 1
-               : (v.type == VK_IMAGE_VIEW_TYPE_2D || v.type == VK_IMAGE_VIEW_TYPE_1D) ? 1
-                                                                                      : std::max(1u, tex.layers);
-    if (tex.depth) v.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-    const VkImageView view = gx2vk::image_view(*tex.image, v);
-    tex.cached_view = view;
-    tex.cached_image_serial = img_serial;
-    tex.cached_view_format = tex.view_format;
-    tex.cached_swizzle = tex.swizzle;
-    tex.cached_base_level = tex.params.base_level;
-    tex.cached_max_level = tex.params.max_level;
-    tex.cached_levels = tex.levels;
-    tex.cached_layers = tex.layers;
-    tex.cached_view_flags = flags;
-    return view;
+    return tex_object_view(tex, dim, integer_sampler, sint_sampler, tex.swizzle);
 }
 
 static VkSamplerAddressMode vk_wrap(uint32_t wrap) {
@@ -750,8 +684,12 @@ template <class F> auto post_compile(F&& fn, bool background = false) {
     if (async_shader_compile()) {
         if (!s_compile_queue) {
             const unsigned cores = std::thread::hardware_concurrency();
-            s_compile_queue = std::make_unique<gx2vk::CompileQueue>(
-                std::clamp(cores > 2 ? cores - 2 : 1u, 1u, std::max(4u, cores > 2 ? cores - 2 : 1u)));
+            unsigned workers = cores > 2 ? cores - 2 : 1u;
+            // Cap parallel shader/pipeline compilation on AMD and low-VRAM iGPUs
+            // to avoid LLPC VkPipelineCache lock contention and memory spikes.
+            if (gx2vk::ready() && (gx2vk::caps().is_amd || gx2vk::caps().low_vram_igpu))
+                workers = std::min(workers, 4u);
+            s_compile_queue = std::make_unique<gx2vk::CompileQueue>(std::max(workers, 1u));
         }
         return s_compile_queue->post(std::move(task_fn), background);
     }
@@ -1008,6 +946,14 @@ void trace_program_key_miss(uint32_t vs, uint32_t ps, bool reused) {
 #endif
 }
 
+bool push_descriptors_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("RBREW_PUSH_DESCRIPTORS");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+
 bool create_program_layouts(Program& p, bool allow_push = true) {
     const auto& caps = gx2vk::caps();
     p.attribute_semantics.clear();
@@ -1051,7 +997,8 @@ bool create_program_layouts(Program& p, bool allow_push = true) {
                 bindings.push_back(
                     {uint32_t(vk.texture_bindings[t]), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, flags, nullptr});
     }
-    p.push = allow_push && caps.push_descriptor && bindings.size() <= caps.max_push_descriptors;
+    p.push = allow_push && push_descriptors_enabled() && caps.push_descriptor &&
+             bindings.size() <= caps.max_push_descriptors;
     // Like Cemu's Vulkan uniform streaming, separate changing ring offsets
     // from descriptor identity. Push descriptors cannot be dynamic; ordinary
     // sets use as many dynamic UBO bindings as this device actually supports.
@@ -2275,7 +2222,9 @@ Program* resolve_active_program(uint8_t* mem) {
     const std::vector<R700FetchAttribute>* fetch_attributes = nullptr;
     Gx2PerfScope key_scope(kPerfShaderKey);
     const unsigned primitive = S.regs[0x2256] & 31;
-    const uint32_t rect = primitive == 0x11 ? 1 : primitive == 0x13 || primitive == 0x14 ? 2 : 0;
+    // QUADS (0x13) and QUAD_STRIP (0x14) expand to TRIANGLE_LIST on CPU;
+    // only RECTS (0x11) still uses the r700_rect_geometry assembly GS.
+    const uint32_t rect = primitive == 0x11 ? 1 : 0;
     // Vulkan: a points program must write gl_PointSize (from uf_pointSize),
     // so point primitives are part of the translation identity here.
     const uint32_t points = primitive == 0x01;
@@ -3089,9 +3038,18 @@ static std::array<PipelineReqMru, 256> s_pipeline_req_mru{};
 VkPipeline get_pipeline(const PipelineRequest& r) {
     const PipelineSwitches s = pipeline_switches(*r.program);
     const uint64_t cur_epoch = s_last_pipeline_lookup.epoch();
+    uint32_t blend_hash = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        blend_hash ^= (uint32_t(r.blend[i].blendEnable) << i) ^
+                      ((uint32_t(r.blend[i].colorWriteMask) & 0xFu) << (8 + (i & 3) * 4));
+        if (r.blend[i].blendEnable)
+            blend_hash ^= (uint32_t(r.blend[i].srcColorBlendFactor) * 2654435761u) ^
+                          (uint32_t(r.blend[i].dstColorBlendFactor) << 5) ^ (uint32_t(r.blend[i].colorBlendOp) << 11) ^
+                          (uint32_t(r.blend[i].srcAlphaBlendFactor) << 15) ^
+                          (uint32_t(r.blend[i].dstAlphaBlendFactor) << 20);
+    }
     uint32_t ph = r.program->id * 2654435761u ^ (uint32_t(r.topology) * 2246822519u) ^ (uint32_t(r.colors[0]) << 5) ^
-                  (uint32_t(r.depth) << 11) ^ (uint32_t(r.blend[0].blendEnable) << 17) ^
-                  (uint32_t(r.blend[0].colorWriteMask) << 19) ^ (r.input.count << 23) ^ (uint32_t(s.discard) << 28) ^
+                  (uint32_t(r.depth) << 11) ^ blend_hash ^ (r.input.count << 23) ^ (uint32_t(s.discard) << 28) ^
                   (uint32_t(r.xfb) << 29);
     ph ^= ph >> 15;
     auto& mru = s_pipeline_req_mru[ph & (s_pipeline_req_mru.size() - 1)];
@@ -3454,7 +3412,7 @@ void warm_start() {
             if (rec[0] == kWarmProgram && rec[1] == sizeof(WarmProgramRecord)) {
                 WarmProgramRecord p;
                 std::memcpy(&p, data.data(), sizeof(p));
-                if (s_warm.programs.insert(p.key).second) programs.push_back(p);
+                if (p.rect != 2 && s_warm.programs.insert(p.key).second) programs.push_back(p);
             } else if (rec[0] == kWarmMasks && rec[1] == sizeof(WarmMasksRecord)) {
                 WarmMasksRecord m;
                 std::memcpy(&m, data.data(), sizeof(m));
@@ -3464,7 +3422,8 @@ void warm_start() {
             } else if (rec[0] == kWarmPipeline && rec[1] == sizeof(WarmPipelineRecord)) {
                 WarmPipelineRecord p;
                 std::memcpy(&p, data.data(), sizeof(p));
-                if (p.input.count <= 16 && p.ps_uint_mask <= 0xFF && p.ps_sint_mask <= 0xFF &&
+                if (p.topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY && p.input.count <= 16 &&
+                    p.ps_uint_mask <= 0xFF && p.ps_sint_mask <= 0xFF &&
                     s_warm.pipelines.insert(warm_hash(&p, sizeof(p))).second)
                     pipelines.push_back(p);
             }
@@ -3495,7 +3454,8 @@ void warm_start() {
     std::mutex warm_mutex;
     std::atomic<size_t> next_prog_idx{0};
     std::atomic<size_t> atomic_loaded{0}, atomic_linked{0}, atomic_visited{0};
-    const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 2u, 14u);
+    unsigned workers = std::clamp(std::thread::hardware_concurrency(), 2u, 14u);
+    if (gx2vk::ready() && (gx2vk::caps().is_amd || gx2vk::caps().low_vram_igpu)) workers = std::min(workers, 4u);
     std::vector<std::thread> warm_pool;
     for (unsigned w = 0; w < workers; ++w) {
         warm_pool.emplace_back([&] {
@@ -3681,7 +3641,7 @@ const VertexCacheLimits& vertex_cache_limits() {
 #ifdef RBREW_GX2_QUEUE_TESTS
     if (s_test_vertex_limits) return *s_test_vertex_limits;
 #endif
-    static const VertexCacheLimits limits = [] {
+    static const VertexCacheLimits default_limits = [] {
         const uint64_t ram = gx2_host_total_ram();
         const size_t entries = ram >= (24ull << 30) ? 262144 : ram >= (12ull << 30) ? 131072 : 65536;
         const uint64_t bytes = ram ? ram / 4 : (1ull << 30); // a quarter of physical RAM
@@ -3689,7 +3649,14 @@ const VertexCacheLimits& vertex_cache_limits() {
                        (unsigned long long)(bytes >> 20), (unsigned long long)(ram >> 20));
         return VertexCacheLimits{entries, entries / 2, bytes};
     }();
-    return limits;
+    static const VertexCacheLimits igpu_limits = [] {
+        const size_t entries = std::min<size_t>(default_limits.entries, 32768);
+        const uint64_t bytes = std::min<uint64_t>(default_limits.bytes, 64ull << 20);
+        RBREW_LOG_INFO("mem", "vertex cache (low-VRAM iGPU): %zu entries, %llu MB budget\n", entries,
+                       (unsigned long long)(bytes >> 20));
+        return VertexCacheLimits{entries, entries / 2, bytes};
+    }();
+    return (gx2vk::ready() && gx2vk::caps().low_vram_igpu) ? igpu_limits : default_limits;
 }
 size_t vertex_cache_entries() {
     return s_vertex_buffers.size();
@@ -3887,13 +3854,9 @@ BufferRef cached_vertex_buffer(uint8_t* mem, uint32_t addr, uint32_t size, uint6
     uint64_t content = 0;
     if (b.valid && b.mem == mem) {
         if (untracked) {
-            // Epoch model (Cemu's chronon): re-prove the copy at most once
-            // per frame — the first draw of the mesh hashes, every later draw
-            // of that frame hits without touching the bytes. Per-draw hashing
-            // was itself a top render-thread cost on untracked arenas.
-            if (b.epoch == epoch)
-                hit = true;
-            else if ((content = hash_guest_bytes(mem + addr, size)) == b.hash) {
+            // Never short-circuit on frame epoch when write-watch is unavailable:
+            // dynamic guest VBOs can be rewritten between draws in the same frame.
+            if ((content = hash_guest_bytes(mem + addr, size)) == b.hash) {
                 b.epoch = epoch;
                 hit = true;
             }
@@ -3918,12 +3881,15 @@ BufferRef cached_vertex_buffer(uint8_t* mem, uint32_t addr, uint32_t size, uint6
     // DEVICE_LOCAL VRAM via the submission prologue so vertex fetches hit GDDR
     // bandwidth instead of PCIe system RAM once the 256 MiB BAR fills. Dynamic
     // per-frame vertex buffers (rewrites >= 3) stay in mapped Upload storage to
-    // avoid double-copy and staging churn. RBREW_VBO_VRAM=0 disables promotion.
-    static const bool s_vbo_vram = [] {
+    // avoid double-copy and staging churn. RBREW_VBO_VRAM=0/1 overrides auto
+    // (auto defaults OFF on low-VRAM iGPUs to preserve the small local heap).
+    static const int s_vbo_vram_env = [] {
         const char* v = std::getenv("RBREW_VBO_VRAM");
-        return !(v && v[0] == '0');
+        if (!v || !v[0]) return -1;
+        return v[0] == '0' ? 0 : 1;
     }();
-    bool want_vram = s_vbo_vram && size >= 1024 && size <= (16u << 20) && b.rewrites <= 2;
+    const bool vbo_vram = s_vbo_vram_env >= 0 ? (s_vbo_vram_env != 0) : !gx2vk::caps().low_vram_igpu;
+    bool want_vram = vbo_vram && size >= 1024 && size <= (16u << 20) && b.rewrites <= 2;
 #ifndef RBREW_DISABLE_LOGGING
     if (cache_verify_enabled()) want_vram = false;
 #endif
@@ -4232,6 +4198,7 @@ struct StageDescriptors {
     uint32_t write_count = 0;
     uint32_t buffer_count = 0;
     uint32_t image_count = 0;
+    bool aliases_active_fb = false;
 };
 
 bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& d) {
@@ -4240,6 +4207,7 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
     if (stage == 0) {
         d.write_count = d.buffer_count = d.image_count = 0;
         d.material = nullptr;
+        d.aliases_active_fb = false;
     }
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(gx2vk::caps().limits.minUniformBufferOffsetAlignment, 16);
     // Native sampler slots: PS 0-17, VS 18-35. Only a differing slot changes state.
@@ -4746,11 +4714,32 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
             tex = dummy_texture(dim ? dim : 2, integer, false, shadow);
             params = tex->params;
         }
-        VkImageView view = tex_object_view(*tex, dim ? dim : 2, integer, false);
+        const uint32_t slot_word4 =
+            (complete && unit < S.bound_textures.size() && S.bound_textures[unit].address)
+                ? S.bound_textures[unit].swizzle
+                : tex->swizzle;
+        VkImageView view = tex_object_view(*tex, dim ? dim : 2, integer, false, slot_word4);
         if (!view) {
             tex = dummy_texture(dim ? dim : 2, integer, false, shadow);
             params = tex->params;
-            view = tex_object_view(*tex, dim ? dim : 2, integer, false);
+            view = tex_object_view(*tex, dim ? dim : 2, integer, false, tex->swizzle);
+        }
+        if (tex->image && tex->image->image && !d.aliases_active_fb) {
+            const auto& sampled = *tex->image;
+            const auto& active_fb = s_rendering ? s_active_fb : S.framebuffer;
+            for (const auto* color_att : active_fb.colors) {
+                if (color_att && color_att->image.image &&
+                    (color_att->image.image == sampled.image ||
+                     (sampled.image_serial && color_att->image.image_serial == sampled.image_serial))) {
+                    d.aliases_active_fb = true;
+                    break;
+                }
+            }
+            if (!d.aliases_active_fb && active_fb.depth && active_fb.depth->image.image &&
+                (active_fb.depth->image.image == sampled.image ||
+                 (sampled.image_serial && active_fb.depth->image.image_serial == sampled.image_serial))) {
+                d.aliases_active_fb = true;
+            }
         }
         const VkSampler s = tex_object_sampler(params, shadow, integer || tex->integer);
         TXDIAG(txdiag::binding(prog.id, stage, unit, uint32_t(vk.texture_bindings[t]), dim, complete,
@@ -4765,6 +4754,71 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         w.pImageInfo = &image;
     }
     return true;
+}
+
+void advance_descriptor_pool_serial(uint64_t serial) {
+    if (s_descriptor_cache_serial == serial) return;
+    s_descriptor_sets.clear();
+    s_descriptor_cache_serial = serial;
+    if (s_descriptor_pool) s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
+    s_descriptor_pool = VK_NULL_HANDLE;
+    // cmd() has already polled completion. A conservative cached value
+    // suffices here; pool allocation must never introduce another wait.
+    const uint64_t done = gx2vk::known_completed_serial();
+    for (auto it = s_retired_pools.begin(); it != s_retired_pools.end();) {
+        // A replay may still bind sets of this pool (gx2_frame_interp.h).
+        if (it->first <= done && !gx2interp::replay_may_read(it->first)) {
+            s_free_descriptor_pools.push_back(it->second);
+            it = s_retired_pools.erase(it);
+        } else
+            ++it;
+    }
+}
+
+VkDescriptorSet allocate_descriptor_set(VkDescriptorSetLayout set_layout, uint64_t serial) {
+    advance_descriptor_pool_serial(serial);
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    // Retry only pool exhaustion/fragmentation, once with an empty pool.
+    // Device/host OOM and device loss must not recurse or allocate forever.
+    bool empty = false;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        if (!s_descriptor_pool) {
+            if (!s_free_descriptor_pools.empty()) {
+                s_descriptor_pool = s_free_descriptor_pools.back();
+                s_free_descriptor_pools.pop_back();
+                if (vkResetDescriptorPool(gx2vk::device(), s_descriptor_pool, 0) != VK_SUCCESS) {
+                    vkDestroyDescriptorPool(gx2vk::device(), s_descriptor_pool, nullptr);
+                    s_descriptor_pool = VK_NULL_HANDLE;
+                    return VK_NULL_HANDLE;
+                }
+            } else {
+                const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096},
+                                                      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4096},
+                                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}};
+                VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                info.maxSets = 1024;
+                info.poolSizeCount = 3;
+                info.pPoolSizes = sizes;
+                if (vkCreateDescriptorPool(gx2vk::device(), &info, nullptr, &s_descriptor_pool) != VK_SUCCESS)
+                    return VK_NULL_HANDLE;
+                TXDIAG(txdiag::event("descriptor_pool_create", "\"id\":%llu,\"pool\":%llu", txdiag::next_id(),
+                                     txdiag::handle(s_descriptor_pool)));
+            }
+            s_descriptor_pool_serial = serial;
+            empty = true;
+        }
+        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = s_descriptor_pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &set_layout;
+        const VkResult result = vkAllocateDescriptorSets(gx2vk::device(), &alloc, &set);
+        if (result == VK_SUCCESS) return set;
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) return VK_NULL_HANDLE;
+        s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
+        s_descriptor_pool = VK_NULL_HANDLE;
+        if (empty) return VK_NULL_HANDLE; // every supported layout fits an empty pool
+    }
+    return VK_NULL_HANDLE;
 }
 
 bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* writes, uint32_t write_count) {
@@ -4800,36 +4854,12 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
     };
 #endif
     if (prog.push) {
-        if (s_bindings.is_push && prog.layout == s_bindings.descriptor_layout &&
-            write_count == s_bindings.descriptor_count && write_count <= s_bindings.descriptors.size()) {
-            std::array<VkWriteDescriptorSet, StageDescriptors::kMaxWrites> dirty_writes;
-            std::array<uint8_t, StageDescriptors::kMaxWrites> dirty_slots;
-            uint32_t dirty_count = 0;
-            bool simple = true;
-            for (uint32_t i = 0; i < write_count; ++i) {
-                if (!valid_single_descriptor(writes[i])) {
-                    simple = false;
-                    break;
-                }
-                if (!same_single_descriptor(writes[i], s_bindings.descriptors[i])) {
-                    dirty_writes[dirty_count] = writes[i];
-                    dirty_slots[dirty_count] = uint8_t(i);
-                    ++dirty_count;
-                }
-            }
-            if (simple) {
-                if (!dirty_count) {
-                    TXDIAG(txdiag::count(txdiag::DescriptorHits));
-                    return true;
-                }
-                TXDIAG(txdiag::count(txdiag::DescriptorUpdates));
-                TXDIAG(diagnostic_descriptors(VK_NULL_HANDLE));
-                vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prog.layout, 0, dirty_count,
-                                          dirty_writes.data());
-                for (uint32_t i = 0; i < dirty_count; ++i)
-                    save_single_descriptor(dirty_writes[i], s_bindings.descriptors[dirty_slots[i]]);
-                return true;
-            }
+        // Always push the complete write_count descriptor set whenever anything
+        // changed (or pipeline/render-pass invalidated s_bindings.descriptor_layout).
+        // Avoids partial subset push-descriptor updates across shared layouts on AMD PAL.
+        if (s_bindings.is_push && same_descriptors(prog.layout, writes, write_count)) {
+            TXDIAG(txdiag::count(txdiag::DescriptorHits));
+            return true;
         }
         TXDIAG(txdiag::count(txdiag::DescriptorUpdates));
         TXDIAG(diagnostic_descriptors(VK_NULL_HANDLE));
@@ -4893,23 +4923,7 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
         dynamic_offsets.fill(0);
     }
     TXDIAG(txdiag::count(txdiag::DescriptorUpdates));
-    if (s_descriptor_cache_serial != serial) {
-        s_descriptor_sets.clear();
-        s_descriptor_cache_serial = serial;
-        if (s_descriptor_pool) s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
-        s_descriptor_pool = VK_NULL_HANDLE;
-        // cmd() has already polled completion. A conservative cached value
-        // suffices here; pool allocation must never introduce another wait.
-        const uint64_t done = gx2vk::known_completed_serial();
-        for (auto it = s_retired_pools.begin(); it != s_retired_pools.end();) {
-            // A replay may still bind sets of this pool (gx2_frame_interp.h).
-            if (it->first <= done && !gx2interp::replay_may_read(it->first)) {
-                s_free_descriptor_pools.push_back(it->second);
-                it = s_retired_pools.erase(it);
-            } else
-                ++it;
-        }
-    }
+    advance_descriptor_pool_serial(serial);
     // Serialize fields individually, never structure padding or host pointers.
     // unordered_map checks complete key equality even on a hash collision.
     // Built on the stack; only a new set's key is copied into the map.
@@ -4953,46 +4967,7 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
     if (const auto found = s_descriptor_sets.find(key); found != s_descriptor_sets.end())
         set = found->second;
     else {
-        // Retry only pool exhaustion/fragmentation, once with an empty pool.
-        // Device/host OOM and device loss must not recurse or allocate forever.
-        bool empty = false;
-        for (unsigned attempt = 0; attempt < 2; ++attempt) {
-            if (!s_descriptor_pool) {
-                if (!s_free_descriptor_pools.empty()) {
-                    s_descriptor_pool = s_free_descriptor_pools.back();
-                    s_free_descriptor_pools.pop_back();
-                    if (vkResetDescriptorPool(gx2vk::device(), s_descriptor_pool, 0) != VK_SUCCESS) {
-                        vkDestroyDescriptorPool(gx2vk::device(), s_descriptor_pool, nullptr);
-                        s_descriptor_pool = VK_NULL_HANDLE;
-                        return false;
-                    }
-                } else {
-                    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096},
-                                                          {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4096},
-                                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}};
-                    VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-                    info.maxSets = 1024;
-                    info.poolSizeCount = 3;
-                    info.pPoolSizes = sizes;
-                    if (vkCreateDescriptorPool(gx2vk::device(), &info, nullptr, &s_descriptor_pool) != VK_SUCCESS)
-                        return false;
-                    TXDIAG(txdiag::event("descriptor_pool_create", "\"id\":%llu,\"pool\":%llu", txdiag::next_id(),
-                                         txdiag::handle(s_descriptor_pool)));
-                }
-                s_descriptor_pool_serial = serial;
-                empty = true;
-            }
-            VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-            alloc.descriptorPool = s_descriptor_pool;
-            alloc.descriptorSetCount = 1;
-            alloc.pSetLayouts = &prog.set_layout;
-            const VkResult result = vkAllocateDescriptorSets(gx2vk::device(), &alloc, &set);
-            if (result == VK_SUCCESS) break;
-            if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) return false;
-            s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
-            s_descriptor_pool = VK_NULL_HANDLE;
-            if (empty) return false; // every supported layout fits an empty pool
-        }
+        set = allocate_descriptor_set(prog.set_layout, serial);
         if (!set) return false;
         std::array<VkWriteDescriptorSet, StageDescriptors::kMaxWrites> updates;
         std::array<VkDescriptorBufferInfo, StageDescriptors::kMaxBuffers> buffers;
@@ -5177,8 +5152,8 @@ VkPrimitiveTopology vk_topology(uint32_t prim) {
     case 0x05: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     case 0x06: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     case 0x13:
-    case 0x14: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; // native assembly GS
-    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;              // TRIANGLES and RECT (GS)
+    case 0x14: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // CPU-expanded quads (no GS)
+    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // TRIANGLES and RECT (GS)
     }
 }
 bool list_topology(VkPrimitiveTopology t) {
@@ -5605,6 +5580,7 @@ struct PipelineReqTemplate {
     uint32_t target_masks = ~0u;
     bool color_write = false;
     bool blend = false;
+    bool per_target_blend_valid = false;
     bool xfb = false;
     uint32_t blend_src_rgb = ~0u;
     uint32_t blend_dst_rgb = ~0u;
@@ -5612,6 +5588,7 @@ struct PipelineReqTemplate {
     uint32_t blend_dst_alpha = ~0u;
     uint32_t blend_eq_rgb = ~0u;
     uint32_t blend_eq_alpha = ~0u;
+    std::array<RasterState::TargetBlendState, 8> target_blends{};
     VkFormat colors[8]{};
     VkPipelineColorBlendAttachmentState blend_states[8]{};
     VkFormat depth = VK_FORMAT_UNDEFINED;
@@ -5698,14 +5675,22 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
 
     uint64_t cur_color_masks = 0;
     std::memcpy(&cur_color_masks, S.raster.color_mask.data(), sizeof(cur_color_masks));
+    const bool blend_matches =
+        s_req_tpl.per_target_blend_valid == S.raster.per_target_blend_valid &&
+        (S.raster.per_target_blend_valid
+             ? std::equal(std::begin(S.raster.target_blends), std::end(S.raster.target_blends),
+                          s_req_tpl.target_blends.begin())
+             : (s_req_tpl.blend == S.raster.blend &&
+                (!S.raster.blend ||
+                 (s_req_tpl.blend_src_rgb == S.raster.blend_src_rgb &&
+                  s_req_tpl.blend_dst_rgb == S.raster.blend_dst_rgb &&
+                  s_req_tpl.blend_src_alpha == S.raster.blend_src_alpha &&
+                  s_req_tpl.blend_dst_alpha == S.raster.blend_dst_alpha &&
+                  s_req_tpl.blend_eq_rgb == S.raster.blend_eq_rgb &&
+                  s_req_tpl.blend_eq_alpha == S.raster.blend_eq_alpha))));
     if (s_req_tpl.prog == prog && s_req_tpl.fb_generation == s_fb_generation && s_req_tpl.fbo_id == S.current_fbo_id &&
         s_req_tpl.target_masks == S.target_masks && s_req_tpl.color_write == S.color_write &&
-        s_req_tpl.color_masks == cur_color_masks && s_req_tpl.blend == S.raster.blend && s_req_tpl.xfb == xfb &&
-        (!S.raster.blend ||
-         (s_req_tpl.blend_src_rgb == S.raster.blend_src_rgb && s_req_tpl.blend_dst_rgb == S.raster.blend_dst_rgb &&
-          s_req_tpl.blend_src_alpha == S.raster.blend_src_alpha &&
-          s_req_tpl.blend_dst_alpha == S.raster.blend_dst_alpha && s_req_tpl.blend_eq_rgb == S.raster.blend_eq_rgb &&
-          s_req_tpl.blend_eq_alpha == S.raster.blend_eq_alpha))) {
+        s_req_tpl.color_masks == cur_color_masks && s_req_tpl.xfb == xfb && blend_matches) {
         std::memcpy(r.colors, s_req_tpl.colors, sizeof(r.colors));
         std::memcpy(r.blend, s_req_tpl.blend_states, sizeof(r.blend));
         r.depth = s_req_tpl.depth;
@@ -5729,17 +5714,29 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
                     uint_mask |= 1u << i;
             }
             // GPU ignores blending for integer buffers.
+            const bool target_blend_en =
+                S.raster.per_target_blend_valid ? S.raster.target_blends[i].enable : S.raster.blend;
             const bool blendable =
-                S.raster.blend && !integer &&
+                target_blend_en && !integer &&
                 gx2vk::format_supports(t->fmt.attachment, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
-            b.blendEnable = S.raster.blend && blendable;
+            b.blendEnable = blendable;
             if (b.blendEnable) {
-                b.srcColorBlendFactor = vk_blend(S.raster.blend_src_rgb);
-                b.dstColorBlendFactor = vk_blend(S.raster.blend_dst_rgb);
-                b.colorBlendOp = vk_blend_op(S.raster.blend_eq_rgb);
-                b.srcAlphaBlendFactor = vk_blend(S.raster.blend_src_alpha);
-                b.dstAlphaBlendFactor = vk_blend(S.raster.blend_dst_alpha);
-                b.alphaBlendOp = vk_blend_op(S.raster.blend_eq_alpha);
+                if (S.raster.per_target_blend_valid) {
+                    const auto& tb = S.raster.target_blends[i];
+                    b.srcColorBlendFactor = vk_blend(tb.color_src);
+                    b.dstColorBlendFactor = vk_blend(tb.color_dst);
+                    b.colorBlendOp = vk_blend_op(tb.color_op);
+                    b.srcAlphaBlendFactor = vk_blend(tb.separate_alpha ? tb.alpha_src : tb.color_src);
+                    b.dstAlphaBlendFactor = vk_blend(tb.separate_alpha ? tb.alpha_dst : tb.color_dst);
+                    b.alphaBlendOp = vk_blend_op(tb.separate_alpha ? tb.alpha_op : tb.color_op);
+                } else {
+                    b.srcColorBlendFactor = vk_blend(S.raster.blend_src_rgb);
+                    b.dstColorBlendFactor = vk_blend(S.raster.blend_dst_rgb);
+                    b.colorBlendOp = vk_blend_op(S.raster.blend_eq_rgb);
+                    b.srcAlphaBlendFactor = vk_blend(S.raster.blend_src_alpha);
+                    b.dstAlphaBlendFactor = vk_blend(S.raster.blend_dst_alpha);
+                    b.alphaBlendOp = vk_blend_op(S.raster.blend_eq_alpha);
+                }
             }
             // Outputs the pixel shader does not write keep the attachment's contents.
             b.colorWriteMask = (outputs >> i & 1) ? S.raster.color_mask[i] : 0;
@@ -5757,6 +5754,9 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         s_req_tpl.target_masks = S.target_masks;
         s_req_tpl.color_write = S.color_write;
         s_req_tpl.blend = S.raster.blend;
+        s_req_tpl.per_target_blend_valid = S.raster.per_target_blend_valid;
+        std::copy(std::begin(S.raster.target_blends), std::end(S.raster.target_blends),
+                  s_req_tpl.target_blends.begin());
         s_req_tpl.xfb = xfb;
         s_req_tpl.blend_src_rgb = S.raster.blend_src_rgb;
         s_req_tpl.blend_dst_rgb = S.raster.blend_dst_rgb;
@@ -5825,6 +5825,13 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
             stages_ok = build_stage(mem, *prog, 0, sd) && build_stage(mem, *prog, 1, sd);
         }
         if (!stages_ok) return any;
+        if (s_rendering && sd.aliases_active_fb) {
+            // Break intra-pass attachment feedback loops so CB/DCC and DB/HTILE
+            // caches flush before sampling an image bound in the active pass
+            // (AMD RDNA 3.5 coherency & VUID-vkCmdDraw-None-06886).
+            end_rendering();
+            gx2vk::barrier_for(gx2vk::kSyncGraphics);
+        }
         // Refreshing a sampled depth array can end rendering for its copies.
         if (!ensure_rendering(streamout_only)) return any;
         // A trace readback or capture may have submitted since the state was
@@ -5841,6 +5848,11 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         if (pipeline != s_bound_pipeline) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             s_bound_pipeline = pipeline;
+            // Invalidate descriptor tracking on pipeline switch so shared
+            // VkPipelineLayouts always push/bind a fresh complete set.
+            s_bindings.descriptor_layout = VK_NULL_HANDLE;
+            s_bindings.descriptor_set = VK_NULL_HANDLE;
+            s_bindings.is_push = false;
             if (streamout_only) {
                 // Binding a rasterizerDiscardEnable=VK_TRUE pipeline with null
                 // pDepthStencilState/pColorBlendState invalidates depth/stencil/blend
@@ -6138,6 +6150,21 @@ static void RBREW_TARGET_SSSE3 copy_swapped_indices(uint8_t* dst, const uint8_t*
 extern bool gx2r_capture_draw_if_armed(bool indexed, uint32_t prim, uint32_t count, uint32_t index_type,
                                        uint32_t index_addr, uint32_t first_vertex, uint8_t* mem);
 
+// CPU TRIANGLE_LIST expansion for GX2 QUADS (0x13) and QUAD_STRIP (0x14).
+// Preserves exact CCW winding and last-vertex provoking vertex `d` under
+// VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT while bypassing Geometry Shaders.
+static inline void append_quad_triangles(std::vector<uint32_t>& out, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
+                                         bool strip) {
+    if (strip)
+        // QUAD_STRIP perimeter is (a, b, d, c); triangles (a, b, d) and (c, a, d)
+        // preserve that exact winding with `d` as provoking vertex.
+        out.insert(out.end(), {a, b, d, c, a, d});
+    else
+        // QUADS perimeter is (a, b, c, d); triangles (a, b, d) and (b, c, d)
+        // preserve CCW winding with `d` as provoking vertex.
+        out.insert(out.end(), {a, b, d, b, c, d});
+}
+
 void gx2_render_draw(uint32_t prim_type, uint32_t count, uint32_t first_vertex, uint8_t* mem, uint32_t instances,
                      uint32_t first_instance) {
     Gx2PerfScope perf_scope(kPerfDraw);
@@ -6160,19 +6187,19 @@ void gx2_render_draw(uint32_t prim_type, uint32_t count, uint32_t first_vertex, 
     IndexStream indices;
     const unsigned mode = prim_type & 31;
     if (mode == 0x13 || mode == 0x14 || mode == 0x0D) {
-        // QUADS/QUAD_STRIP: adjacency quadruplets for the assembly GS (0-based,
+        // QUADS/QUAD_STRIP: CPU-expanded TRIANGLE_LIST indices (0-based,
         // base vertex = first); LINE_LOOP: strip closed by its first vertex.
         std::vector<uint32_t> expanded;
         if (mode == 0x0D) {
+            expanded.reserve(count + 1);
             for (uint32_t v = 0; v < count; ++v) expanded.push_back(v);
             if (count > 1) expanded.push_back(0);
-        } else
-            for (unsigned v = 0; v + 3 < count; v += mode == 0x13 ? 4 : 2) {
-                if (mode == 0x13)
-                    expanded.insert(expanded.end(), {v, v + 1, v + 2, v + 3});
-                else
-                    expanded.insert(expanded.end(), {v, v + 1, v + 3, v + 2});
-            }
+        } else {
+            const bool strip = mode == 0x14;
+            expanded.reserve((count / (strip ? 2u : 4u)) * 6u);
+            for (unsigned v = 0; v + 3 < count; v += strip ? 2 : 4)
+                append_quad_triangles(expanded, v, v + 1, v + 2, v + 3, strip);
+        }
         if (expanded.empty()) return;
         indices.indexed = true;
         indices.count = uint32_t(expanded.size());
@@ -6265,12 +6292,10 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
                            ((cached_idx->device_local && cached_idx->vram_buffer.buffer != VK_NULL_HANDLE) ||
                             gx2vk::span_alive(cached_idx->span));
         if (alive) {
-            // Epoch model (Cemu's chronon): hash at most once per frame per
-            // buffer; later draws of that frame hit without re-reading.
+            // Never short-circuit on frame epoch when write-watch is unavailable:
+            // dynamic guest IBOs can be rewritten between draws in the same frame.
             if (untracked) {
-                if (cached_idx->epoch == epoch)
-                    hit = true;
-                else if ((content = hash_guest_bytes(mem + idx_guest_addr, idx_bytes)) == cached_idx->hash) {
+                if ((content = hash_guest_bytes(mem + idx_guest_addr, idx_bytes)) == cached_idx->hash) {
                     cached_idx->epoch = epoch;
                     hit = true;
                 }
@@ -6326,12 +6351,15 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
             // Static index buffers (uploaded once or twice, 1 KiB..16 MiB) are
             // promoted to pure DEVICE_LOCAL VRAM via the submission prologue so
             // indexed draws read GDDR instead of PCIe upload memory and survive
-            // upload-ring wraps without re-uploading. RBREW_IBO_VRAM=0 disables.
-            static const bool s_ibo_vram = [] {
+            // upload-ring wraps without re-uploading. RBREW_IBO_VRAM=0/1 overrides
+            // auto (auto defaults OFF on low-VRAM iGPUs to preserve small local heaps).
+            static const int s_ibo_vram_env = [] {
                 const char* v = std::getenv("RBREW_IBO_VRAM");
-                return !(v && v[0] == '0');
+                if (!v || !v[0]) return -1;
+                return v[0] == '0' ? 0 : 1;
             }();
-            bool want_vram = s_ibo_vram && idx_bytes >= 1024 && idx_bytes <= (16u << 20) && next_rewrites <= 2;
+            const bool ibo_vram = s_ibo_vram_env >= 0 ? (s_ibo_vram_env != 0) : !gx2vk::caps().low_vram_igpu;
+            bool want_vram = ibo_vram && idx_bytes >= 1024 && idx_bytes <= (16u << 20) && next_rewrites <= 2;
 #ifndef RBREW_DISABLE_LOGGING
             if (cache_verify_enabled()) want_vram = false;
 #endif
@@ -6433,20 +6461,17 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
         return;
     }
     std::vector<uint32_t> out;
-    out.reserve(count + 8);
+    out.reserve(mode == 0x13 ? (count / 4) * 6 + 6 : mode == 0x14 ? (count / 2) * 6 + 6 : count + 8);
     if (mode == 0x13 || mode == 0x14) {
-        // Respect restart boundaries before reordering quad-strip pairs; each
-        // segment contributes whole quads, so the restart index itself is not
-        // needed in the adjacency list.
+        // Respect restart boundaries before expanding quads/quad-strips to
+        // TRIANGLE_LIST; each segment contributes whole quads, so the restart
+        // index itself is not needed in the expanded index list.
         const bool strip = mode == 0x14;
         std::vector<uint32_t> segment;
         auto emit = [&] {
             for (unsigned i = 0; i + 3 < segment.size(); i += strip ? 2 : 4) {
                 const uint32_t a = segment[i], b = segment[i + 1], c = segment[i + 2], d = segment[i + 3];
-                if (strip)
-                    out.insert(out.end(), {a, b, d, c});
-                else
-                    out.insert(out.end(), {a, b, c, d});
+                append_quad_triangles(out, a, b, c, d, strip);
             }
             segment.clear();
         };
@@ -6775,39 +6800,88 @@ void gx2r_streamout_flush_if_overlaps(uint8_t* mem, uint32_t address, uint64_t s
 }
 
 // ---------------------------------------------------------------------------
-// Internal transfer pass: depth -> R32F color (GX2CopySurface /
-// ConvertDepthBufferToTextureSurface), the GPU back-end's transfer program.
+// Internal transfer passes: depth -> R32F color (GX2CopySurface /
+// ConvertDepthBufferToTextureSurface) and depth -> depth scaling fallback
+// (for formats without VK_FORMAT_FEATURE_BLIT_DST_BIT such as D32_SFLOAT_S8_UINT).
 // ---------------------------------------------------------------------------
 namespace {
 VkDescriptorSetLayout s_transfer_set = VK_NULL_HANDLE;
 VkPipelineLayout s_transfer_layout = VK_NULL_HANDLE;
+bool s_transfer_use_push = false;
 std::map<VkFormat, VkPipeline> s_transfer_pipelines;
+std::map<VkFormat, VkPipeline> s_depth_transfer_pipelines;
 const char* kTransferVs =
     "#version 450\nvoid main(){vec2 p=vec2((gl_VertexIndex<<1)&2,gl_VertexIndex&2);gl_Position=vec4(p*2-1,0,1);}\n";
 const char* kTransferPs =
     "#version 450\nlayout(set=0,binding=0) uniform sampler2D source;layout(location=0) out vec4 value;"
     "layout(push_constant)uniform CopyScale{vec2 scale;}pc;"
     "void main(){value=vec4(texelFetch(source,ivec2(gl_FragCoord.xy*pc.scale),0).r,0,0,1);}\n";
+const char* kDepthTransferPs =
+    "#version 450\nlayout(set=0,binding=0) uniform sampler2D source;"
+    "layout(push_constant)uniform CopyScale{vec2 scale;}pc;"
+    "void main(){ivec2 lim=max(textureSize(source,0)-ivec2(1),ivec2(0));"
+    "gl_FragDepth=texelFetch(source,clamp(ivec2(gl_FragCoord.xy*pc.scale),ivec2(0),lim),0).r;}\n";
+
+bool ensure_transfer_layout() {
+    if (s_transfer_layout) return true;
+    s_transfer_use_push = push_descriptors_enabled() && gx2vk::caps().push_descriptor;
+    VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                         nullptr};
+    VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set.flags = s_transfer_use_push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
+    set.bindingCount = 1;
+    set.pBindings = &binding;
+    if (vkCreateDescriptorSetLayout(gx2vk::device(), &set, nullptr, &s_transfer_set) != VK_SUCCESS) {
+        s_transfer_set = VK_NULL_HANDLE;
+        return false;
+    }
+    VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout.setLayoutCount = 1;
+    layout.pSetLayouts = &s_transfer_set;
+    const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8};
+    layout.pushConstantRangeCount = 1;
+    layout.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(gx2vk::device(), &layout, nullptr, &s_transfer_layout) != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(gx2vk::device(), s_transfer_set, nullptr);
+        s_transfer_set = VK_NULL_HANDLE;
+        s_transfer_layout = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+bool prepare_transfer_descriptor(const VkDescriptorImageInfo& image, VkDescriptorSet& out_set) {
+    out_set = VK_NULL_HANDLE;
+    if (s_transfer_use_push) return true;
+    out_set = allocate_descriptor_set(s_transfer_set, gx2vk::recording_serial());
+    if (!out_set) return false;
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = out_set;
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &image;
+    vkUpdateDescriptorSets(gx2vk::device(), 1, &w, 0, nullptr);
+    return true;
+}
+
+void bind_transfer_descriptor(VkCommandBuffer cb, const VkDescriptorImageInfo& image, VkDescriptorSet pool_set) {
+    if (s_transfer_use_push) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &image;
+        vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_transfer_layout, 0, 1, &w);
+    } else {
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_transfer_layout, 0, 1, &pool_set, 0, nullptr);
+    }
+}
 } // namespace
 
 bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, uint32_t width, uint32_t height) {
     if (!(destination.image.desc.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
-    if (!s_transfer_layout) {
-        VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                             VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        set.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        set.bindingCount = 1;
-        set.pBindings = &binding;
-        vkCreateDescriptorSetLayout(gx2vk::device(), &set, nullptr, &s_transfer_set);
-        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout.setLayoutCount = 1;
-        layout.pSetLayouts = &s_transfer_set;
-        const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8};
-        layout.pushConstantRangeCount = 1;
-        layout.pPushConstantRanges = &push;
-        vkCreatePipelineLayout(gx2vk::device(), &layout, nullptr, &s_transfer_layout);
-    }
+    if (!ensure_transfer_layout()) return false;
     const VkFormat format = destination.fmt.attachment;
     auto& pipeline = s_transfer_pipelines[format];
     if (!pipeline) {
@@ -6867,6 +6941,17 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
     end_rendering();
     VkCommandBuffer cb = gx2vk::cmd();
     gx2vk::barrier_if_dirty();
+    gx2vk::ViewDesc sv;
+    sv.type = VK_IMAGE_VIEW_TYPE_2D;
+    sv.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    TexParams nearest;
+    nearest.min_filter = nearest.mag_filter = wire::NEAREST;
+    nearest.max_level = 0;
+    const VkImageView src_view = gx2vk::image_view(source.image, sv);
+    if (!src_view) return false;
+    VkDescriptorImageInfo image{tex_object_sampler(nearest, false, false), src_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorSet pool_set = VK_NULL_HANDLE;
+    if (!prepare_transfer_descriptor(image, pool_set)) return false;
     gx2vk::ViewDesc dv;
     dv.type = VK_IMAGE_VIEW_TYPE_2D;
     dv.format = format;
@@ -6892,20 +6977,7 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
     vkCmdSetScissor(cb, 0, 1, &sc);
     const float copy_scale[2] = {src_scale[0] / dst_scale[0], src_scale[1] / dst_scale[1]};
     vkCmdPushConstants(cb, s_transfer_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, copy_scale);
-    gx2vk::ViewDesc sv;
-    sv.type = VK_IMAGE_VIEW_TYPE_2D;
-    sv.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-    TexParams nearest;
-    nearest.min_filter = nearest.mag_filter = wire::NEAREST;
-    nearest.max_level = 0;
-    VkDescriptorImageInfo image{tex_object_sampler(nearest, false, false), gx2vk::image_view(source.image, sv),
-                                VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstBinding = 0;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo = &image;
-    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_transfer_layout, 0, 1, &w);
+    bind_transfer_descriptor(cb, image, pool_set);
     vkCmdDraw(cb, 3, 1, 0, 0);
     gx2_count_gpu_draw();
     vkCmdEndRendering(cb);
@@ -6914,6 +6986,171 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
     // A following draw in the same command buffer must emit all of it again.
     reset_command_tracking();
     gx2vk::note_gpu_write(destination.image);
+    return true;
+}
+
+bool gx2r::depth_to_depth_pass(gx2vk::Image& src, uint32_t src_level, uint32_t src_layer, gx2vk::Image& dst,
+                               uint32_t dst_level, uint32_t dst_layer, uint32_t dst_width, uint32_t dst_height) {
+    if (!src.image || !dst.image || !(src.desc.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return false;
+    if (src_level >= src.desc.levels || src_layer >= src.desc.layers) return false;
+    if (dst_level >= dst.desc.levels || dst_layer >= dst.desc.layers) return false;
+    const uint32_t src_w = std::max(1u, src.desc.width >> src_level);
+    const uint32_t src_h = std::max(1u, src.desc.height >> src_level);
+    const uint32_t dst_mip_w = std::max(1u, dst.desc.width >> dst_level);
+    const uint32_t dst_mip_h = std::max(1u, dst.desc.height >> dst_level);
+    const uint32_t copy_w = std::min(dst_width, dst_mip_w);
+    const uint32_t copy_h = std::min(dst_height, dst_mip_h);
+    if (!copy_w || !copy_h) return false;
+    const VkFormat format = dst.desc.format;
+    if (!gx2vk::format_is_depth(format)) return false;
+    if (!gx2vk::format_supports(format, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) return false;
+    const bool direct_attach = (dst.desc.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+    if (!direct_attach && !(dst.desc.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
+    if (!ensure_transfer_layout()) return false;
+    const bool has_stencil = gx2vk::format_has_stencil(format);
+    auto& pipeline = s_depth_transfer_pipelines[format];
+    if (!pipeline) {
+        VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = gx2vk::shader_module(VK_SHADER_STAGE_VERTEX_BIT, kTransferVs);
+        stages[0].pName = "main";
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = gx2vk::shader_module(VK_SHADER_STAGE_FRAGMENT_BIT, kDepthTransferPs);
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewport.viewportCount = 1;
+        viewport.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.lineWidth = 1.0f;
+        raster.cullMode = VK_CULL_MODE_NONE;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depth.depthTestEnable = VK_TRUE;
+        depth.depthWriteEnable = VK_TRUE;
+        depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        depth.stencilTestEnable = VK_FALSE;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = 2;
+        dynamic.pDynamicStates = dynamic_states;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.depthAttachmentFormat = format;
+        rendering.stencilAttachmentFormat = has_stencil ? format : VK_FORMAT_UNDEFINED;
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        info.pNext = &rendering;
+        info.stageCount = 2;
+        info.pStages = stages;
+        info.pVertexInputState = &vertex;
+        info.pInputAssemblyState = &assembly;
+        info.pViewportState = &viewport;
+        info.pRasterizationState = &raster;
+        info.pMultisampleState = &multisample;
+        info.pDepthStencilState = &depth;
+        info.pColorBlendState = &blend;
+        info.pDynamicState = &dynamic;
+        info.layout = s_transfer_layout;
+        if (!stages[0].module || !stages[1].module ||
+            vkCreateGraphicsPipelines(gx2vk::device(), gx2vk::pipeline_cache(), 1, &info, nullptr, &pipeline) !=
+                VK_SUCCESS) {
+            pipeline = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    gx2vk::Image scratch;
+    gx2vk::Image* target_img = &dst;
+    uint32_t target_level = dst_level, target_layer = dst_layer;
+    uint32_t render_w = dst_mip_w, render_h = dst_mip_h;
+    if (!direct_attach) {
+        gx2vk::ImageDesc desc;
+        desc.format = format;
+        desc.width = copy_w;
+        desc.height = copy_h;
+        desc.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (!gx2vk::create_image(scratch, desc)) return false;
+        target_img = &scratch;
+        target_level = 0;
+        target_layer = 0;
+        render_w = copy_w;
+        render_h = copy_h;
+    }
+    end_rendering();
+    VkCommandBuffer cb = gx2vk::cmd();
+    gx2vk::barrier_if_dirty();
+    gx2vk::ViewDesc sv;
+    sv.type = VK_IMAGE_VIEW_TYPE_2D;
+    sv.base_level = src_level;
+    sv.levels = 1;
+    sv.base_layer = src_layer;
+    sv.layers = 1;
+    sv.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    TexParams nearest;
+    nearest.min_filter = nearest.mag_filter = wire::NEAREST;
+    nearest.max_level = 0;
+    const VkImageView src_view = gx2vk::image_view(src, sv);
+    if (!src_view) {
+        if (scratch.image) gx2vk::destroy_image(scratch);
+        return false;
+    }
+    VkDescriptorImageInfo image{tex_object_sampler(nearest, false, false), src_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorSet pool_set = VK_NULL_HANDLE;
+    if (!prepare_transfer_descriptor(image, pool_set)) {
+        if (scratch.image) gx2vk::destroy_image(scratch);
+        return false;
+    }
+    gx2vk::ViewDesc dv;
+    dv.type = VK_IMAGE_VIEW_TYPE_2D;
+    dv.base_level = target_level;
+    dv.levels = 1;
+    dv.base_layer = target_layer;
+    dv.layers = 1;
+    dv.aspect = target_img->aspect;
+    const VkImageView dst_view = gx2vk::image_view(*target_img, dv);
+    if (!dst_view) {
+        if (scratch.image) gx2vk::destroy_image(scratch);
+        return false;
+    }
+    VkRenderingAttachmentInfo depth_att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depth_att.imageView = dst_view;
+    depth_att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth_att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo stencil_att = depth_att;
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, {render_w, render_h}};
+    info.layerCount = 1;
+    info.pDepthAttachment = &depth_att;
+    info.pStencilAttachment = has_stencil ? &stencil_att : nullptr;
+    vkCmdBeginRendering(cb, &info);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    const VkViewport vp{0, 0, float(copy_w), float(copy_h), 0, 1};
+    const VkRect2D sc{{0, 0}, {copy_w, copy_h}};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    const float copy_scale[2] = {float(src_w) / float(copy_w), float(src_h) / float(copy_h)};
+    vkCmdPushConstants(cb, s_transfer_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, copy_scale);
+    bind_transfer_descriptor(cb, image, pool_set);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    gx2_count_gpu_draw();
+    vkCmdEndRendering(cb);
+    reset_command_tracking();
+    if (scratch.image) {
+        gx2vk::note_gpu_write(scratch);
+        gx2vk::barrier_for(gx2vk::kSyncTransfer);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, dst_level, dst_layer, 1};
+        region.extent = {copy_w, copy_h, 1};
+        vkCmdCopyImage(cb, scratch.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        gx2vk::destroy_image(scratch);
+    }
+    gx2vk::note_gpu_write(dst);
     return true;
 }
 
@@ -6981,6 +7218,158 @@ bool gx2_render_vk_test_pipeline_cache() {
     request.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     request.blend[0].colorWriteMask = 0xf;
     return get_pipeline(request) == first;
+}
+
+// Authored GPU & CPU regression checks for QUADS/QUAD_STRIP TRIANGLE_LIST
+// expansion, per-slot swizzle views, and depth_to_depth_pass scaling fallback.
+void gx2_render_vk_test_quads_and_depth_copy() {
+    auto require = [](bool ok, const char* text) {
+        if (!ok) throw std::runtime_error(text);
+    };
+    // 1. CPU QUADS (0x13) and QUAD_STRIP (0x14) TRIANGLE_LIST expansion & topology.
+    require(vk_topology(0x13) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "QUADS did not map to TRIANGLE_LIST");
+    require(vk_topology(0x14) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "QUAD_STRIP did not map to TRIANGLE_LIST");
+    {
+        std::vector<uint32_t> quads;
+        append_quad_triangles(quads, 0, 1, 2, 3, false);
+        const std::vector<uint32_t> expect_quads{0, 1, 3, 1, 2, 3};
+        require(quads == expect_quads, "QUADS triangle expansion mismatch");
+        std::vector<uint32_t> strip;
+        append_quad_triangles(strip, 0, 1, 2, 3, true);
+        append_quad_triangles(strip, 2, 3, 4, 5, true);
+        const std::vector<uint32_t> expect_strip{0, 1, 3, 2, 0, 3, 2, 3, 5, 4, 2, 5};
+        require(strip == expect_strip, "QUAD_STRIP triangle expansion mismatch");
+    }
+    // 2. GPU QUADS draw: render a fullscreen quad via expanded TRIANGLE_LIST
+    //    (no geometry shader) and verify pixels across all 4 quadrants.
+    {
+        Program program;
+        program.id = UINT32_MAX - 200;
+        for (auto& info : program.info) {
+            info.attribute_locations.fill(-1);
+            info.buffer_bindings.fill(-1);
+            info.vk.uniform_buffer_bindings.fill(-1);
+            info.vk.texture_bindings.fill(-1);
+            info.vk.offset_tex_scale.fill(-1);
+        }
+        program.info[1].vk.pixel_outputs = 1;
+        program.vs = gx2vk::shader_module(
+            VK_SHADER_STAGE_VERTEX_BIT,
+            "#version 450\n"
+            "const vec2 kPos[4]=vec2[4](vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,1.0));\n"
+            "void main(){gl_Position=vec4(kPos[gl_VertexIndex&3],0.0,1.0);}\n");
+        program.ps_source =
+            "#version 450\nlayout(location=0)out vec4 c;void main(){c=vec4(0.25,0.5,0.75,1.0);}\n";
+        require(program.vs && create_program_layouts(program, true), "quad test program layout failed");
+        ColorTarget target;
+        target.width = target.height = 16;
+        gx2vk::ImageDesc cd;
+        cd.width = cd.height = 16;
+        cd.usage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        require(gx2vk::create_image(target.image, cd), "quad test color target failed");
+        VkClearColorValue zero{};
+        clear_image_color(target.image, zero);
+        std::vector<uint32_t> quad_idx;
+        append_quad_triangles(quad_idx, 0, 1, 2, 3, false);
+        IndexStream indices;
+        indices.indexed = true;
+        indices.type = VK_INDEX_TYPE_UINT32;
+        indices.count = uint32_t(quad_idx.size());
+        indices.span = gx2vk::upload(quad_idx.size() * 4, 16);
+        require(indices.span.data != nullptr, "quad test index upload failed");
+        std::memcpy(indices.span.data, quad_idx.data(), quad_idx.size() * 4);
+        S.raster = RasterState{};
+        S.raster.viewport[2] = S.raster.viewport[3] = 16;
+        S.draw_instances = 1;
+        S.draw_first_instance = 0;
+        S.target_masks = 1;
+        S.framebuffer = {};
+        S.framebuffer.colors[0] = &target;
+        S.framebuffer.valid = true;
+        note_framebuffer_changed();
+        require(issue_draw_program(&program, nullptr, 0x13, 4, 0, indices, false, nullptr),
+                "QUADS GPU draw failed");
+        end_rendering();
+        require(gx2vk::finish(), "QUADS GPU draw completion failed");
+        std::vector<uint8_t> rgba;
+        require(gx2vk::read_image(target.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 16, 16, rgba),
+                "QUADS readback failed");
+        for (unsigned p = 0; p < 16 * 16; ++p)
+            require(std::abs(int(rgba[p * 4 + 0]) - 64) <= 2 && std::abs(int(rgba[p * 4 + 1]) - 128) <= 2 &&
+                        std::abs(int(rgba[p * 4 + 2]) - 191) <= 2,
+                    "QUADS triangle expansion missed pixels");
+        // Verify per-slot swizzle_override returns distinct views without mutating tex.swizzle.
+        TexObject swiz_tex;
+        swiz_tex.image = &target.image;
+        swiz_tex.view_format = VK_FORMAT_R8G8B8A8_UNORM;
+        swiz_tex.levels = 1;
+        swiz_tex.layers = 1;
+        swiz_tex.swizzle = 0x06880000u; // RGBA
+        const uint32_t swiz_abgr = (3u << 16) | (2u << 19) | (1u << 22) | (0u << 25);
+        const VkImageView v_rgba = tex_object_view(swiz_tex, 2, false, false, swiz_tex.swizzle);
+        const VkImageView v_abgr = tex_object_view(swiz_tex, 2, false, false, swiz_abgr);
+        require(v_rgba != VK_NULL_HANDLE && v_abgr != VK_NULL_HANDLE && v_rgba != v_abgr,
+                "per-slot swizzle_override failed to produce distinct views");
+        require(swiz_tex.swizzle == 0x06880000u, "tex_object_view mutated shared TexObject::swizzle");
+        S.framebuffer = {};
+        gx2vk::destroy_image(target.image);
+        require(gx2vk::finish(), "QUADS cleanup wait failed");
+        s_last_pipeline_lookup.reset();
+        s_pipeline_req_mru.fill({});
+        for (auto it = s_pipelines.begin(); it != s_pipelines.end();) {
+            uint32_t id = 0;
+            std::memcpy(&id, it->first.data(), 4);
+            if (id != program.id) {
+                ++it;
+                continue;
+            }
+            if (auto pipe = await_compile(it->second)) vkDestroyPipeline(gx2vk::device(), pipe, nullptr);
+            it = s_pipelines.erase(it);
+        }
+        release_program_layouts(program);
+        reset_command_tracking();
+    }
+    // 3. depth_to_depth_pass GPU scaling test (D32_SFLOAT and D32_SFLOAT_S8_UINT when supported).
+    auto check_depth_copy = [&](VkFormat fmt, bool attachable) {
+        gx2vk::Image src, dst;
+        gx2vk::ImageDesc sd;
+        sd.format = fmt;
+        sd.width = 16;
+        sd.height = 16;
+        sd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        require(gx2vk::create_image(src, sd), "depth_to_depth src allocation failed");
+        gx2vk::ImageDesc dd;
+        dd.format = fmt;
+        dd.width = 8;
+        dd.height = 8;
+        dd.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                   (attachable ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0u);
+        require(gx2vk::create_image(dst, dd), "depth_to_depth dst allocation failed");
+        clear_image_depth(src, 0.375f, 0);
+        clear_image_depth(dst, 1.0f, 0);
+        require(gx2r::depth_to_depth_pass(src, 0, 0, dst, 0, 0, 8, 8), "depth_to_depth_pass failed");
+        require(gx2vk::finish(), "depth_to_depth_pass completion failed");
+        std::vector<uint8_t> bytes;
+        require(gx2vk::read_image(dst, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 8, 8, bytes), "depth_to_depth readback failed");
+        require(bytes.size() == 8 * 8 * 4, "depth_to_depth unexpected readback size");
+        for (unsigned p = 0; p < 8 * 8; ++p) {
+            float z = 0.0f;
+            std::memcpy(&z, bytes.data() + p * 4, 4);
+            require(std::abs(z - 0.375f) < 1e-5f, "depth_to_depth_pass output depth mismatch");
+        }
+        gx2vk::destroy_image(src);
+        gx2vk::destroy_image(dst);
+    };
+    check_depth_copy(VK_FORMAT_D32_SFLOAT, true);
+    check_depth_copy(VK_FORMAT_D32_SFLOAT, false);
+    if (gx2vk::format_supports(VK_FORMAT_D32_SFLOAT_S8_UINT,
+                               VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+        check_depth_copy(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
+    require(gx2vk::finish(), "depth_to_depth cleanup wait failed");
+    require(gx2vk::validation_error_count() == 0, "Vulkan validation error in quads/depth_to_depth test");
+    std::printf("{\"metric\":\"quads_and_depth_copy\",\"passed\":true}\n");
 }
 #endif
 
@@ -7119,10 +7508,14 @@ void gx2r::shutdown_draw_state() {
     for (auto& [key, pipeline] : s_transfer_pipelines)
         if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
     s_transfer_pipelines.clear();
+    for (auto& [key, pipeline] : s_depth_transfer_pipelines)
+        if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    s_depth_transfer_pipelines.clear();
     if (s_transfer_layout) vkDestroyPipelineLayout(device, s_transfer_layout, nullptr);
     if (s_transfer_set) vkDestroyDescriptorSetLayout(device, s_transfer_set, nullptr);
     s_transfer_layout = VK_NULL_HANDLE;
     s_transfer_set = VK_NULL_HANDLE;
+    s_transfer_use_push = false;
     if (s_descriptor_pool) vkDestroyDescriptorPool(device, s_descriptor_pool, nullptr);
     for (auto& [serial, pool] : s_retired_pools) vkDestroyDescriptorPool(device, pool, nullptr);
     for (auto pool : s_free_descriptor_pools) vkDestroyDescriptorPool(device, pool, nullptr);

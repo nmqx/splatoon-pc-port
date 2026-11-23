@@ -166,6 +166,7 @@ void gx2_render_vk_test_lifetime();
 void gx2_render_vk_test_heavy(bool overdraw, bool push);
 void gx2_render_vk_test_watch_ranges();
 void gx2_render_vk_test_vertex_plans();
+void gx2_render_vk_test_quads_and_depth_copy();
 void gx2_render_vk_test_packet_batches();
 void gx2_render_vk_test_plaza();
 void gx2_render_vk_test_npc(unsigned characters, bool push);
@@ -594,7 +595,7 @@ int main(int argc, char** argv) {
         }
         if (!npc_characters && mode != "fallback" && mode != "push" && mode != "churn" && mode != "contracts" &&
             mode != "lifetime" && mode != "heavy" && mode != "heavy_push" && mode != "overdraw" && mode != "watch" &&
-            mode != "geometry" && mode != "packets" && mode != "plaza")
+            mode != "geometry" && mode != "quads_depth" && mode != "packets" && mode != "plaza")
             throw std::runtime_error("unknown authored benchmark");
         if (!gx2vk::init(nullptr)) return 77;
         gx2_render_init();
@@ -608,8 +609,11 @@ int main(int argc, char** argv) {
             gx2_render_vk_test_binding_contracts();
         else if (mode == "watch")
             gx2_render_vk_test_watch_ranges();
-        else if (mode == "geometry")
+        else if (mode == "geometry") {
             gx2_render_vk_test_vertex_plans();
+            gx2_render_vk_test_quads_and_depth_copy();
+        } else if (mode == "quads_depth")
+            gx2_render_vk_test_quads_and_depth_copy();
         else if (mode == "packets")
             gx2_render_vk_test_packet_batches();
         else if (mode == "plaza")

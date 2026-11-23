@@ -333,8 +333,32 @@ char* r700_to_glsl(const R700TranslateInput& in) {
         constexpr std::string_view push =
             "layout(push_constant) uniform RbrewPushConstants { int rbrew_base_instance; };\n";
         const size_t extra = in.is_pixel ? 0 : push.size();
-        const char* line = extra ? static_cast<const char*>(std::memchr(src, '\n', length)) : nullptr;
-        const size_t prefix = line ? size_t(line - src) + 1 : 0;
+        size_t prefix = 0;
+        if (extra) {
+            if (const char* line = static_cast<const char*>(std::memchr(src, '\n', length))) {
+                prefix = size_t(line - src) + 1;
+                // GLSL §3.3 requires #extension directives before any non-preprocessor
+                // tokens; advance past all leading #extension directives.
+                size_t scan = prefix;
+                while (scan < length) {
+                    const char* nl = static_cast<const char*>(std::memchr(src + scan, '\n', length - scan));
+                    const size_t line_end = nl ? size_t(nl - src) + 1 : length;
+                    size_t p = scan;
+                    while (p < line_end && (src[p] == ' ' || src[p] == '\t' || src[p] == '\r' || src[p] == '\n')) ++p;
+                    if (p == line_end) {
+                        scan = line_end;
+                        continue;
+                    }
+                    if (line_end - p >= 10 && std::memcmp(src + p, "#extension", 10) == 0 &&
+                        (p + 10 == line_end || src[p + 10] == ' ' || src[p + 10] == '\t')) {
+                        prefix = line_end;
+                        scan = line_end;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
         size_t main_pos = std::string_view::npos;
         size_t body_pos = std::string_view::npos;
         if (!default_decls.empty()) {

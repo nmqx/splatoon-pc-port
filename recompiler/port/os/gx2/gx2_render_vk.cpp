@@ -1325,10 +1325,11 @@ void gx2_render_set_polygon_control(uint32_t front_face, bool cull_front, bool c
 
 void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t count) {
     bool mask = false, blend = false, alpha = false, point = false, restart = false, viewport = false, scissor = false,
-         stencil = false, polygon = false, offset = false, blend_control = false, color_control = false;
+         stencil = false, polygon = false, offset = false, color_control = false;
+    uint8_t blend_control_mask = 0;
     for (size_t i = 0; i < count; ++i) {
         const uint32_t r = writes[i].index;
-        blend_control |= r == 0xA1E0;
+        if (r >= 0xA1E0 && r <= 0xA1E7) blend_control_mask |= uint8_t(1u << (r - 0xA1E0));
         color_control |= r == 0xA202;
         mask |= r == 0xA08E;
         blend |= r >= 0xA105 && r <= 0xA108;
@@ -1349,7 +1350,7 @@ void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t 
     };
     if (mask) gx2_render_set_target_channel_masks(S.regs[0xA08E]);
     if (blend) S.raster.blend_color = {f(0xA105), f(0xA106), f(0xA107), f(0xA108)};
-    // CB_BLEND0_CONTROL / CB_COLOR_CONTROL written by display lists (layout
+    // CB_BLEND0..7_CONTROL / CB_COLOR_CONTROL written by display lists (layout
     // materials build theirs this way). They were ignored, so UI text kept
     // the previous material's blend: barely visible on the TV, but text
     // rendered into an offscreen capture (Splatoon's button labels) got alpha
@@ -1358,18 +1359,41 @@ void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t 
         const char* v = std::getenv("RBREW_DL_BLEND");
         return !(v && v[0] == '0');
     }();
-    if ((blend_control || color_control) && dl_blend) {
-        const uint32_t color = S.regs[0xA202], w = S.regs[0xA1E0];
+    if ((blend_control_mask || color_control) && dl_blend) {
+        const uint32_t color = S.regs[0xA202];
         // Without a CB_COLOR_CONTROL write the enable stays; without a
-        // CB_BLEND0_CONTROL write the factors stay.
-        const bool enable = color_control ? ((color >> 8) & 1) != 0 : S.raster.blend;
-        if (blend_control) {
-            const bool separate = (w >> 29) & 1;
-            const uint32_t src = w & 0x1F, dst = (w >> 8) & 0x1F, combine = (w >> 5) & 7;
-            gx2_render_set_blend_control(true, src, dst, combine, separate ? (w >> 16) & 0x1F : src,
-                                         separate ? (w >> 24) & 0x1F : dst, separate ? (w >> 21) & 7 : combine);
+        // CB_BLENDn_CONTROL write the factors stay.
+        for (unsigned t = 0; t < 8; ++t) {
+            auto& tb = S.raster.target_blends[t];
+            if (color_control) tb.enable = ((color >> (8 + t)) & 1) != 0;
+            if ((blend_control_mask >> t) & 1u) {
+                const uint32_t w = S.regs[0xA1E0 + t];
+                const bool separate = ((w >> 29) & 1) != 0;
+                const uint32_t src = w & 0x1F, dst = (w >> 8) & 0x1F, combine = (w >> 5) & 7;
+                const uint32_t asrc = separate ? ((w >> 16) & 0x1F) : src;
+                const uint32_t adst = separate ? ((w >> 24) & 0x1F) : dst;
+                const uint32_t acombine = separate ? ((w >> 21) & 7) : combine;
+                tb.color_src = gx2_blend_factor(src);
+                tb.color_dst = gx2_blend_factor(dst);
+                tb.color_op = gx2_blend_equation(combine);
+                tb.alpha_src = gx2_blend_factor(asrc);
+                tb.alpha_dst = gx2_blend_factor(adst);
+                tb.alpha_op = gx2_blend_equation(acombine);
+                tb.separate_alpha = separate;
+            }
         }
-        S.raster.blend = enable;
+        S.raster.per_target_blend_valid = true;
+        // Maintain legacy target-0 blend fields for callers, captures and logs.
+        const auto& tb0 = S.raster.target_blends[0];
+        S.raster.blend = tb0.enable;
+        if (blend_control_mask & 1u) {
+            S.raster.blend_src_rgb = tb0.color_src;
+            S.raster.blend_dst_rgb = tb0.color_dst;
+            S.raster.blend_eq_rgb = tb0.color_op;
+            S.raster.blend_src_alpha = tb0.alpha_src;
+            S.raster.blend_dst_alpha = tb0.alpha_dst;
+            S.raster.blend_eq_alpha = tb0.alpha_op;
+        }
         if (color_control) gx2_render_set_color_write(((color >> 4) & 7) != 1);
     }
     if (alpha) S.raster.alpha_to_coverage = (S.regs[0xA351] & 1) != 0;
@@ -1427,6 +1451,7 @@ void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t 
 
 void gx2_render_set_blend_control(bool blend_enable, uint32_t src_color, uint32_t dst_color, uint32_t color_combine,
                                   uint32_t src_alpha, uint32_t dst_alpha, uint32_t alpha_combine) {
+    auto& tb0 = S.raster.target_blends[0];
     if (blend_enable) {
         S.raster.blend = true;
         S.raster.blend_src_rgb = gx2_blend_factor(src_color);
@@ -1435,8 +1460,17 @@ void gx2_render_set_blend_control(bool blend_enable, uint32_t src_color, uint32_
         S.raster.blend_dst_alpha = gx2_blend_factor(dst_alpha);
         S.raster.blend_eq_rgb = gx2_blend_equation(color_combine);
         S.raster.blend_eq_alpha = gx2_blend_equation(alpha_combine);
+        tb0.enable = true;
+        tb0.color_src = S.raster.blend_src_rgb;
+        tb0.color_dst = S.raster.blend_dst_rgb;
+        tb0.color_op = S.raster.blend_eq_rgb;
+        tb0.alpha_src = S.raster.blend_src_alpha;
+        tb0.alpha_dst = S.raster.blend_dst_alpha;
+        tb0.alpha_op = S.raster.blend_eq_alpha;
+        tb0.separate_alpha = (src_color != src_alpha) || (dst_color != dst_alpha) || (color_combine != alpha_combine);
     } else {
         S.raster.blend = false;
+        tb0.enable = false;
     }
 }
 
@@ -1642,11 +1676,89 @@ static bool ensure_texture_storage(Texture& entry, uint32_t target, VkFormat for
     desc.layers = type == VK_IMAGE_TYPE_3D ? 1 : layers;
     desc.levels = levels;
     desc.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (depth_format && gx2vk::format_supports(format, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+        desc.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if (!gx2vk::format_is_compressed(format) && !depth_format) desc.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     if (target == wire::TEXTURE_CUBE_MAP_ARRAY) desc.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (!gx2vk::create_image(entry.image, desc)) return false;
     entry.tex.image = &entry.image;
     return true;
+}
+
+static VkComponentSwizzle swizzle_of_sel(uint32_t sel) {
+    static const VkComponentSwizzle map[6] = {VK_COMPONENT_SWIZZLE_R,    VK_COMPONENT_SWIZZLE_G,
+                                              VK_COMPONENT_SWIZZLE_B,    VK_COMPONENT_SWIZZLE_A,
+                                              VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
+    return sel < 6 ? map[sel] : VK_COMPONENT_SWIZZLE_ZERO;
+}
+
+static VkFormat integer_view_format_of(VkFormat f, bool sint) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: return sint ? VK_FORMAT_R8_SINT : VK_FORMAT_R8_UINT;
+    case VK_FORMAT_R8G8_UNORM: return sint ? VK_FORMAT_R8G8_SINT : VK_FORMAT_R8G8_UINT;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB: return sint ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UINT;
+    case VK_FORMAT_R16_SFLOAT: return sint ? VK_FORMAT_R16_SINT : VK_FORMAT_R16_UINT;
+    case VK_FORMAT_R16G16_SFLOAT: return sint ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16G16_UINT;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return sint ? VK_FORMAT_R16G16B16A16_SINT : VK_FORMAT_R16G16B16A16_UINT;
+    case VK_FORMAT_R32_SFLOAT: return sint ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_UINT;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT: return sint ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+VkImageView gx2r::tex_object_view(TexObject& tex, uint32_t dim, bool integer_sampler, bool sint_sampler,
+                                  uint32_t swizzle_override) {
+    const uint8_t flags = uint8_t((dim & 7u) | (integer_sampler ? 8u : 0u) | (sint_sampler ? 16u : 0u) |
+                                  (tex.integer ? 32u : 0u) | (tex.depth ? 64u : 0u));
+    const uint64_t img_serial = tex.image ? tex.image->image_serial : 0;
+    if (tex.cached_view != VK_NULL_HANDLE && img_serial != 0 && tex.cached_image_serial == img_serial &&
+        tex.cached_view_flags == flags && tex.cached_view_format == tex.view_format &&
+        tex.cached_swizzle == swizzle_override && tex.cached_base_level == tex.params.base_level &&
+        tex.cached_max_level == tex.params.max_level && tex.cached_levels == tex.levels &&
+        tex.cached_layers == tex.layers) {
+        return tex.cached_view;
+    }
+    gx2vk::ViewDesc v;
+    v.type = dim == 1   ? VK_IMAGE_VIEW_TYPE_1D
+             : dim == 3 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+             : dim == 4 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
+             : dim == 5 ? VK_IMAGE_VIEW_TYPE_3D
+                        : VK_IMAGE_VIEW_TYPE_2D;
+    v.format = tex.view_format;
+    if (integer_sampler && !tex.integer)
+        v.format = integer_view_format_of(tex.view_format, sint_sampler);
+    else if (integer_sampler && tex.integer) {
+        // usampler vs isampler of a 128-bit integer target
+        if (sint_sampler && v.format == VK_FORMAT_R32G32B32A32_UINT) v.format = VK_FORMAT_R32G32B32A32_SINT;
+        if (!sint_sampler && v.format == VK_FORMAT_R32G32B32A32_SINT) v.format = VK_FORMAT_R32G32B32A32_UINT;
+    }
+    const uint32_t w4 = swizzle_override;
+    v.swizzle = {swizzle_of_sel((w4 >> 16) & 7), swizzle_of_sel((w4 >> 19) & 7), swizzle_of_sel((w4 >> 22) & 7),
+                 swizzle_of_sel((w4 >> 25) & 7)};
+    const uint32_t base = std::min(tex.params.base_level, tex.levels ? tex.levels - 1 : 0);
+    const uint32_t last = std::min(tex.levels ? tex.levels - 1 : 0, tex.params.max_level);
+    v.base_level = base;
+    v.levels = last >= base ? last - base + 1 : 1;
+    v.base_layer = 0;
+    v.layers = v.type == VK_IMAGE_VIEW_TYPE_3D                                        ? 1
+               : (v.type == VK_IMAGE_VIEW_TYPE_2D || v.type == VK_IMAGE_VIEW_TYPE_1D) ? 1
+                                                                                      : std::max(1u, tex.layers);
+    if (tex.depth) v.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    const VkImageView view = gx2vk::image_view(*tex.image, v);
+    tex.cached_view = view;
+    tex.cached_image_serial = img_serial;
+    tex.cached_view_format = tex.view_format;
+    tex.cached_swizzle = swizzle_override;
+    tex.cached_base_level = tex.params.base_level;
+    tex.cached_max_level = tex.params.max_level;
+    tex.cached_levels = tex.levels;
+    tex.cached_layers = tex.layers;
+    tex.cached_view_flags = flags;
+    return view;
 }
 
 template <class Target> static bool live_copy_needed(Texture& destination, const Target& source) {
@@ -1726,6 +1838,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
         std::memcpy(bound_slot.descriptor.data(), data, GX2TEX_SIZEOF);
     }
     const uint32_t word4 = descriptor_word(data, 0x90);
+    bound_slot.swizzle = word4;
     r700_texture_registers(S.regs.data(), data, slot);
 
     auto& cached = S.texture_entries[slot];
@@ -1773,7 +1886,6 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
     // byte-swaps on the 99% cache-hit path.
     if (!s_cube_probe && entry.created && entry.hash_valid && !entry.verify && entry.depth_revision == eff_depth_rev &&
         entry.no_depth_alias && entry.color_revision == eff_color_rev && entry.no_color_alias) {
-        entry.tex.swizzle = word4;
         bind_unit(slot, &entry.tex);
         return;
     }
@@ -1849,10 +1961,10 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                     view.id = S.next_object_id++;
                     view.target = target;
                     view.layers = 1;
+                    view.swizzle = word4;
                 }
                 sampled = &view;
             }
-            sampled->swizzle = word4;
             bind_unit(slot, sampled);
             s_refresh_alias_memo[slot] = {img_ptr,
                                           eff_color_rev,
@@ -1903,7 +2015,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             entry.tex.depth = true;
             entry.tex.integer = entry.tex.compressed = false;
             entry.tex.complete_storage = true;
-            entry.tex.swizzle = word4;
+            if (!same_storage) entry.tex.swizzle = word4;
             entry.tex.params = render_target_params(true);
             entry.tex.params.base_level = std::min(first_mip, mip_levels - 1);
             entry.tex.params.max_level =
@@ -1919,13 +2031,13 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                 region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
                 region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, key[5], key[6] - first_slice, 1};
                 region.extent = {depth.width, depth.height, 1};
+                bool copied = false;
                 if (depth.image.desc.width == depth.width && depth.image.desc.height == depth.height) {
                     vkCmdCopyImage(cb, depth.image.image, VK_IMAGE_LAYOUT_GENERAL, entry.image.image,
                                    VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-                } else {
-                    if (!gx2vk::format_supports(depth.format,
-                                                VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT))
-                        return;
+                    copied = true;
+                } else if (gx2vk::format_supports(depth.format,
+                                                  VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
                     VkImageBlit blit{};
                     blit.srcSubresource = region.srcSubresource;
                     blit.dstSubresource = region.dstSubresource;
@@ -1933,7 +2045,12 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                     blit.dstOffsets[1] = {int32_t(depth.width), int32_t(depth.height), 1};
                     vkCmdBlitImage(cb, depth.image.image, VK_IMAGE_LAYOUT_GENERAL, entry.image.image,
                                    VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+                    copied = true;
+                } else {
+                    copied = depth_to_depth_pass(const_cast<gx2vk::Image&>(depth.image), 0, 0, entry.image, key[5],
+                                                 key[6] - first_slice, depth.width, depth.height);
                 }
+                if (!copied) continue;
                 live_copy_recorded(entry, depth);
                 if (g_trace_active || shadow_log())
                     RBREW_LOG_DEBUG(
@@ -2050,13 +2167,12 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                     entry.tex.params.min_filter = entry.tex.params.mag_filter = wire::LINEAR;
                     entry.tex.params.wrap_s = entry.tex.params.wrap_t = wire::CLAMP_TO_EDGE;
                     entry.tex.params.max_level = 0;
+                    entry.tex.swizzle = word4;
                 }
-                entry.tex.swizzle = word4;
                 bind_unit(slot, &entry.tex);
                 return;
             }
             if (target == wire::TEXTURE_2D && texture_view_matches(key, data) && cb.image.image) {
-                cb.tex.swizzle = word4;
                 bind_unit(slot, &cb.tex);
                 if (entry.no_depth_alias)
                     s_refresh_alias_memo[slot] = {img_ptr, eff_color_rev, eff_depth_rev, nullptr, 0, &cb.tex, word4,
@@ -2083,8 +2199,8 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                     view.tex.params = render_target_params(gf.integer);
                     view.tex.params.max_level = 1000; // glTextureView with one level
                     view.tex.coordinate_scale = cb.tex.coordinate_scale;
+                    view.tex.swizzle = word4;
                 }
-                view.tex.swizzle = word4;
                 bind_unit(slot, &view.tex);
                 if (entry.no_depth_alias)
                     s_refresh_alias_memo[slot] = {img_ptr, eff_color_rev, eff_depth_rev, nullptr, 0, &view.tex, word4,
@@ -2093,7 +2209,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             }
         }
     }
-    entry.tex.swizzle = word4;
+    if (!entry.hash_valid) entry.tex.swizzle = word4;
     bind_unit(slot, &entry.tex);
 
     bool upload = !entry.hash_valid;
@@ -2228,10 +2344,13 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             const uint8_t* level0 = detiled ? (decoded_span.data ? decoded_span.data : linear.data()) : pixels;
             const uint32_t bw = vf.compressed ? (w + 3) / 4 : w, bh = vf.compressed ? (h + 3) / 4 : h;
             const size_t level0_bytes = size_t(bw) * bh * (vf.compressed ? vf.block : vf.bpp) * layers;
+            bool level0_uploaded = false;
             if (vf.depth) {
                 clear_image_depth(entry.image, 0.0f, 0); // GPU allocates depth textures without data
+                level0_uploaded = true;
             } else if (detiled && decoded_span.data) {
                 upload_image_span(entry.image, 0, 0, layers, w, h, layers, decoded_span);
+                level0_uploaded = true;
             } else if (level0 && (detiled || !vf.compressed || target != wire::TEXTURE_2D || level0_bytes <= img_sz)) {
                 // Undetiled CPU bytes are uploaded as GPU would (they may be short).
                 if (!detiled && img_sz > 0 && img_sz < level0_bytes) {
@@ -2246,6 +2365,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                         std::memcpy(padded.data(), level0, img_sz);
                         upload_image_level(entry.image, 0, 0, layers, w, h, layers, padded.data(), level0_bytes, 0);
                     }
+                    level0_uploaded = true;
                 } else {
                     // As in GPU, a zero imageSize does not cap the unpacked
                     // texel upload. Validate the actual range before reading.
@@ -2255,10 +2375,17 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                             upload_image_span(entry.image, 0, 0, layers, w, h, layers, decoded_span);
                         } else
                             upload_image_level(entry.image, 0, 0, layers, w, h, layers, level0, level0_bytes, 0);
+                        level0_uploaded = true;
                     }
                 }
-            } else {
-                clear_image_color(entry.image, zero_color());
+            }
+            if (!level0_uploaded) {
+                if (!vf.compressed) {
+                    clear_image_color(entry.image, zero_color());
+                } else {
+                    std::vector<uint8_t> zeros(level0_bytes);
+                    upload_image_level(entry.image, 0, 0, layers, w, h, layers, zeros.data(), zeros.size(), 0);
+                }
             }
             // Texture packs (gx2_texture_pack.h): level 0 by content hash.
             if (gx2texpack::dumping() && target == wire::TEXTURE_2D && layers == 1 && !vf.depth && level0 &&
@@ -2392,9 +2519,9 @@ void gx2r::refresh_bound_render_texture(uint32_t unit, uint8_t* mem) {
     if (direct.direct && direct.tex && S.units[unit][0] == direct.tex && direct.image == image &&
         direct.color_rev == eff_color_rev && direct.depth_rev == eff_depth_rev &&
         (!direct.alt_image || direct.alt_image->content_generation == direct.alt_gen)) {
-        // Restore this slot's swizzle in case another slot sampled the same
-        // render target with a different component mapping since our bind.
-        direct.tex->swizzle = direct.swizzle;
+        // Keep this slot's swizzle on BoundTexture without clobbering the
+        // shared render target's TexObject::swizzle across texture units.
+        S.bound_textures[unit].swizzle = direct.swizzle;
         return;
     }
     const auto depth = image_views(S.depth_map, image);
@@ -2739,6 +2866,11 @@ void gx2_render_copy_surface(const uint8_t* src, uint32_t src_mip, uint32_t src_
             VkCommandBuffer cb = gx2vk::cmd();
             gx2vk::barrier_if_dirty();
             const VkImageAspectFlags aspect = src_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            const VkImageAspectFlags copy_aspect =
+                (src_depth && (source_image->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+                 (target.aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
+                    ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                    : aspect;
             const uint32_t src_w = std::max(1u, source_image->desc.width >> source_level),
                            src_h = std::max(1u, source_image->desc.height >> source_level);
             const uint32_t swidth = std::max(1u, sk[2] >> src_mip), sheight = std::max(1u, sk[3] >> src_mip);
@@ -2748,13 +2880,15 @@ void gx2_render_copy_surface(const uint8_t* src, uint32_t src_mip, uint32_t src_
             const uint32_t dw = std::max(1u, uint32_t(uint64_t(width) * target.desc.width / dwidth)),
                            dh = std::max(1u, uint32_t(uint64_t(height) * target.desc.height / dheight));
             const bool same_format = source_image->desc.format == target.desc.format;
+            bool copied = false;
             if (same_format && cw == dw && ch == dh) {
                 VkImageCopy region{};
-                region.srcSubresource = {aspect, source_level, 0, 1};
-                region.dstSubresource = {aspect, 0, 0, 1};
+                region.srcSubresource = {copy_aspect, source_level, 0, 1};
+                region.dstSubresource = {copy_aspect, 0, 0, 1};
                 region.extent = {cw, ch, 1};
                 vkCmdCopyImage(cb, source_image->image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL,
                                1, &region);
+                copied = true;
             } else if ((!src_depth || same_format) &&
                        gx2vk::format_is_integer(source_image->desc.format) ==
                            gx2vk::format_is_integer(target.desc.format) &&
@@ -2768,8 +2902,11 @@ void gx2_render_copy_surface(const uint8_t* src, uint32_t src_mip, uint32_t src_
                 blit.dstOffsets[1] = {int32_t(dw), int32_t(dh), 1};
                 vkCmdBlitImage(cb, source_image->image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL,
                                1, &blit, VK_FILTER_NEAREST);
+                copied = true;
+            } else if (src_depth) {
+                copied = depth_to_depth_pass(*source_image, source_level, 0, target, 0, 0, dw, dh);
             }
-            gx2vk::note_gpu_write(target);
+            if (copied) gx2vk::note_gpu_write(target);
         }
     }
     S.color_targets = color_targets;
@@ -3752,7 +3889,8 @@ bool gx2_render_vk_unit_texture(uint32_t unit, uint32_t target, Gx2VkTextureView
     o.levels = t->levels;
     o.layers = t->image->desc.layers;
     o.vk_format = int(t->view_format);
-    for (unsigned c = 0; c < 4; ++c) o.swizzle[c] = gl_swizzle_enum((t->swizzle >> (16 + 3 * c)) & 7);
+    const uint32_t w4 = S.bound_textures[unit].address ? S.bound_textures[unit].swizzle : t->swizzle;
+    for (unsigned c = 0; c < 4; ++c) o.swizzle[c] = gl_swizzle_enum((w4 >> (16 + 3 * c)) & 7);
     o.min_filter = t->params.min_filter;
     o.mag_filter = t->params.mag_filter;
     o.max_level = t->params.max_level;
