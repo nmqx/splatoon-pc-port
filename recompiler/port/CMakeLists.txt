@@ -64,7 +64,18 @@ target_compile_definitions(rbrew_zlib_static PUBLIC Z_PREFIX)
 set_target_properties(rbrew_zlib_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(RBREW_ZLIB_HEADER "${rbrew_zlib_SOURCE_DIR}/zlib.h")
 
+option(RBREW_ENABLE_AVX2 "Enable AVX2 codegen on x64 builds (disable for older non-AVX2 CPUs)" ON)
+
 add_subdirectory(third_party/cemu_shader)
+if(MSVC AND NOT RBREW_ENABLE_AVX2)
+    get_target_property(_rbrew_cemu_shader_opts cemu_shader COMPILE_OPTIONS)
+    if(_rbrew_cemu_shader_opts)
+        list(FILTER _rbrew_cemu_shader_opts EXCLUDE REGEX "/arch:AVX2")
+        set_target_properties(cemu_shader PROPERTIES COMPILE_OPTIONS "${_rbrew_cemu_shader_opts}")
+    endif()
+elseif(RBREW_ENABLE_AVX2 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(cemu_shader PRIVATE "$<$<CONFIG:Release>:-mavx2>")
+endif()
 
 # Manifest
 # Every Manifest/*.manifest describes one image. Prefer an explicit
@@ -237,6 +248,7 @@ add_library(gambit_runtime STATIC
     loader/gambit_loader.cpp
     loader/native_console_profile.cpp
     runtime/splatoon_diagnostics.cpp
+    runtime/crash_diagnostics.cpp
     runtime/discord_rpc.cpp
     runtime/port_settings.cpp
 )
@@ -247,9 +259,10 @@ target_include_directories(gambit_runtime PUBLIC
 )
 
 target_compile_definitions(gambit_runtime PUBLIC HAVE_SDL2)
-# Gameplay builds contain no console/file diagnostics or profiler hooks.
-# RBREW_DIAGNOSTIC_RUNTIME keeps them for a separately linked, one-off
-# diagnostic copy (capture/trace); never for the delivered game.
+# Gameplay builds strip verbose logging (DEBUG/INFO/WARN) and profiler/capture
+# hooks via RBREW_DISABLE_LOGGING, while logger.hpp preserves critical ERROR and
+# FATAL logs (Vulkan, shader compilation, OOM) in Release builds.
+# RBREW_DIAGNOSTIC_RUNTIME keeps all verbose diagnostics for a one-off diagnostic copy.
 option(RBREW_DIAGNOSTIC_RUNTIME "Keep diagnostics in the runtime for a one-off diagnostic copy" OFF)
 if(NOT RBREW_DIAGNOSTIC_RUNTIME)
     target_compile_definitions(gambit_runtime PRIVATE RBREW_DISABLE_LOGGING)
@@ -264,7 +277,7 @@ option(HYPER_OPTIMIZE "Aggressive CPU optimizations for guest code (zero-check m
 if(HYPER_OPTIMIZE)
     message(STATUS "HYPER_OPTIMIZE enabled: zero-check guest memory, aggressive inlining")
 endif()
-# RBREW_FAST_LINK: same optimized guest code (zero-check memory, /O2, AVX2), but
+# RBREW_FAST_LINK: same optimized guest code (zero-check memory, /O2, optional AVX2), but
 # without /GL on gambit_generated so generated parts compile in parallel and a
 # single runtime edit relinks quickly (~15-20 s). Host runtime IPO
 # (RBREW_RUNTIME_IPO, default ON) stays independent so gambit_runtime and
@@ -296,10 +309,14 @@ target_link_libraries(gambit_runtime PRIVATE rbrew_zlib_static)
 set_source_files_properties(os/stubs/zlib_guest.cpp PROPERTIES COMPILE_DEFINITIONS "RBREW_ZLIB_HEADER=\"${RBREW_ZLIB_HEADER}\"")
 
 if(WIN32)
-    target_link_libraries(gambit_runtime PUBLIC ws2_32 winmm)
+    target_link_libraries(gambit_runtime PUBLIC ws2_32 winmm user32)
     if(HAVE_MINIAUDIO)
         target_link_libraries(gambit_runtime PUBLIC ole32 ksuser)
     endif()
+endif()
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(gambit_runtime PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 if(UNIX AND NOT APPLE AND HAVE_MINIAUDIO)
@@ -354,11 +371,14 @@ if(MSVC)
     target_compile_options(gambit_generated PRIVATE "$<$<CONFIG:Debug>:/Od>" /bigobj /GS- /Gy- /EHs-c- /GR-)
     if(HYPER_OPTIMIZE)
         # Full inlining plus whole-program optimization on the generated parts.
-        # /arch:AVX2 (Haswell+) brings MOVBE and BMI2 like -march=native above.
         if(RBREW_FAST_LINK)
-            target_compile_options(gambit_generated PRIVATE /Ob2 /Oi /GT /arch:AVX2)
+            target_compile_options(gambit_generated PRIVATE /Ob2 /Oi /GT)
         else()
-            target_compile_options(gambit_generated PRIVATE /Ob2 /Oi /GT /GL /arch:AVX2)
+            target_compile_options(gambit_generated PRIVATE /Ob2 /Oi /GT /GL)
+        endif()
+        if(RBREW_ENABLE_AVX2)
+            # /arch:AVX2 (Haswell+) brings MOVBE and BMI2.
+            target_compile_options(gambit_generated PRIVATE /arch:AVX2)
         endif()
     else()
         target_compile_options(gambit_generated PRIVATE /Ob1)
@@ -423,12 +443,17 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(Gambit PRIVATE "$<$<CONFIG:Debug>:-O0>" -fno-strict-aliasing)
     endif()
     target_compile_options(gambit_runtime PRIVATE -O2)
+    if(RBREW_ENABLE_AVX2)
+        target_compile_options(gambit_runtime PRIVATE "$<$<CONFIG:Release>:-mavx2>" "$<$<CONFIG:Release>:-mfma>")
+    endif()
     if(HYPER_OPTIMIZE AND TARGET gambit_generated)
         target_compile_options(gambit_generated PRIVATE -O3)
-        # MOVBE fuses each guest load/store + bswap into one instruction and
-        # BMI2 replaces shift-by-register sequences; -march=native matches the
-        # build machine (do not redistribute such a binary).
-        target_compile_options(gambit_generated PRIVATE -march=native)
+        if(RBREW_ENABLE_AVX2)
+            # MOVBE fuses each guest load/store + bswap into one instruction and
+            # BMI2 replaces shift-by-register sequences; opt-in so default builds
+            # remain portable across older x86-64 CPUs without AVX2.
+            target_compile_options(gambit_generated PRIVATE -mavx2 -mfma -mbmi2 -mmovbe)
+        endif()
         # GCC/Clang -flto on the generated corpus OOMs the linker (the parts
         # carry thousands of large functions); MSVC /GL+/LTCG is used there.
     endif()
@@ -456,7 +481,10 @@ if(MSVC)
             target_link_options(Gambit PRIVATE /LTCG)
         endif()
     endif()
-    target_compile_options(gambit_runtime PRIVATE /utf-8 /MP "$<$<CONFIG:Release>:/arch:AVX2>")
+    target_compile_options(gambit_runtime PRIVATE /utf-8 /MP)
+    if(RBREW_ENABLE_AVX2)
+        target_compile_options(gambit_runtime PRIVATE "$<$<CONFIG:Release>:/arch:AVX2>")
+    endif()
 endif()
 
 # Optimize host-runtime boundaries without recompiling the large generated
@@ -512,6 +540,10 @@ if(RBREW_BUILD_TESTS)
     target_link_libraries(gambit_quit_confirm_tests PRIVATE gambit_runtime)
     target_include_directories(gambit_quit_confirm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME native_quit_confirm COMMAND gambit_quit_confirm_tests)
+    add_executable(gambit_crash_diagnostics_tests ../tests/test_crash_diagnostics.cpp)
+    target_link_libraries(gambit_crash_diagnostics_tests PRIVATE gambit_runtime)
+    target_include_directories(gambit_crash_diagnostics_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME native_crash_diagnostics COMMAND gambit_crash_diagnostics_tests)
     # Local developer tests/tools below are optional (not in the public tree).
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_frame_pacing.cpp")
         add_executable(gambit_frame_pacing_tests ../tests/test_frame_pacing.cpp)
@@ -574,7 +606,12 @@ if(RBREW_BUILD_TESTS)
         target_compile_definitions(gambit_guest_bench PRIVATE RBREW_HYPER_OPTIMIZE=1)
     endif()
     if(MSVC)
-        target_compile_options(gambit_guest_bench PRIVATE /Zc:tlsGuards- "$<$<CONFIG:Release>:/arch:AVX2>") # as the Gambit target
+        target_compile_options(gambit_guest_bench PRIVATE /Zc:tlsGuards-) # as the Gambit target
+        if(RBREW_ENABLE_AVX2)
+            target_compile_options(gambit_guest_bench PRIVATE "$<$<CONFIG:Release>:/arch:AVX2>")
+        endif()
+    elseif(RBREW_ENABLE_AVX2 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(gambit_guest_bench PRIVATE "$<$<CONFIG:Release>:-mavx2>" "$<$<CONFIG:Release>:-mfma>")
     endif()
     foreach(case npc_1 npc_10 npc_25 npc_50 npc_100 paired_equivalence psq_equivalence)
         add_test(NAME guest_${case} COMMAND gambit_guest_bench ${case})

@@ -440,6 +440,16 @@ void translation() {
     auto* without_registers = r700_to_glsl(zero_registers);
     require(without_registers && expected[0] == without_registers, "absent register snapshot was not zeroed");
     std::free(without_registers);
+    for (const auto& text : expected) {
+        // GLSL §3.3 requires #extension directives before any non-preprocessor declaration
+        // (such as the injected RbrewPushConstants push_constant block).
+        const auto push_pos = text.find("layout(push_constant)");
+        require(push_pos != std::string::npos, "translated VS missing RbrewPushConstants push_constant block");
+        for (size_t ext_pos = text.find("#extension"); ext_pos != std::string::npos;
+             ext_pos = text.find("#extension", ext_pos + 1)) {
+            require(ext_pos < push_pos, "GLSL #extension directive emitted after layout(push_constant)");
+        }
+    }
     measure("gx2_to_glsl", 240, [&](unsigned i) {
         auto source = translate(programs[i % programs.size()], false);
         require(source.text == expected[i % programs.size()], "GX2 translation is nondeterministic");

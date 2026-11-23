@@ -66,7 +66,33 @@ void policy() {
     a.backing_size = 300;
     range = memory_detail::mapped_range(a, 256, 257, VK_WHOLE_SIZE);
     require(range.offset == 256 && range.size == 44, "dedicated tail crossed backing allocation");
-    std::puts("memory policy: discrete, small BAR, shared fallback, non-coherent, UMA and atom ranges passed");
+
+    // AMD Radeon 890M (RDNA 3.5 iGPU) exact 3-heap topology:
+    //   Heap 0: 256 MiB DEVICE_LOCAL
+    //   Heap 1: 15.56 GiB shared system RAM
+    //   Heap 2: 256 MiB DEVICE_LOCAL (CPU-visible BAR)
+    VkPhysicalDeviceMemoryProperties igpu{};
+    igpu.memoryHeapCount = 3;
+    igpu.memoryHeaps[0] = {256ull << 20, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    igpu.memoryHeaps[1] = {15933ull << 20, 0};
+    igpu.memoryHeaps[2] = {256ull << 20, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    igpu.memoryTypeCount = 5;
+    igpu.memoryTypes[0] = {local, 0};
+    igpu.memoryTypes[1] = {visible | coherent, 1};
+    igpu.memoryTypes[2] = {local | visible | coherent, 2};
+    igpu.memoryTypes[3] = {visible | coherent | cached, 1};
+    igpu.memoryTypes[4] = {local | VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD, 0};
+    const bool shared_upload = memory_detail::prefer_shared_upload(igpu, true);
+    require(shared_upload, "low-VRAM iGPU with 15.56 GiB shared heap must prefer shared upload");
+    require(!memory_detail::prefer_shared_upload(igpu, false), "non-low-VRAM device must keep local BAR upload");
+    types = memory_detail::memory_types(igpu, ~0u, MemoryUse::Upload, shared_upload);
+    require(types.count == 3 && types.indices[0] == 1 && types.indices[1] == 3 && types.indices[2] == 2,
+            "low-VRAM iGPU upload must prefer 15.56 GiB shared coherent heap over 256 MiB BAR");
+    types = memory_detail::memory_types(igpu, ~0u, MemoryUse::DeviceLocal, shared_upload);
+    require(types.count == 4 && types.indices[0] == 0 && types.indices[1] == 2 &&
+                (types.indices[2] == 1 || types.indices[2] == 3),
+            "low-VRAM iGPU DeviceLocal must still prefer DEVICE_LOCAL with shared fallback");
+    std::puts("memory policy: discrete, small BAR, low-VRAM iGPU, shared fallback, non-coherent, UMA and atom ranges passed");
 }
 
 PFN_vkAllocateMemory original_allocate;
@@ -187,7 +213,9 @@ void allocator() {
     maximum_request = 4096;
     attempted_types.clear();
     a = allocate(requirements, MemoryUse::Upload, true);
-    const auto upload_types = memory_detail::memory_types(memory, ~0u, MemoryUse::Upload);
+    const auto upload_types =
+        memory_detail::memory_types(memory, ~0u, MemoryUse::Upload,
+                                    memory_detail::prefer_shared_upload(memory, caps().low_vram_igpu));
     require(bool(a) && a.block < 0 && a.memory_type == upload_types.indices[0], "exact-size recovery failed");
     require(attempted_types.size() == 2, "expected pool failure then exact-size success");
     free_now(a);

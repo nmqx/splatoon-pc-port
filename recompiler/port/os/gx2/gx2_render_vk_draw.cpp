@@ -83,6 +83,13 @@ bool s_streamout_only = false;
 uint32_t s_last_program = 0; // diagnostics (gx2_render_vk_debug.h)
 uint64_t s_submitted_primitives = 0;
 Framebuffer s_active_fb;
+struct ActiveFbImage {
+    VkImage image = VK_NULL_HANDLE;
+    uint64_t serial = 0;
+};
+std::array<ActiveFbImage, 9> s_active_fb_images{};
+uint32_t s_active_fb_image_count = 0;
+std::array<float, 2> s_active_fb_scale{1.0f, 1.0f};
 VkRect2D s_area{};
 uint64_t s_dynamic_serial = 0; // command buffer the tracked state belongs to
 uint64_t s_tracking_epoch = 0; // includes internal transfers within one command buffer
@@ -318,6 +325,12 @@ void gx2r::end_rendering() {
     }
     vkCmdEndRendering(cb);
     s_rendering = false;
+    s_active_fb_image_count = 0;
+    // Invalidate descriptor tracking across dynamic rendering pass boundaries
+    // so the next pass pushes/binds a full descriptor set cleanly.
+    s_bindings.descriptor_layout = VK_NULL_HANDLE;
+    s_bindings.descriptor_set = VK_NULL_HANDLE;
+    s_bindings.is_push = false;
     gx2vk::note_gpu_write();
 }
 
@@ -398,6 +411,23 @@ bool gx2r::ensure_rendering(bool streamout_only) {
     s_rendering = true;
     s_streamout_only = streamout_only;
     s_active_fb = fb;
+    s_active_fb_image_count = 0;
+    s_active_fb_scale = {1.0f, 1.0f};
+    bool scale_set = false;
+    for (const auto* color_att : fb.colors) {
+        if (!color_att) continue;
+        if (!scale_set) {
+            s_active_fb_scale = image_coordinate_scale(color_att->image, color_att->width, color_att->height);
+            scale_set = true;
+        }
+        if (color_att->image.image)
+            s_active_fb_images[s_active_fb_image_count++] = {color_att->image.image, color_att->image.image_serial};
+    }
+    if (fb.depth) {
+        if (!scale_set) s_active_fb_scale = image_coordinate_scale(fb.depth->image, fb.depth->width, fb.depth->height);
+        if (fb.depth->image.image)
+            s_active_fb_images[s_active_fb_image_count++] = {fb.depth->image.image, fb.depth->image.image_serial};
+    }
     s_area = info.renderArea;
     ++C.rendering_instances;
     query_rendering_begin(cb);
@@ -554,79 +584,8 @@ static TexObject* shadow_depth_copy(const TexObject& source) {
     return &c.tex;
 }
 
-static VkComponentSwizzle swizzle_of(uint32_t sel) {
-    static const VkComponentSwizzle map[6] = {VK_COMPONENT_SWIZZLE_R,    VK_COMPONENT_SWIZZLE_G,
-                                              VK_COMPONENT_SWIZZLE_B,    VK_COMPONENT_SWIZZLE_A,
-                                              VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
-    return sel < 6 ? map[sel] : VK_COMPONENT_SWIZZLE_ZERO;
-}
-
-static VkFormat integer_view_format(VkFormat f, bool sint) {
-    switch (f) {
-    case VK_FORMAT_R8_UNORM: return sint ? VK_FORMAT_R8_SINT : VK_FORMAT_R8_UINT;
-    case VK_FORMAT_R8G8_UNORM: return sint ? VK_FORMAT_R8G8_SINT : VK_FORMAT_R8G8_UINT;
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_R8G8B8A8_SRGB: return sint ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UINT;
-    case VK_FORMAT_R16_SFLOAT: return sint ? VK_FORMAT_R16_SINT : VK_FORMAT_R16_UINT;
-    case VK_FORMAT_R16G16_SFLOAT: return sint ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16G16_UINT;
-    case VK_FORMAT_R16G16B16A16_SFLOAT: return sint ? VK_FORMAT_R16G16B16A16_SINT : VK_FORMAT_R16G16B16A16_UINT;
-    case VK_FORMAT_R32_SFLOAT: return sint ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_UINT;
-    case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT:
-    case VK_FORMAT_R32G32B32A32_SINT: return sint ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT;
-    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
-    default: return VK_FORMAT_UNDEFINED;
-    }
-}
-
 VkImageView gx2r::tex_object_view(TexObject& tex, uint32_t dim, bool integer_sampler, bool sint_sampler) {
-    const uint8_t flags = uint8_t((dim & 7u) | (integer_sampler ? 8u : 0u) | (sint_sampler ? 16u : 0u) |
-                                  (tex.integer ? 32u : 0u) | (tex.depth ? 64u : 0u));
-    const uint64_t img_serial = tex.image ? tex.image->image_serial : 0;
-    if (tex.cached_view != VK_NULL_HANDLE && img_serial != 0 && tex.cached_image_serial == img_serial &&
-        tex.cached_view_flags == flags && tex.cached_view_format == tex.view_format &&
-        tex.cached_swizzle == tex.swizzle && tex.cached_base_level == tex.params.base_level &&
-        tex.cached_max_level == tex.params.max_level && tex.cached_levels == tex.levels &&
-        tex.cached_layers == tex.layers) {
-        return tex.cached_view;
-    }
-    gx2vk::ViewDesc v;
-    v.type = dim == 1   ? VK_IMAGE_VIEW_TYPE_1D
-             : dim == 3 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-             : dim == 4 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
-             : dim == 5 ? VK_IMAGE_VIEW_TYPE_3D
-                        : VK_IMAGE_VIEW_TYPE_2D;
-    v.format = tex.view_format;
-    if (integer_sampler && !tex.integer)
-        v.format = integer_view_format(tex.view_format, sint_sampler);
-    else if (integer_sampler && tex.integer) {
-        // usampler vs isampler of a 128-bit integer target
-        if (sint_sampler && v.format == VK_FORMAT_R32G32B32A32_UINT) v.format = VK_FORMAT_R32G32B32A32_SINT;
-        if (!sint_sampler && v.format == VK_FORMAT_R32G32B32A32_SINT) v.format = VK_FORMAT_R32G32B32A32_UINT;
-    }
-    const uint32_t w4 = tex.swizzle;
-    v.swizzle = {swizzle_of((w4 >> 16) & 7), swizzle_of((w4 >> 19) & 7), swizzle_of((w4 >> 22) & 7),
-                 swizzle_of((w4 >> 25) & 7)};
-    const uint32_t base = std::min(tex.params.base_level, tex.levels ? tex.levels - 1 : 0);
-    const uint32_t last = std::min(tex.levels ? tex.levels - 1 : 0, tex.params.max_level);
-    v.base_level = base;
-    v.levels = last >= base ? last - base + 1 : 1;
-    v.base_layer = 0;
-    v.layers = v.type == VK_IMAGE_VIEW_TYPE_3D                                        ? 1
-               : (v.type == VK_IMAGE_VIEW_TYPE_2D || v.type == VK_IMAGE_VIEW_TYPE_1D) ? 1
-                                                                                      : std::max(1u, tex.layers);
-    if (tex.depth) v.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-    const VkImageView view = gx2vk::image_view(*tex.image, v);
-    tex.cached_view = view;
-    tex.cached_image_serial = img_serial;
-    tex.cached_view_format = tex.view_format;
-    tex.cached_swizzle = tex.swizzle;
-    tex.cached_base_level = tex.params.base_level;
-    tex.cached_max_level = tex.params.max_level;
-    tex.cached_levels = tex.levels;
-    tex.cached_layers = tex.layers;
-    tex.cached_view_flags = flags;
-    return view;
+    return tex_object_view(tex, dim, integer_sampler, sint_sampler, tex.swizzle);
 }
 
 static VkSamplerAddressMode vk_wrap(uint32_t wrap) {
@@ -750,8 +709,12 @@ template <class F> auto post_compile(F&& fn, bool background = false) {
     if (async_shader_compile()) {
         if (!s_compile_queue) {
             const unsigned cores = std::thread::hardware_concurrency();
-            s_compile_queue = std::make_unique<gx2vk::CompileQueue>(
-                std::clamp(cores > 2 ? cores - 2 : 1u, 1u, std::max(4u, cores > 2 ? cores - 2 : 1u)));
+            unsigned workers = cores > 2 ? cores - 2 : 1u;
+            // Cap parallel shader/pipeline compilation on AMD and low-VRAM iGPUs
+            // to avoid LLPC VkPipelineCache lock contention and memory spikes.
+            if (gx2vk::ready() && (gx2vk::caps().is_amd || gx2vk::caps().low_vram_igpu))
+                workers = std::min(workers, 4u);
+            s_compile_queue = std::make_unique<gx2vk::CompileQueue>(std::max(workers, 1u));
         }
         return s_compile_queue->post(std::move(task_fn), background);
     }
@@ -847,13 +810,15 @@ struct Program {
     std::array<bool, 2> remapped_dense{};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     bool valid = false;
+    bool canonical_seeded = false;
     struct UfBlockSlot {
         std::string bytes;
         gx2vk::Span span;
         uint64_t reserved_serial = 0;
         uint64_t sig = 0;
     };
-    std::array<std::array<UfBlockSlot, 4>, 2> ufblock_slots{};
+    static constexpr size_t kUfBlockSlots = 16;
+    std::array<std::array<UfBlockSlot, kUfBlockSlots>, 2> ufblock_slots{};
     std::array<uint8_t, 2> ufblock_mru{}, ufblock_next{};
     std::string ufblock_scratch[2]; // reusable packing storage; never GPU-resident
     uint64_t warm_key = 0;          // an exact program key that links to this program (boot warm-up)
@@ -1008,6 +973,14 @@ void trace_program_key_miss(uint32_t vs, uint32_t ps, bool reused) {
 #endif
 }
 
+bool push_descriptors_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("RBREW_PUSH_DESCRIPTORS");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+
 bool create_program_layouts(Program& p, bool allow_push = true) {
     const auto& caps = gx2vk::caps();
     p.attribute_semantics.clear();
@@ -1051,7 +1024,8 @@ bool create_program_layouts(Program& p, bool allow_push = true) {
                 bindings.push_back(
                     {uint32_t(vk.texture_bindings[t]), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, flags, nullptr});
     }
-    p.push = allow_push && caps.push_descriptor && bindings.size() <= caps.max_push_descriptors;
+    p.push = allow_push && push_descriptors_enabled() && caps.push_descriptor &&
+             bindings.size() <= caps.max_push_descriptors;
     // Like Cemu's Vulkan uniform streaming, separate changing ring offsets
     // from descriptor identity. Push descriptors cannot be dynamic; ordinary
     // sets use as many dynamic UBO bindings as this device actually supports.
@@ -2008,7 +1982,7 @@ std::unordered_map<uint64_t, ExactReads> s_exact_reads;
 // emplace; their count invalidates a key computed before a mask was discovered.
 struct ExactKeyInputs {
     std::array<uint32_t, kExactKeyRegisterCount> words;
-    std::array<uint32_t, 36> texture_bits;
+    std::array<uint8_t, 36> texture_bits; // 5 bits per unit (DIM 0..2 | NUM_FORMAT_ALL 3..4)
     uint64_t fetch_hash = 0;
     uint32_t rect = 0, points = 0, vs_attribs = 0;
     bool operator==(const ExactKeyInputs&) const = default;
@@ -2022,6 +1996,7 @@ struct ExactKeyMemo {
     const uint8_t* ps_at = nullptr; // guest bytes those generations describe
     size_t masks = 0;
     uint64_t key = 0, base = 0, canon = 0;
+    Program* prog = nullptr;
     bool valid = false;
     // A generation describes writes to one guest range only. Pages collected
     // by one query share a generation, so another program of the same size
@@ -2051,6 +2026,7 @@ struct ExactKeyMemo {
     void capture(const ExactKeyInputs& current, const uint8_t* vertex, size_t vertex_size, uint64_t vertex_written,
                  const uint8_t* pixel, size_t pixel_size, uint64_t pixel_written, uint64_t current_batch) {
         valid = false;
+        prog = nullptr;
         vs.assign(vertex, vertex + vertex_size);
         ps.assign(pixel, pixel + pixel_size);
         vs_written = vertex_written;
@@ -2069,12 +2045,21 @@ struct ExactKeyMemo {
 // Recent combinations each keep a slot, chosen by a hash of the program
 // ranges and every key input; a hit still compares all of them and every
 // code byte, exactly as the single memo did. A slot collision only recomputes.
-constexpr size_t kExactKeyMemoSlots = 1024;
+constexpr size_t kExactKeyMemoSlots = 4096;
 std::vector<ExactKeyMemo> s_exact_key_memos;
 ExactKeyMemo* s_last_exact_key_memo = nullptr; // previous draw's slot: consecutive draws often repeat it
+// Per-batch memo of shader bytecode write-watch generations: avoids re-querying
+// gx2_write_generations() on static VS/PS ranges thousands of times per batch.
+struct CodeGenSlot {
+    const uint8_t* mem = nullptr;
+    uint64_t range = 0; // address<<32 | size
+    uint64_t batch = 0;
+    uint64_t generation = kGx2WriteUntracked;
+};
+std::array<CodeGenSlot, 256> s_code_gen_cache{};
 ExactKeyMemo& exact_key_memo_slot(const ExactKeyInputs& in, const GX2ShaderProgram& vs, const GX2ShaderProgram& ps) {
     if (s_exact_key_memos.empty()) s_exact_key_memos.resize(kExactKeyMemoSlots);
-    // Only chooses a 10-bit cache slot; hit() checks full ExactKeyInputs equality.
+    // Only chooses a 12-bit cache slot; hit() checks full ExactKeyInputs equality.
     uint64_t h = (uint64_t(vs.address) << 32 | vs.size) * 0x9E3779B97F4A7C15ull;
     h ^= (uint64_t(ps.address) << 32 | ps.size) * 0xBF58476D1CE4E5B9ull;
     h ^= in.fetch_hash * 0x94D049BB133111EBull;
@@ -2085,11 +2070,14 @@ ExactKeyMemo& exact_key_memo_slot(const ExactKeyInputs& in, const GX2ShaderProgr
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
     }
     if (in.words.size() & 1) h = (h ^ in.words.back()) * 0x9E3779B97F4A7C15ull;
-    for (size_t i = 0; i < in.texture_bits.size(); i += 2) {
+    for (size_t i = 0; i + 8 <= in.texture_bits.size(); i += 8) {
         uint64_t w;
         std::memcpy(&w, in.texture_bits.data() + i, 8);
         h = (h ^ w) * 0xBF58476D1CE4E5B9ull;
     }
+    uint32_t tex_tail;
+    std::memcpy(&tex_tail, in.texture_bits.data() + 32, 4);
+    h = (h ^ tex_tail) * 0xBF58476D1CE4E5B9ull;
     h ^= h >> 33;
     return s_exact_key_memos[h & (kExactKeyMemoSlots - 1)];
 }
@@ -2275,7 +2263,9 @@ Program* resolve_active_program(uint8_t* mem) {
     const std::vector<R700FetchAttribute>* fetch_attributes = nullptr;
     Gx2PerfScope key_scope(kPerfShaderKey);
     const unsigned primitive = S.regs[0x2256] & 31;
-    const uint32_t rect = primitive == 0x11 ? 1 : primitive == 0x13 || primitive == 0x14 ? 2 : 0;
+    // QUADS (0x13) and QUAD_STRIP (0x14) expand to TRIANGLE_LIST on CPU;
+    // only RECTS (0x11) still uses the r700_rect_geometry assembly GS.
+    const uint32_t rect = primitive == 0x11 ? 1 : 0;
     // Vulkan: a points program must write gl_PointSize (from uf_pointSize),
     // so point primitives are part of the translation identity here.
     const uint32_t points = primitive == 0x01;
@@ -2333,6 +2323,12 @@ Program* resolve_active_program(uint8_t* mem) {
     const bool exact = exact_shader_key();
     uint64_t key, exact_base = 0, canon = 0;
     bool fresh_key = false; // computed now, not taken from the memo
+    ExactKeyMemo* memo_slot = nullptr;
+    bool memo_hit = false;
+    bool memo_active = false;
+    KeyHash fresh_code_hash;
+    std::array<uint32_t, kExactKeyRegisterCount> fresh_words{};
+    std::array<uint32_t, 36> fresh_tex_words{};
     if (exact) {
         ExactKeyInputs inputs;
         inputs.rect = rect;
@@ -2341,7 +2337,14 @@ Program* resolve_active_program(uint8_t* mem) {
         inputs.vs_attribs = vs_attribs;
         auto& words = inputs.words;
         const unsigned n = kExactKeyRegisterCount;
-        for (unsigned i = 0; i < n; ++i) words[i] = S.regs[kExactKeyRegisters[i]];
+        {
+            unsigned dst = 0;
+            for (const auto& range : kGx2TranslatorRegisters) {
+                const unsigned len = range.last - range.first + 1u;
+                std::memcpy(words.data() + dst, S.regs.data() + range.first, len * sizeof(uint32_t));
+                dst += len;
+            }
+        }
         // SPI_PS_INPUT_CNTL_f is read only for f < SPI_PS_IN_CONTROL_0 & 0x3F
         // (clamped to 32): the one reader is LatteShader_CreatePSInputTable.
         // The 32 words are contiguous in the key (static_assert above); index
@@ -2350,12 +2353,13 @@ Program* resolve_active_program(uint8_t* mem) {
         constexpr unsigned kPsInputWord = kExactWordIndex(0xA191);
         std::fill(words.begin() + kPsInputWord + ps_inputs, words.begin() + kPsInputWord + 32, 0u);
         // Texture words: the translator reads DIM (word0 bits 0-2) and
-        // NUM_FORMAT_ALL (word4 bits 8-9) of each unit it samples.
+        // NUM_FORMAT_ALL (word4 bits 8-9) of each unit it samples (5 bits/unit).
         auto& texture_bits = inputs.texture_bits;
         unsigned t = 0;
         for (unsigned base : kGx2TranslatorTextureBases)
             for (unsigned slot = 0; slot < 18; ++slot)
-                texture_bits[t++] = (S.regs[base + slot * 7] & 7) | ((S.regs[base + slot * 7 + 4] >> 8) & 3) << 3;
+                texture_bits[t++] =
+                    uint8_t((S.regs[base + slot * 7] & 7u) | (((S.regs[base + slot * 7 + 4] >> 8) & 3u) << 3));
         static const uint64_t kEmptyFetchHash = KeyHash{}.finish();
         uint64_t fetch_hash = kEmptyFetchHash;
         if (fs_info) {
@@ -2369,12 +2373,41 @@ Program* resolve_active_program(uint8_t* mem) {
         }
         inputs.fetch_hash = fetch_hash;
         const bool memo = exact_key_memo_enabled();
+        memo_active = memo;
         const uint64_t current_batch = gx2_write_watch_batch_id();
         Gx2WriteRange code[2] = {{vs_program.address, vs_program.size}, {ps_program.address, ps_program.size}};
-        ExactKeyMemo* memo_slot = nullptr;
-        bool memo_hit = false;
         if (memo) {
-            gx2_write_generations(mem, code, 2);
+            if (current_batch != 0) {
+                Gx2WriteRange missing[2];
+                unsigned missing_idx[2];
+                unsigned missing_count = 0;
+                CodeGenSlot* missing_slots[2];
+                for (unsigned ci = 0; ci < 2; ++ci) {
+                    const uint64_t rng = (uint64_t(code[ci].address) << 32) | code[ci].size;
+                    const size_t idx =
+                        size_t((rng ^ (rng >> 19) ^ (rng >> 37) ^ uintptr_t(mem)) & (s_code_gen_cache.size() - 1));
+                    auto& cg = s_code_gen_cache[idx];
+                    if (cg.batch == current_batch && cg.mem == mem && cg.range == rng) {
+                        code[ci].generation = cg.generation;
+                    } else {
+                        missing[missing_count] = code[ci];
+                        missing_idx[missing_count] = ci;
+                        missing_slots[missing_count] = &cg;
+                        ++missing_count;
+                    }
+                }
+                if (missing_count) {
+                    gx2_write_generations(mem, missing, missing_count);
+                    for (unsigned m = 0; m < missing_count; ++m) {
+                        const unsigned ci = missing_idx[m];
+                        code[ci].generation = missing[m].generation;
+                        *missing_slots[m] = {mem, (uint64_t(code[ci].address) << 32) | code[ci].size, current_batch,
+                                             missing[m].generation};
+                    }
+                }
+            } else {
+                gx2_write_generations(mem, code, 2);
+            }
             auto hit = [&](ExactKeyMemo& m) {
                 return m.matches(inputs, mem + vs_program.address, vs_program.size, code[0].generation,
                                  mem + ps_program.address, ps_program.size, code[1].generation, current_batch);
@@ -2410,7 +2443,7 @@ Program* resolve_active_program(uint8_t* mem) {
             h.add(&rect, sizeof(rect));
             h.add(&points, sizeof(points));
             h.add(&vs_attribs, sizeof(vs_attribs));
-            const KeyHash code = h; // tag, bytecode, primitive kind, attribute count
+            fresh_code_hash = h; // tag, bytecode, primitive kind, attribute count
             // Base: everything except the per-parameter VS output IDs and the
             // per-unit texture words, whose read sets the translation reports.
             KeyHash base = h;
@@ -2418,6 +2451,7 @@ Program* resolve_active_program(uint8_t* mem) {
                 if (i < kExactWordIndex(0xA185) || i > kExactWordIndex(0xA18E)) base.add(&words[i], 4);
             base.add(&fetch_hash, sizeof(fetch_hash));
             exact_base = base.finish();
+            for (unsigned slot = 0; slot < 36; ++slot) fresh_tex_words[slot] = texture_bits[slot];
             uint32_t known = 0;
             if (auto reads = s_exact_reads.find(exact_base); reads != s_exact_reads.end()) {
                 known = 1;
@@ -2425,42 +2459,21 @@ Program* resolve_active_program(uint8_t* mem) {
                 for (unsigned k = 0; k < 10; ++k)
                     if (k >= 8 || ((r.vs_parameter_mask >> (k * 4)) & 0xF) == 0) words[kExactWordIndex(0xA185 + k)] = 0;
                 for (unsigned slot = 0; slot < 18; ++slot) {
-                    if (!((r.ps_texture_mask >> slot) & 1)) texture_bits[slot] = 0; // kGx2TranslatorTextureBases[0]: PS
-                    if (!((r.vs_texture_mask >> slot) & 1)) texture_bits[18 + slot] = 0; // [1]: VS
+                    if (!((r.ps_texture_mask >> slot) & 1)) fresh_tex_words[slot] = 0; // kGx2TranslatorTextureBases[0]: PS
+                    if (!((r.vs_texture_mask >> slot) & 1)) fresh_tex_words[18 + slot] = 0; // [1]: VS
                 }
             }
+            fresh_words = words;
             h.add(&exact_base, sizeof(exact_base));
             h.add(&known, sizeof(known));
             h.add(words.data() + kExactWordIndex(0xA185), 10 * 4);
-            h.add(texture_bits.data(), sizeof(texture_bits));
+            h.add(fresh_tex_words.data(), sizeof(fresh_tex_words));
             key = h.finish();
-            if (canonical_key_enabled()) {
-                KeyHash c = code;
-                c.add(&kCanonicalKeyTag, sizeof(kCanonicalKeyTag));
-                for (unsigned i = 0; i < n; ++i) {
-                    const uint32_t w = words[i] & kCanonicalWordBits[i];
-                    c.add(&w, sizeof(w));
-                }
-                c.add(texture_bits.data(), sizeof(texture_bits));
-                const uint32_t attribute_count = fetch_attributes ? uint32_t(fetch_attributes->size()) : 0u;
-                c.add(&attribute_count, sizeof(attribute_count));
-                if (fetch_attributes)
-                    for (const auto& a : *fetch_attributes) {
-                        const uint32_t data[] = {a.semantic,           a.format,      a.endian,
-                                                 a.destination_select, a.offset & 3u, a.buffer >= 16 ? 1u : 0u};
-                        c.add(data, sizeof(data));
-                    }
-                canon = c.finish();
-            }
             fresh_key = true;
-            if (memo) memo_slot->canon = canon;
-            if (s_prog_cache.find(key) == s_prog_cache.end())
-                note_exact_key_miss(vs_program.address, ps_program.address, mem, vs_program.size, ps_program.size,
-                                    words.data(), texture_bits.data(), fetch_hash,
-                                    rect | points << 2 | vs_attribs << 3);
             if (memo) {
                 memo_slot->key = key;
                 memo_slot->base = exact_base;
+                memo_slot->canon = 0;
                 memo_slot->valid = true;
             }
         }
@@ -2468,16 +2481,49 @@ Program* resolve_active_program(uint8_t* mem) {
         key = legacy_key(dynamic_key_registers_excluded());
         gx2_perf_bytes(kBytesShaderKey, vs_program.size + ps_program.size + 0x400 * 4);
     }
+    auto compute_canon = [&]() -> uint64_t {
+        if (!exact || !canonical_key_enabled()) return 0;
+        if (canon) return canon;
+        if (!fresh_key) return 0;
+        KeyHash c = fresh_code_hash;
+        c.add(&kCanonicalKeyTag, sizeof(kCanonicalKeyTag));
+        for (unsigned i = 0; i < kExactKeyRegisterCount; ++i) {
+            const uint32_t w = fresh_words[i] & kCanonicalWordBits[i];
+            c.add(&w, sizeof(w));
+        }
+        c.add(fresh_tex_words.data(), sizeof(fresh_tex_words));
+        const uint32_t attribute_count = fetch_attributes ? uint32_t(fetch_attributes->size()) : 0u;
+        c.add(&attribute_count, sizeof(attribute_count));
+        if (fetch_attributes)
+            for (const auto& a : *fetch_attributes) {
+                const uint32_t data[] = {a.semantic,           a.format,      a.endian,
+                                         a.destination_select, a.offset & 3u, a.buffer >= 16 ? 1u : 0u};
+                c.add(data, sizeof(data));
+            }
+        canon = c.finish();
+        if (memo_active && memo_slot) memo_slot->canon = canon;
+        return canon;
+    };
     auto& pm = s_prog_mru[key & (s_prog_mru.size() - 1)];
     bool prog_hit = false;
     Program* cached_prog = nullptr;
-    if (!fresh_key && pm.valid && pm.key == key) {
+    if (memo_hit && memo_slot->prog) {
+        prog_hit = true;
+        cached_prog = memo_slot->prog;
+    } else if (!fresh_key && pm.valid && pm.key == key) {
         prog_hit = true;
         cached_prog = pm.prog;
+        if (memo_hit && cached_prog) memo_slot->prog = cached_prog;
     } else if (auto it = s_prog_cache.find(key); it != s_prog_cache.end()) {
         prog_hit = true;
         cached_prog = it->second;
         pm = {key, cached_prog, true};
+        if (memo_active && memo_slot && cached_prog) memo_slot->prog = cached_prog;
+    } else if (fresh_key) {
+        note_exact_key_miss(vs_program.address, ps_program.address, mem, vs_program.size, ps_program.size,
+                            fresh_words.data(), fresh_tex_words.data(),
+                            memo_slot ? memo_slot->inputs.fetch_hash : 0ull,
+                            rect | points << 2 | S.cur_vs_attribs << 3);
     }
 #ifdef RBREW_GX2_KEY_TEST_HOOKS
     if (exact) s_last_exact_key = key;
@@ -2485,8 +2531,11 @@ Program* resolve_active_program(uint8_t* mem) {
     key_scope.stop();
     if (prog_hit) {
         // Programs linked by the boot warm-up or earlier draws seed the
-        // canonical map as soon as their inputs are seen.
-        if (fresh_key && canon && cached_prog) s_canonical.try_emplace(canon, CanonicalEntry{cached_prog});
+        // canonical map once when their inputs are first seen.
+        if (fresh_key && cached_prog && !cached_prog->canonical_seeded) {
+            if (const uint64_t c = compute_canon()) s_canonical.try_emplace(c, CanonicalEntry{cached_prog});
+            cached_prog->canonical_seeded = true;
+        }
         if (cached_prog && !still_compiling(cached_prog->compiled) && !await_compile(cached_prog->compiled))
             return nullptr;
         if (shader_key_verify() && cached_prog && (exact || dynamic_key_registers_excluded())) {
@@ -2541,6 +2590,7 @@ Program* resolve_active_program(uint8_t* mem) {
         }
         return cached_prog;
     }
+    if (exact) (void)compute_canon();
     if (exact && canon)
         if (auto known = s_canonical.find(canon); known != s_canonical.end() && known->second.program) {
             // Same translation as an existing program: no translation, no new
@@ -2548,6 +2598,7 @@ Program* resolve_active_program(uint8_t* mem) {
             Program* prog = known->second.program;
             s_prog_cache[key] = prog;
             pm = {key, prog, true};
+            if (memo_active && memo_slot) memo_slot->prog = prog;
             ++s_canonical_reuses;
             if (!still_compiling(prog->compiled) && !await_compile(prog->compiled)) return nullptr;
             if (known->second.reads_valid && s_exact_reads.try_emplace(exact_base, known->second.reads).second)
@@ -2853,6 +2904,7 @@ Program* resolve_active_program(uint8_t* mem) {
     trace_program_key_miss(vs_program.address, ps_program.address, reused);
     s_prog_cache[key] = prog;
     pm = {key, prog, true};
+    if (memo_active && memo_slot && prog) memo_slot->prog = prog;
     return prog;
 }
 
@@ -3032,6 +3084,7 @@ struct PipelineRequest {
     bool stencil;
     VkPipelineColorBlendAttachmentState blend[8];
     uint32_t ps_uint_mask = 0, ps_sint_mask = 0; // integer-output pixel variant of r.ps
+    uint32_t blend_hash = 0;                     // precomputed in s_req_tpl; 0 computes on demand
 };
 
 // Register-derived pipeline switches (from S.regs at the draw).
@@ -3091,12 +3144,26 @@ struct PipelineReqMru {
 };
 static std::array<PipelineReqMru, 256> s_pipeline_req_mru{};
 
+uint32_t compute_blend_hash(const VkPipelineColorBlendAttachmentState (&blend)[8]) noexcept {
+    uint32_t blend_hash = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        blend_hash ^= (uint32_t(blend[i].blendEnable) << i) ^
+                      ((uint32_t(blend[i].colorWriteMask) & 0xFu) << (8 + (i & 3) * 4));
+        if (blend[i].blendEnable)
+            blend_hash ^= (uint32_t(blend[i].srcColorBlendFactor) * 2654435761u) ^
+                          (uint32_t(blend[i].dstColorBlendFactor) << 5) ^ (uint32_t(blend[i].colorBlendOp) << 11) ^
+                          (uint32_t(blend[i].srcAlphaBlendFactor) << 15) ^
+                          (uint32_t(blend[i].dstAlphaBlendFactor) << 20);
+    }
+    return blend_hash;
+}
+
 VkPipeline get_pipeline(const PipelineRequest& r) {
     const PipelineSwitches s = pipeline_switches(*r.program);
     const uint64_t cur_epoch = s_last_pipeline_lookup.epoch();
+    const uint32_t blend_hash = r.blend_hash ? r.blend_hash : compute_blend_hash(r.blend);
     uint32_t ph = r.program->id * 2654435761u ^ (uint32_t(r.topology) * 2246822519u) ^ (uint32_t(r.colors[0]) << 5) ^
-                  (uint32_t(r.depth) << 11) ^ (uint32_t(r.blend[0].blendEnable) << 17) ^
-                  (uint32_t(r.blend[0].colorWriteMask) << 19) ^ (r.input.count << 23) ^ (uint32_t(s.discard) << 28) ^
+                  (uint32_t(r.depth) << 11) ^ blend_hash ^ (r.input.count << 23) ^ (uint32_t(s.discard) << 28) ^
                   (uint32_t(r.xfb) << 29);
     ph ^= ph >> 15;
     auto& mru = s_pipeline_req_mru[ph & (s_pipeline_req_mru.size() - 1)];
@@ -3459,7 +3526,7 @@ void warm_start() {
             if (rec[0] == kWarmProgram && rec[1] == sizeof(WarmProgramRecord)) {
                 WarmProgramRecord p;
                 std::memcpy(&p, data.data(), sizeof(p));
-                if (s_warm.programs.insert(p.key).second) programs.push_back(p);
+                if (p.rect != 2 && s_warm.programs.insert(p.key).second) programs.push_back(p);
             } else if (rec[0] == kWarmMasks && rec[1] == sizeof(WarmMasksRecord)) {
                 WarmMasksRecord m;
                 std::memcpy(&m, data.data(), sizeof(m));
@@ -3469,7 +3536,8 @@ void warm_start() {
             } else if (rec[0] == kWarmPipeline && rec[1] == sizeof(WarmPipelineRecord)) {
                 WarmPipelineRecord p;
                 std::memcpy(&p, data.data(), sizeof(p));
-                if (p.input.count <= 16 && p.ps_uint_mask <= 0xFF && p.ps_sint_mask <= 0xFF &&
+                if (p.topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY && p.input.count <= 16 &&
+                    p.ps_uint_mask <= 0xFF && p.ps_sint_mask <= 0xFF &&
                     s_warm.pipelines.insert(warm_hash(&p, sizeof(p))).second)
                     pipelines.push_back(p);
             }
@@ -3500,7 +3568,8 @@ void warm_start() {
     std::mutex warm_mutex;
     std::atomic<size_t> next_prog_idx{0};
     std::atomic<size_t> atomic_loaded{0}, atomic_linked{0}, atomic_visited{0};
-    const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 2u, 14u);
+    unsigned workers = std::clamp(std::thread::hardware_concurrency(), 2u, 14u);
+    if (gx2vk::ready() && (gx2vk::caps().is_amd || gx2vk::caps().low_vram_igpu)) workers = std::min(workers, 4u);
     std::vector<std::thread> warm_pool;
     for (unsigned w = 0; w < workers; ++w) {
         warm_pool.emplace_back([&] {
@@ -3686,7 +3755,7 @@ const VertexCacheLimits& vertex_cache_limits() {
 #ifdef RBREW_GX2_QUEUE_TESTS
     if (s_test_vertex_limits) return *s_test_vertex_limits;
 #endif
-    static const VertexCacheLimits limits = [] {
+    static const VertexCacheLimits default_limits = [] {
         const uint64_t ram = gx2_host_total_ram();
         const size_t entries = ram >= (24ull << 30) ? 262144 : ram >= (12ull << 30) ? 131072 : 65536;
         const uint64_t bytes = ram ? ram / 4 : (1ull << 30); // a quarter of physical RAM
@@ -3694,7 +3763,14 @@ const VertexCacheLimits& vertex_cache_limits() {
                        (unsigned long long)(bytes >> 20), (unsigned long long)(ram >> 20));
         return VertexCacheLimits{entries, entries / 2, bytes};
     }();
-    return limits;
+    static const VertexCacheLimits igpu_limits = [] {
+        const size_t entries = std::min<size_t>(default_limits.entries, 32768);
+        const uint64_t bytes = std::min<uint64_t>(default_limits.bytes, 64ull << 20);
+        RBREW_LOG_INFO("mem", "vertex cache (low-VRAM iGPU): %zu entries, %llu MB budget\n", entries,
+                       (unsigned long long)(bytes >> 20));
+        return VertexCacheLimits{entries, entries / 2, bytes};
+    }();
+    return (gx2vk::ready() && gx2vk::caps().low_vram_igpu) ? igpu_limits : default_limits;
 }
 size_t vertex_cache_entries() {
     return s_vertex_buffers.size();
@@ -3733,11 +3809,13 @@ struct CachedIndices {
     gx2vk::Span span;
     gx2vk::Buffer vram_buffer;
     uint64_t written = 0;
-    uint64_t hash = 0;        // content hash when written is untracked (Linux)
-    uint64_t epoch = 0;       // frame epoch the hash was last proven at
-    uint64_t last_use = 0;    // LRU clock for bounded VRAM eviction
-    uint64_t last_serial = 0; // last recording serial that bound vram_buffer
-    uint32_t vram_size = 0;   // byte size of vram_buffer
+    uint64_t hash = 0;            // content hash when written is untracked (Linux)
+    uint64_t epoch = 0;           // frame epoch the hash was last proven at
+    uint64_t last_use = 0;        // LRU clock for bounded VRAM eviction
+    uint64_t last_serial = 0;     // last recording serial that bound vram_buffer
+    uint64_t reserved_serial = 0; // recording serial that already verified span_alive(span)
+    uint32_t vram_size = 0;       // byte size of vram_buffer
+    uint32_t expanded_count = 0;  // expanded index count (for cached QUADS/QUAD_STRIP)
     uint8_t rewrites = 0;
     bool device_local = false;
 };
@@ -3746,7 +3824,15 @@ uint64_t s_index_chunk = 0;
 uint64_t s_index_clock = 0;
 uint64_t s_index_vram_bytes = 0;
 size_t s_index_evict_bucket = 0;
+size_t s_index_ring_sweep_bucket = 0;
 std::vector<IndexKey> s_index_stale;
+std::vector<uint32_t> s_index_expand_out;
+std::vector<uint32_t> s_index_expand_segment;
+struct StaticQuadIndexBuffer {
+    gx2vk::Buffer buffer;
+    uint32_t quad_capacity = 0;
+};
+StaticQuadIndexBuffer s_static_quad_ib, s_static_quad_strip_ib;
 IndexKey s_last_idx_key{};
 CachedIndices* s_last_idx_entry = nullptr;
 struct IdxMru {
@@ -3774,6 +3860,8 @@ struct CachedUniform {
 };
 std::unordered_map<UniformKey, CachedUniform, UniformKeyHash> s_uniform_spans;
 uint64_t s_uniform_chunk = 0;
+size_t s_uniform_sweep_bucket = 0;
+std::vector<UniformKey> s_uniform_stale;
 struct UboMru {
     UniformKey key{};
     CachedUniform* entry = nullptr;
@@ -3892,13 +3980,9 @@ BufferRef cached_vertex_buffer(uint8_t* mem, uint32_t addr, uint32_t size, uint6
     uint64_t content = 0;
     if (b.valid && b.mem == mem) {
         if (untracked) {
-            // Epoch model (Cemu's chronon): re-prove the copy at most once
-            // per frame — the first draw of the mesh hashes, every later draw
-            // of that frame hits without touching the bytes. Per-draw hashing
-            // was itself a top render-thread cost on untracked arenas.
-            if (b.epoch == epoch)
-                hit = true;
-            else if ((content = hash_guest_bytes(mem + addr, size)) == b.hash) {
+            // Never short-circuit on frame epoch when write-watch is unavailable:
+            // dynamic guest VBOs can be rewritten between draws in the same frame.
+            if ((content = hash_guest_bytes(mem + addr, size)) == b.hash) {
                 b.epoch = epoch;
                 hit = true;
             }
@@ -3923,12 +4007,15 @@ BufferRef cached_vertex_buffer(uint8_t* mem, uint32_t addr, uint32_t size, uint6
     // DEVICE_LOCAL VRAM via the submission prologue so vertex fetches hit GDDR
     // bandwidth instead of PCIe system RAM once the 256 MiB BAR fills. Dynamic
     // per-frame vertex buffers (rewrites >= 3) stay in mapped Upload storage to
-    // avoid double-copy and staging churn. RBREW_VBO_VRAM=0 disables promotion.
-    static const bool s_vbo_vram = [] {
+    // avoid double-copy and staging churn. RBREW_VBO_VRAM=0/1 overrides auto
+    // (auto defaults OFF on low-VRAM iGPUs to preserve the small local heap).
+    static const int s_vbo_vram_env = [] {
         const char* v = std::getenv("RBREW_VBO_VRAM");
-        return !(v && v[0] == '0');
+        if (!v || !v[0]) return -1;
+        return v[0] == '0' ? 0 : 1;
     }();
-    bool want_vram = s_vbo_vram && size >= 1024 && size <= (16u << 20) && b.rewrites <= 2;
+    const bool vbo_vram = s_vbo_vram_env >= 0 ? (s_vbo_vram_env != 0) : !gx2vk::caps().low_vram_igpu;
+    bool want_vram = vbo_vram && size >= 1024 && size <= (16u << 20) && b.rewrites <= 2;
 #ifndef RBREW_DISABLE_LOGGING
     if (cache_verify_enabled()) want_vram = false;
 #endif
@@ -4043,7 +4130,11 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
     if (g_trace_active)
         RBREW_LOG_DEBUG("ftrace", "  fetch program=%08X known=%d attributes=%zu\n", S.active_fetch,
                         int(fs_info != nullptr), fs_info ? fs_info->attributes.size() : size_t(0));
-    std::array<BufferRef, 32> vbo;
+    struct LocalVboRef {
+        VkBuffer buffer;
+        VkDeviceSize offset;
+    };
+    LocalVboRef vbo[32];
     uint32_t vbo_mask = 0;
     static const std::vector<R700FetchAttribute> none;
     const auto& attributes = fs_info ? fs_info->attributes : none;
@@ -4055,7 +4146,7 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
     auto& plan = prog.vertex_fetch;
     const uint64_t revision = fs_info ? fs_info->revision : 0;
     if (!plan.valid || plan.revision != revision || plan.input_limit != input_limit ||
-        !std::equal(plan.imports.begin(), plan.imports.end(), S.regs.begin() + 0xA0E0)) {
+        std::memcmp(plan.imports.data(), S.regs.data() + 0xA0E0, 32 * sizeof(uint32_t)) != 0) {
         plan.valid = true;
         plan.revision = revision;
         plan.input_limit = input_limit;
@@ -4096,7 +4187,7 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
             const unsigned slot = checked_slots[i];
             const BufferRef ref = cached_vertex_buffer(mem, checks[i].address, checks[i].size, checks[i].generation);
             if (ref.buffer) {
-                vbo[slot] = ref;
+                vbo[slot] = {ref.buffer, ref.offset};
                 vbo_mask |= 1u << slot;
             }
         }
@@ -4237,14 +4328,63 @@ struct StageDescriptors {
     uint32_t write_count = 0;
     uint32_t buffer_count = 0;
     uint32_t image_count = 0;
+    bool aliases_active_fb = false;
 };
 
-bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& d) {
+struct StageBlockPrecheck {
+    std::array<std::array<uint64_t, 16>, 2> generations{};
+    std::array<uint16_t, 2> accessible{};
+    bool valid = false;
+};
+
+void precheck_stage_uniform_blocks(uint8_t* mem, const Program& prog, StageBlockPrecheck& out) {
+    out.accessible = {};
+    out.valid = true;
+    const uint32_t m0 = prog.live_banks[0], m1 = prog.live_banks[1];
+    if (!m0 && !m1) return;
+    std::array<Gx2WriteRange, 32> checks;
+    struct Ref {
+        uint8_t stage, bank, check_idx;
+    };
+    std::array<Ref, 32> refs;
+    unsigned check_count = 0, ref_count = 0;
+    for (unsigned stage = 0; stage < 2; ++stage) {
+        const auto& info = prog.info[stage];
+        for (uint32_t m = prog.live_banks[stage]; m; m &= m - 1) {
+            const unsigned bank = unsigned(std::countr_zero(m));
+            const auto& block = S.uniform_blocks[stage][bank];
+            const int binding = info.buffer_bindings[bank];
+            if (binding < 0 || binding >= 48 || !block.address || !block.size ||
+                !rbrew_memory_accessible(mem, block.address, block.size))
+                continue;
+            out.accessible[stage] |= uint16_t(1u << bank);
+            // Deduplicate identical (address, size) ranges shared across VS & PS (e.g. scene UBO).
+            unsigned found = check_count;
+            for (unsigned i = 0; i < check_count; ++i) {
+                if (checks[i].address == block.address && checks[i].size == block.size) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found == check_count) checks[check_count++] = {block.address, block.size};
+            refs[ref_count++] = {uint8_t(stage), uint8_t(bank), uint8_t(found)};
+        }
+    }
+    if (check_count) {
+        gx2_write_generations(mem, checks.data(), check_count);
+        for (unsigned i = 0; i < ref_count; ++i)
+            out.generations[refs[i].stage][refs[i].bank] = checks[refs[i].check_idx].generation;
+    }
+}
+
+bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& d,
+                 const StageBlockPrecheck* precheck = nullptr) {
     const auto& info = prog.info[stage];
     const auto& vk = info.vk;
     if (stage == 0) {
         d.write_count = d.buffer_count = d.image_count = 0;
         d.material = nullptr;
+        d.aliases_active_fb = false;
     }
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(gx2vk::caps().limits.minUniformBufferOffsetAlignment, 16);
     // Native sampler slots: PS 0-17, VS 18-35. Only a differing slot changes state.
@@ -4276,161 +4416,179 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
     const gx2material::Response* material = d.material;
     // Uniform-variable block (uniforms that GPU keeps on the program).
     if (vk.uniform_vars_binding >= 0) {
-        auto& block = prog.ufblock_scratch[stage];
         const size_t block_size = std::max<uint32_t>(vk.uniform_block_bytes, 16);
         const size_t reg_copy_bytes =
             (info.uniform_mode == 2 && vk.offset_registers == 0) ? size_t(std::min(vk.register_vec4s, 256)) * 16 : 0;
-        const size_t remapped_bytes = info.remapped.size() * 16;
-        const bool dense_remapped = prog.remapped_dense[stage] && remapped_bytes <= block_size;
-        if (reg_copy_bytes > 0) {
-            block.resize(block_size);
-            if (reg_copy_bytes < block_size) std::memset(block.data() + reg_copy_bytes, 0, block_size - reg_copy_bytes);
-        } else if (dense_remapped) {
-            block.resize(block_size);
-            if (remapped_bytes < block_size) std::memset(block.data() + remapped_bytes, 0, block_size - remapped_bytes);
+        const bool direct_reg_block = reg_copy_bytes == block_size && vk.offset_alpha_ref < 0 &&
+                                      vk.offset_point_size < 0 && vk.offset_window_to_clip < 0 &&
+                                      vk.offset_frag_coord_scale < 0 && prog.tex_scale_mask[stage] == 0 &&
+                                      !gx2interp::capturing() && !gx2interp::replaying();
+        const char* block_data = nullptr;
+        auto& block = prog.ufblock_scratch[stage];
+        if (direct_reg_block) {
+            // Fast path: uniform_mode==2 pure register block — compare directly
+            // against S.uniform_words[stage] without copying into ufblock_scratch.
+            block_data = reinterpret_cast<const char*>(S.uniform_words[stage].data());
         } else {
-            block.assign(block_size, '\0');
-        }
-        auto put = [&](int32_t offset, const void* data, size_t bytes) {
-            if (offset >= 0 && size_t(offset) + bytes <= block.size()) std::memcpy(block.data() + offset, data, bytes);
-        };
-        if (info.uniform_mode == 1 && vk.offset_remapped >= 0) {
-            // Zero-filled holes and the complete-range check match the old
-            // temporary vector plus put(). Pack directly into the final block.
-            if (size_t(vk.offset_remapped) <= block.size() &&
-                remapped_bytes <= block.size() - size_t(vk.offset_remapped)) {
-                char* values = block.data() + vk.offset_remapped;
-                std::array<unsigned, 16> material_layouts;
-                std::array<bool, 16> material_checked;
-                if (material) {
-                    material_layouts.fill(0);
-                    material_checked.fill(false);
-                }
-                for (const auto& entry : info.remapped) {
-                    if (entry.mapped_index >= info.remapped.size()) continue;
-                    char* dst = values + entry.mapped_index * 16;
-                    if (entry.is_register && entry.index < 256)
-                        std::memcpy(dst, S.uniform_words[stage].data() + entry.index * 4, 16);
-                    else if (!entry.is_register && entry.bank < 16) {
-                        const auto& source = S.uniform_blocks[stage][entry.bank];
-                        const uint64_t offset = uint64_t(entry.index) * 16;
-                        if (!source.address || offset + 16 > source.size) {
-                            if (dense_remapped) std::memset(dst, 0, 16);
-                            continue;
-                        }
-                        std::memcpy(dst, mem + source.address + uint32_t(offset), 16);
-                        if (material) {
-                            if (!material_checked[entry.bank]) {
-                                material_checked[entry.bank] = true;
-                                if (rbrew_memory_accessible(mem, source.address, source.size))
-                                    material_layouts[entry.bank] =
-                                        gx2material::layout({mem + source.address, source.size}, *material);
-                                static const bool s_material_log = std::getenv("RBREW_MATERIAL_LOG") != nullptr;
-                                if (!material_layouts[entry.bank] && source.size >= 424 &&
-                                    rbrew_memory_accessible(mem, source.address, source.size) && s_material_log) {
-                                    static uint64_t seen = 0;
-                                    const auto bit = 1ull
-                                                     << (unsigned(material - gx2material::responses) * 16 + entry.bank);
-                                    if (!(seen & bit)) {
+            const size_t remapped_bytes = info.remapped.size() * 16;
+            const bool dense_remapped = prog.remapped_dense[stage] && remapped_bytes <= block_size;
+            if (reg_copy_bytes > 0) {
+                block.resize(block_size);
+                if (reg_copy_bytes < block_size)
+                    std::memset(block.data() + reg_copy_bytes, 0, block_size - reg_copy_bytes);
+            } else if (dense_remapped) {
+                block.resize(block_size);
+                if (remapped_bytes < block_size)
+                    std::memset(block.data() + remapped_bytes, 0, block_size - remapped_bytes);
+            } else {
+                block.assign(block_size, '\0');
+            }
+            auto put = [&](int32_t offset, const void* data, size_t bytes) {
+                if (offset >= 0 && size_t(offset) + bytes <= block.size())
+                    std::memcpy(block.data() + offset, data, bytes);
+            };
+            if (info.uniform_mode == 1 && vk.offset_remapped >= 0) {
+                // Zero-filled holes and the complete-range check match the old
+                // temporary vector plus put(). Pack directly into the final block.
+                if (size_t(vk.offset_remapped) <= block.size() &&
+                    remapped_bytes <= block.size() - size_t(vk.offset_remapped)) {
+                    char* values = block.data() + vk.offset_remapped;
+                    std::array<unsigned, 16> material_layouts;
+                    std::array<bool, 16> material_checked;
+                    if (material) {
+                        material_layouts.fill(0);
+                        material_checked.fill(false);
+                    }
+                    for (const auto& entry : info.remapped) {
+                        if (entry.mapped_index >= info.remapped.size()) continue;
+                        char* dst = values + entry.mapped_index * 16;
+                        if (entry.is_register && entry.index < 256)
+                            std::memcpy(dst, S.uniform_words[stage].data() + entry.index * 4, 16);
+                        else if (!entry.is_register && entry.bank < 16) {
+                            const auto& source = S.uniform_blocks[stage][entry.bank];
+                            const uint64_t offset = uint64_t(entry.index) * 16;
+                            if (!source.address || offset + 16 > source.size) {
+                                if (dense_remapped) std::memset(dst, 0, 16);
+                                continue;
+                            }
+                            std::memcpy(dst, mem + source.address + uint32_t(offset), 16);
+                            if (material) {
+                                if (!material_checked[entry.bank]) {
+                                    material_checked[entry.bank] = true;
+                                    if (rbrew_memory_accessible(mem, source.address, source.size))
+                                        material_layouts[entry.bank] =
+                                            gx2material::layout({mem + source.address, source.size}, *material);
+                                    static const bool s_material_log = std::getenv("RBREW_MATERIAL_LOG") != nullptr;
+                                    if (!material_layouts[entry.bank] && source.size >= 424 &&
+                                        rbrew_memory_accessible(mem, source.address, source.size) && s_material_log) {
+                                        static uint64_t seen = 0;
+                                        const auto bit = 1ull << (unsigned(material - gx2material::responses) * 16 +
+                                                                  entry.bank);
+                                        if (!(seen & bit)) {
+                                            seen |= bit;
+                                            const std::span<const uint8_t> v{mem + source.address, source.size};
+                                            char text[512];
+                                            int n = std::snprintf(text, sizeof text,
+                                                                  "unmapped %016llx bank=%u bytes=%u "
+                                                                  "byte=(%.4g,%.4g,%.4g / %.4g / %.4g) ",
+                                                                  (unsigned long long)material->albedo_hash, entry.bank,
+                                                                  source.size, gx2material::value(v, 240),
+                                                                  gx2material::value(v, 244), gx2material::value(v, 248),
+                                                                  gx2material::value(v, 384),
+                                                                  gx2material::value(v, 420));
+                                            if (n > 0 && size_t(n) < sizeof text && source.size >= 1684)
+                                                std::snprintf(text + n, sizeof text - size_t(n),
+                                                              "word=(%.4g,%.4g,%.4g / %.4g / %.4g)",
+                                                              gx2material::value(v, 960), gx2material::value(v, 964),
+                                                              gx2material::value(v, 968), gx2material::value(v, 1536),
+                                                              gx2material::value(v, 1680));
+                                            RBREW_LOG_DEBUG("material", "%s", text);
+                                        }
+                                    }
+                                }
+                                const unsigned scale = material_layouts[entry.bank];
+                                if (scale && gx2material::apply_range({reinterpret_cast<uint8_t*>(dst), 16},
+                                                                      size_t(offset), *material, scale)) {
+                                    static const bool log = [] {
+                                        const char* v = std::getenv("RBREW_MATERIAL_LOG");
+                                        return v && v[0] == '1';
+                                    }();
+                                    static uint32_t seen = 0;
+                                    const auto bit = 1u << (unsigned(material - gx2material::responses) * 2 + stage);
+                                    if (log && !(seen & bit)) {
                                         seen |= bit;
-                                        const std::span<const uint8_t> v{mem + source.address, source.size};
-                                        char text[512];
-                                        int n = std::snprintf(text, sizeof text,
-                                                              "unmapped %016llx bank=%u bytes=%u "
-                                                              "byte=(%.4g,%.4g,%.4g / %.4g / %.4g) ",
-                                                              (unsigned long long)material->albedo_hash, entry.bank,
-                                                              source.size, gx2material::value(v, 240),
-                                                              gx2material::value(v, 244), gx2material::value(v, 248),
-                                                              gx2material::value(v, 384), gx2material::value(v, 420));
-                                        if (n > 0 && size_t(n) < sizeof text && source.size >= 1684)
-                                            std::snprintf(text + n, sizeof text - size_t(n),
-                                                          "word=(%.4g,%.4g,%.4g / %.4g / %.4g)",
-                                                          gx2material::value(v, 960), gx2material::value(v, 964),
-                                                          gx2material::value(v, 968), gx2material::value(v, 1536),
-                                                          gx2material::value(v, 1680));
-                                        RBREW_LOG_DEBUG("material", "%s", text);
+                                        RBREW_LOG_DEBUG("material", "remapped %016llx stage=%u bank=%u units=%u bytes=%u",
+                                                        (unsigned long long)material->albedo_hash, stage, entry.bank,
+                                                        scale, source.size);
                                     }
                                 }
                             }
-                            const unsigned scale = material_layouts[entry.bank];
-                            if (scale && gx2material::apply_range({reinterpret_cast<uint8_t*>(dst), 16}, size_t(offset),
-                                                                  *material, scale)) {
-                                static const bool log = [] {
-                                    const char* v = std::getenv("RBREW_MATERIAL_LOG");
-                                    return v && v[0] == '1';
-                                }();
-                                static uint32_t seen = 0;
-                                const auto bit = 1u << (unsigned(material - gx2material::responses) * 2 + stage);
-                                if (log && !(seen & bit)) {
-                                    seen |= bit;
-                                    RBREW_LOG_DEBUG("material", "remapped %016llx stage=%u bank=%u units=%u bytes=%u",
-                                                    (unsigned long long)material->albedo_hash, stage, entry.bank, scale,
-                                                    source.size);
-                                }
-                            }
+                        } else if (dense_remapped) {
+                            std::memset(dst, 0, 16);
                         }
-                    } else if (dense_remapped) {
-                        std::memset(dst, 0, 16);
+                    }
+                    if (stage == 1 && g_trace_active && remapped_bytes) {
+                        float c[4];
+                        std::memcpy(c, values, 16);
+                        RBREW_LOG_DEBUG("ftrace", "PS remapped c0=(%g %g %g %g)\n", c[0], c[1], c[2], c[3]);
                     }
                 }
-                if (stage == 1 && g_trace_active && remapped_bytes) {
-                    float c[4];
-                    std::memcpy(c, values, 16);
-                    RBREW_LOG_DEBUG("ftrace", "PS remapped c0=(%g %g %g %g)\n", c[0], c[1], c[2], c[3]);
-                }
+            } else if (info.uniform_mode == 2 && vk.offset_registers >= 0) {
+                put(vk.offset_registers, S.uniform_words[stage].data(), size_t(std::min(vk.register_vec4s, 256)) * 16);
             }
-        } else if (info.uniform_mode == 2 && vk.offset_registers >= 0) {
-            put(vk.offset_registers, S.uniform_words[stage].data(), size_t(std::min(vk.register_vec4s, 256)) * 16);
+            if (vk.offset_alpha_ref >= 0) {
+                const uint32_t w = S.regs[0xA10E];
+                put(vk.offset_alpha_ref, &w, 4);
+            }
+            if (vk.offset_point_size >= 0) put(vk.offset_point_size, &S.raster.point_size, 4);
+            // Window-space vertex exports (viewport scaling disabled) convert
+            // window coordinates through 2/viewportSize, taken from the guest
+            // viewport scale registers (Cemu VulkanRendererCore semantics).
+            if (vk.offset_window_to_clip >= 0) {
+                float xs, ys;
+                std::memcpy(&xs, &S.regs[0xA10F], 4);
+                std::memcpy(&ys, &S.regs[0xA111], 4);
+                const float t[2] = {xs != 0.0f ? 1.0f / xs : 0.0f, ys != 0.0f ? -1.0f / ys : 0.0f};
+                put(vk.offset_window_to_clip, t, 8);
+            }
+            // Guest screen-space calculations still use console coordinates.
+            if (vk.offset_frag_coord_scale >= 0) {
+                const auto framebuffer_scale = s_rendering ? s_active_fb_scale : framebuffer_coordinate_scale();
+                const float s[4] = {1.0f / framebuffer_scale[0], 1.0f / framebuffer_scale[1], 0, 0};
+                put(vk.offset_frag_coord_scale, s, 16);
+            }
+            // Texel-coordinate fetches (guest SAMPLE with unnormalized coordinates
+            // or LD) multiply the guest's raw texel coordinates by this scale.
+            for (uint32_t m = prog.tex_scale_mask[stage]; m; m &= m - 1) {
+                const unsigned t = unsigned(std::countr_zero(m));
+                const auto dim = vk.texture_dim[t];
+                const auto* tex = dim == 0 || dim == 1 ? nullptr
+                                                       : S.units[(stage == 0 ? 32 : 0) + t][dim == 3   ? 1
+                                                                                            : dim == 5 ? 2
+                                                                                            : dim == 4 ? 3
+                                                                                                       : 0];
+                const auto scale = tex ? tex->coordinate_scale : std::array<float, 2>{1, 1};
+                put(vk.offset_tex_scale[t], scale.data(), 8);
+            }
+            // 120 FPS in-between frame: record N's block, or use the N-1/N blend.
+            if (gx2interp::replaying())
+                gx2interp::replay_uf(stage, block.data(), block.size());
+            else if (gx2interp::capturing())
+                gx2interp::record_uf(stage, block.data(), block.size());
+            block_data = block.data();
         }
-        if (vk.offset_alpha_ref >= 0) {
-            const uint32_t w = S.regs[0xA10E];
-            put(vk.offset_alpha_ref, &w, 4);
-        }
-        if (vk.offset_point_size >= 0) put(vk.offset_point_size, &S.raster.point_size, 4);
-        // Window-space vertex exports (viewport scaling disabled) convert
-        // window coordinates through 2/viewportSize, taken from the guest
-        // viewport scale registers (Cemu VulkanRendererCore semantics).
-        if (vk.offset_window_to_clip >= 0) {
-            float xs, ys;
-            std::memcpy(&xs, &S.regs[0xA10F], 4);
-            std::memcpy(&ys, &S.regs[0xA111], 4);
-            const float t[2] = {xs != 0.0f ? 1.0f / xs : 0.0f, ys != 0.0f ? -1.0f / ys : 0.0f};
-            put(vk.offset_window_to_clip, t, 8);
-        }
-        // Guest screen-space calculations still use console coordinates.
-        if (vk.offset_frag_coord_scale >= 0) {
-            const auto framebuffer_scale = framebuffer_coordinate_scale();
-            const float s[4] = {1.0f / framebuffer_scale[0], 1.0f / framebuffer_scale[1], 0, 0};
-            put(vk.offset_frag_coord_scale, s, 16);
-        }
-        // Texel-coordinate fetches (guest SAMPLE with unnormalized coordinates
-        // or LD) multiply the guest's raw texel coordinates by this scale.
-        for (uint32_t m = prog.tex_scale_mask[stage]; m; m &= m - 1) {
-            const unsigned t = unsigned(std::countr_zero(m));
-            const auto dim = vk.texture_dim[t];
-            const auto* tex = dim == 0 || dim == 1 ? nullptr
-                                                   : S.units[(stage == 0 ? 32 : 0) + t][dim == 3   ? 1
-                                                                                        : dim == 5 ? 2
-                                                                                        : dim == 4 ? 3
-                                                                                                   : 0];
-            const auto scale = tex ? tex->coordinate_scale : std::array<float, 2>{1, 1};
-            put(vk.offset_tex_scale[t], scale.data(), 8);
-        }
-        // 120 FPS in-between frame: record N's block, or use the N-1/N blend.
-        if (gx2interp::replaying())
-            gx2interp::replay_uf(stage, block.data(), block.size());
-        else if (gx2interp::capturing())
-            gx2interp::record_uf(stage, block.data(), block.size());
         const uint64_t serial = gx2vk::recording_serial();
-        const uint64_t sig = ufblock_quick_sig(block.data(), block.size());
+        const uint64_t sig = ufblock_quick_sig(block_data, block_size);
         auto& slots = prog.ufblock_slots[stage];
         int hit_slot = -1;
         const uint8_t mru_idx = prog.ufblock_mru[stage];
-        if (slots[mru_idx].sig == sig && slots[mru_idx].bytes == block) {
+        if (slots[mru_idx].sig == sig && slots[mru_idx].bytes.size() == block_size &&
+            std::memcmp(slots[mru_idx].bytes.data(), block_data, block_size) == 0) {
             hit_slot = int(mru_idx);
         } else {
             for (unsigned s_idx = 0; s_idx < slots.size(); ++s_idx) {
-                if (s_idx != mru_idx && slots[s_idx].sig == sig && slots[s_idx].bytes == block) {
+                if (s_idx != mru_idx && slots[s_idx].sig == sig && slots[s_idx].bytes.size() == block_size &&
+                    std::memcmp(slots[s_idx].bytes.data(), block_data, block_size) == 0) {
                     hit_slot = int(s_idx);
                     prog.ufblock_mru[stage] = uint8_t(s_idx);
                     break;
@@ -4452,13 +4610,16 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         } else {
             ++C.uniform_uploads;
             const uint8_t dst_idx = prog.ufblock_next[stage];
-            prog.ufblock_next[stage] = uint8_t((dst_idx + 1) & 3);
+            prog.ufblock_next[stage] = uint8_t((dst_idx + 1) & (Program::kUfBlockSlots - 1));
             prog.ufblock_mru[stage] = dst_idx;
             auto& slot = slots[dst_idx];
             slot.span = gx2vk::upload(block_size, ubo_align);
             if (!slot.span.data) return false;
-            std::memcpy(slot.span.data, block.data(), block_size);
-            slot.bytes.swap(block);
+            std::memcpy(slot.span.data, block_data, block_size);
+            if (direct_reg_block)
+                slot.bytes.assign(block_data, block_size);
+            else
+                slot.bytes.swap(block);
             slot.sig = sig;
             slot.reserved_serial = serial;
             span = slot.span;
@@ -4475,25 +4636,36 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         w.pBufferInfo = &buffer;
     }
     // Guest uniform blocks (FULL_CBANK).
-    std::array<Gx2WriteRange, 16> block_checks;
-    std::array<unsigned, 16> checked_banks;
-    unsigned block_check_count = 0;
-    std::array<uint64_t, 16> block_generations;
-    for (uint32_t m = live_banks; m; m &= m - 1) {
-        const unsigned bank = unsigned(std::countr_zero(m));
-        const auto& block = S.uniform_blocks[stage][bank];
-        const int binding = info.buffer_bindings[bank];
-        if (binding < 0 || binding >= 48 || !block.address || !block.size ||
-            !rbrew_memory_accessible(mem, block.address, block.size))
-            continue;
-        block_checks[block_check_count] = {block.address, block.size};
-        checked_banks[block_check_count++] = bank;
+    std::array<uint64_t, 16> local_block_generations;
+    uint16_t accessible_banks = 0;
+    const uint64_t* block_generations = nullptr;
+    if (precheck && precheck->valid) {
+        accessible_banks = precheck->accessible[stage];
+        block_generations = precheck->generations[stage].data();
+    } else {
+        std::array<Gx2WriteRange, 16> block_checks;
+        std::array<unsigned, 16> checked_banks;
+        unsigned block_check_count = 0;
+        for (uint32_t m = live_banks; m; m &= m - 1) {
+            const unsigned bank = unsigned(std::countr_zero(m));
+            const auto& block = S.uniform_blocks[stage][bank];
+            const int binding = info.buffer_bindings[bank];
+            if (binding < 0 || binding >= 48 || !block.address || !block.size ||
+                !rbrew_memory_accessible(mem, block.address, block.size))
+                continue;
+            accessible_banks |= uint16_t(1u << bank);
+            block_checks[block_check_count] = {block.address, block.size};
+            checked_banks[block_check_count++] = bank;
+        }
+        if (block_check_count) {
+            gx2_write_generations(mem, block_checks.data(), block_check_count);
+            for (unsigned i = 0; i < block_check_count; ++i)
+                local_block_generations[checked_banks[i]] = block_checks[i].generation;
+        }
+        block_generations = local_block_generations.data();
     }
-    if (block_check_count) {
-        gx2_write_generations(mem, block_checks.data(), block_check_count);
-        for (unsigned i = 0; i < block_check_count; ++i)
-            block_generations[checked_banks[i]] = block_checks[i].generation;
-    }
+    const uint64_t serial = gx2vk::recording_serial();
+    const uint64_t batch_id = g_gx2_has_pending_streamouts ? 0 : gx2_write_watch_batch_id();
     for (uint32_t m = live_banks; m; m &= m - 1) {
         const unsigned bank = unsigned(std::countr_zero(m));
         const int gl_binding = info.buffer_bindings[bank];
@@ -4501,8 +4673,8 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         bool bound_now = false;
         const uint8_t* host_ubo_ptr = nullptr;
         size_t host_ubo_len = 0;
-        if (gl_binding >= 0 && gl_binding < 48 && block.address && block.size &&
-            rbrew_memory_accessible(mem, block.address, block.size)) {
+        const bool bank_accessible = (accessible_banks & (1u << bank)) != 0;
+        if (bank_accessible) {
             // 120 FPS in-between frame: N's recorded bytes blended with N-1's
             // (the game may already be writing the next frame's data).
             if (gx2interp::replaying()) {
@@ -4522,8 +4694,7 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
                 gx2interp::record_bank(stage, bank, mem + block.address, block.size);
             }
         }
-        if (!bound_now && gl_binding >= 0 && gl_binding < 48 && block.address && block.size &&
-            rbrew_memory_accessible(mem, block.address, block.size)) {
+        if (!bound_now && bank_accessible) {
             host_ubo_ptr = mem + block.address;
             host_ubo_len = block.size;
             const uint64_t written = block_generations[bank];
@@ -4536,8 +4707,6 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
                 // draws alternated between characters or passes.
                 const UniformKey key{mem, uint64_t(block.address) << 32 | block.size, uint32_t(bytes)};
                 auto& memo = s_uniform_slot_memo[stage][bank];
-                const uint64_t serial = gx2vk::recording_serial();
-                const uint64_t batch_id = g_gx2_has_pending_streamouts ? 0 : gx2_write_watch_batch_id();
                 const bool memo_hit = memo.serial == serial && memo.key == key &&
                                       (written != kGx2WriteUntracked ? written <= memo.written
                                                                      : (batch_id != 0 && memo.batch == batch_id));
@@ -4603,13 +4772,27 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
                         if (bytes > block.size) std::memset(span.data + block.size, 0, bytes - block.size);
                         if (span.chunk_id) {
                             if (s_uniform_chunk != span.chunk_id) {
-                                std::erase_if(s_uniform_spans,
-                                              [](const auto& item) { return !gx2vk::span_resident(item.second.span); });
+                                // Bounded incremental bucket sweep instead of full-map
+                                // erase_if so chunk rollovers never cause multi-ms spikes.
                                 s_uniform_chunk = span.chunk_id;
-                                s_ubo_mru.fill({});
-                                for (auto& st : s_uniform_slot_memo)
-                                    for (auto& m_slot : st) m_slot.entry = nullptr;
-                                cached = nullptr;
+                                const size_t buckets = s_uniform_spans.bucket_count();
+                                if (buckets && s_uniform_spans.size() > 512) {
+                                    constexpr size_t kSweepBuckets = 512;
+                                    s_uniform_stale.clear();
+                                    for (size_t n = 0; n < kSweepBuckets && n < buckets; ++n) {
+                                        const size_t b = s_uniform_sweep_bucket++ % buckets;
+                                        for (auto it = s_uniform_spans.begin(b); it != s_uniform_spans.end(b); ++it)
+                                            if (!(it->first == key) && !gx2vk::span_resident(it->second.span))
+                                                s_uniform_stale.push_back(it->first);
+                                    }
+                                    if (!s_uniform_stale.empty()) {
+                                        for (const auto& stale : s_uniform_stale) s_uniform_spans.erase(stale);
+                                        s_ubo_mru.fill({});
+                                        for (auto& st : s_uniform_slot_memo)
+                                            for (auto& m_slot : st) m_slot.entry = nullptr;
+                                        cached = nullptr;
+                                    }
+                                }
                             }
                             if (!cached) cached = &s_uniform_spans[key];
                             cached->span = span;
@@ -4629,8 +4812,7 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
                 bound_now = true;
             }
         }
-        if (!bound_now && gl_binding >= 0 && gl_binding < 48 && block.address && block.size &&
-            rbrew_memory_accessible(mem, block.address, block.size)) {
+        if (!bound_now && bank_accessible) {
             // Untracked memory: compare against the slot's last uploaded bytes.
             const uint64_t written = block_generations[bank];
             const bool same_binding = block.uploaded && block.uploaded_mem == mem &&
@@ -4751,11 +4933,26 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
             tex = dummy_texture(dim ? dim : 2, integer, false, shadow);
             params = tex->params;
         }
-        VkImageView view = tex_object_view(*tex, dim ? dim : 2, integer, false);
+        const uint32_t slot_word4 =
+            (complete && unit < S.bound_textures.size() && S.bound_textures[unit].address)
+                ? S.bound_textures[unit].swizzle
+                : tex->swizzle;
+        VkImageView view = tex_object_view(*tex, dim ? dim : 2, integer, false, slot_word4);
         if (!view) {
             tex = dummy_texture(dim ? dim : 2, integer, false, shadow);
             params = tex->params;
-            view = tex_object_view(*tex, dim ? dim : 2, integer, false);
+            view = tex_object_view(*tex, dim ? dim : 2, integer, false, tex->swizzle);
+        }
+        if (s_rendering && s_active_fb_image_count && tex->image && tex->image->image && !d.aliases_active_fb) {
+            const VkImage sampled_img = tex->image->image;
+            const uint64_t sampled_serial = tex->image->image_serial;
+            for (uint32_t i = 0; i < s_active_fb_image_count; ++i) {
+                if (s_active_fb_images[i].image == sampled_img ||
+                    (sampled_serial && s_active_fb_images[i].serial == sampled_serial)) {
+                    d.aliases_active_fb = true;
+                    break;
+                }
+            }
         }
         const VkSampler s = tex_object_sampler(params, shadow, integer || tex->integer);
         TXDIAG(txdiag::binding(prog.id, stage, unit, uint32_t(vk.texture_bindings[t]), dim, complete,
@@ -4770,6 +4967,71 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         w.pImageInfo = &image;
     }
     return true;
+}
+
+void advance_descriptor_pool_serial(uint64_t serial) {
+    if (s_descriptor_cache_serial == serial) return;
+    s_descriptor_sets.clear();
+    s_descriptor_cache_serial = serial;
+    if (s_descriptor_pool) s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
+    s_descriptor_pool = VK_NULL_HANDLE;
+    // cmd() has already polled completion. A conservative cached value
+    // suffices here; pool allocation must never introduce another wait.
+    const uint64_t done = gx2vk::known_completed_serial();
+    for (auto it = s_retired_pools.begin(); it != s_retired_pools.end();) {
+        // A replay may still bind sets of this pool (gx2_frame_interp.h).
+        if (it->first <= done && !gx2interp::replay_may_read(it->first)) {
+            s_free_descriptor_pools.push_back(it->second);
+            it = s_retired_pools.erase(it);
+        } else
+            ++it;
+    }
+}
+
+VkDescriptorSet allocate_descriptor_set(VkDescriptorSetLayout set_layout, uint64_t serial) {
+    advance_descriptor_pool_serial(serial);
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    // Retry only pool exhaustion/fragmentation, once with an empty pool.
+    // Device/host OOM and device loss must not recurse or allocate forever.
+    bool empty = false;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        if (!s_descriptor_pool) {
+            if (!s_free_descriptor_pools.empty()) {
+                s_descriptor_pool = s_free_descriptor_pools.back();
+                s_free_descriptor_pools.pop_back();
+                if (vkResetDescriptorPool(gx2vk::device(), s_descriptor_pool, 0) != VK_SUCCESS) {
+                    vkDestroyDescriptorPool(gx2vk::device(), s_descriptor_pool, nullptr);
+                    s_descriptor_pool = VK_NULL_HANDLE;
+                    return VK_NULL_HANDLE;
+                }
+            } else {
+                const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096},
+                                                      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4096},
+                                                      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}};
+                VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                info.maxSets = 1024;
+                info.poolSizeCount = 3;
+                info.pPoolSizes = sizes;
+                if (vkCreateDescriptorPool(gx2vk::device(), &info, nullptr, &s_descriptor_pool) != VK_SUCCESS)
+                    return VK_NULL_HANDLE;
+                TXDIAG(txdiag::event("descriptor_pool_create", "\"id\":%llu,\"pool\":%llu", txdiag::next_id(),
+                                     txdiag::handle(s_descriptor_pool)));
+            }
+            s_descriptor_pool_serial = serial;
+            empty = true;
+        }
+        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = s_descriptor_pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &set_layout;
+        const VkResult result = vkAllocateDescriptorSets(gx2vk::device(), &alloc, &set);
+        if (result == VK_SUCCESS) return set;
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) return VK_NULL_HANDLE;
+        s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
+        s_descriptor_pool = VK_NULL_HANDLE;
+        if (empty) return VK_NULL_HANDLE; // every supported layout fits an empty pool
+    }
+    return VK_NULL_HANDLE;
 }
 
 bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* writes, uint32_t write_count) {
@@ -4805,36 +5067,12 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
     };
 #endif
     if (prog.push) {
-        if (s_bindings.is_push && prog.layout == s_bindings.descriptor_layout &&
-            write_count == s_bindings.descriptor_count && write_count <= s_bindings.descriptors.size()) {
-            std::array<VkWriteDescriptorSet, StageDescriptors::kMaxWrites> dirty_writes;
-            std::array<uint8_t, StageDescriptors::kMaxWrites> dirty_slots;
-            uint32_t dirty_count = 0;
-            bool simple = true;
-            for (uint32_t i = 0; i < write_count; ++i) {
-                if (!valid_single_descriptor(writes[i])) {
-                    simple = false;
-                    break;
-                }
-                if (!same_single_descriptor(writes[i], s_bindings.descriptors[i])) {
-                    dirty_writes[dirty_count] = writes[i];
-                    dirty_slots[dirty_count] = uint8_t(i);
-                    ++dirty_count;
-                }
-            }
-            if (simple) {
-                if (!dirty_count) {
-                    TXDIAG(txdiag::count(txdiag::DescriptorHits));
-                    return true;
-                }
-                TXDIAG(txdiag::count(txdiag::DescriptorUpdates));
-                TXDIAG(diagnostic_descriptors(VK_NULL_HANDLE));
-                vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prog.layout, 0, dirty_count,
-                                          dirty_writes.data());
-                for (uint32_t i = 0; i < dirty_count; ++i)
-                    save_single_descriptor(dirty_writes[i], s_bindings.descriptors[dirty_slots[i]]);
-                return true;
-            }
+        // Always push the complete write_count descriptor set whenever anything
+        // changed (or pipeline/render-pass invalidated s_bindings.descriptor_layout).
+        // Avoids partial subset push-descriptor updates across shared layouts on AMD PAL.
+        if (s_bindings.is_push && same_descriptors(prog.layout, writes, write_count)) {
+            TXDIAG(txdiag::count(txdiag::DescriptorHits));
+            return true;
         }
         TXDIAG(txdiag::count(txdiag::DescriptorUpdates));
         TXDIAG(diagnostic_descriptors(VK_NULL_HANDLE));
@@ -4898,23 +5136,7 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
         dynamic_offsets.fill(0);
     }
     TXDIAG(txdiag::count(txdiag::DescriptorUpdates));
-    if (s_descriptor_cache_serial != serial) {
-        s_descriptor_sets.clear();
-        s_descriptor_cache_serial = serial;
-        if (s_descriptor_pool) s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
-        s_descriptor_pool = VK_NULL_HANDLE;
-        // cmd() has already polled completion. A conservative cached value
-        // suffices here; pool allocation must never introduce another wait.
-        const uint64_t done = gx2vk::known_completed_serial();
-        for (auto it = s_retired_pools.begin(); it != s_retired_pools.end();) {
-            // A replay may still bind sets of this pool (gx2_frame_interp.h).
-            if (it->first <= done && !gx2interp::replay_may_read(it->first)) {
-                s_free_descriptor_pools.push_back(it->second);
-                it = s_retired_pools.erase(it);
-            } else
-                ++it;
-        }
-    }
+    advance_descriptor_pool_serial(serial);
     // Serialize fields individually, never structure padding or host pointers.
     // unordered_map checks complete key equality even on a hash collision.
     // Built on the stack; only a new set's key is copied into the map.
@@ -4958,46 +5180,7 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
     if (const auto found = s_descriptor_sets.find(key); found != s_descriptor_sets.end())
         set = found->second;
     else {
-        // Retry only pool exhaustion/fragmentation, once with an empty pool.
-        // Device/host OOM and device loss must not recurse or allocate forever.
-        bool empty = false;
-        for (unsigned attempt = 0; attempt < 2; ++attempt) {
-            if (!s_descriptor_pool) {
-                if (!s_free_descriptor_pools.empty()) {
-                    s_descriptor_pool = s_free_descriptor_pools.back();
-                    s_free_descriptor_pools.pop_back();
-                    if (vkResetDescriptorPool(gx2vk::device(), s_descriptor_pool, 0) != VK_SUCCESS) {
-                        vkDestroyDescriptorPool(gx2vk::device(), s_descriptor_pool, nullptr);
-                        s_descriptor_pool = VK_NULL_HANDLE;
-                        return false;
-                    }
-                } else {
-                    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096},
-                                                          {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4096},
-                                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}};
-                    VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-                    info.maxSets = 1024;
-                    info.poolSizeCount = 3;
-                    info.pPoolSizes = sizes;
-                    if (vkCreateDescriptorPool(gx2vk::device(), &info, nullptr, &s_descriptor_pool) != VK_SUCCESS)
-                        return false;
-                    TXDIAG(txdiag::event("descriptor_pool_create", "\"id\":%llu,\"pool\":%llu", txdiag::next_id(),
-                                         txdiag::handle(s_descriptor_pool)));
-                }
-                s_descriptor_pool_serial = serial;
-                empty = true;
-            }
-            VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-            alloc.descriptorPool = s_descriptor_pool;
-            alloc.descriptorSetCount = 1;
-            alloc.pSetLayouts = &prog.set_layout;
-            const VkResult result = vkAllocateDescriptorSets(gx2vk::device(), &alloc, &set);
-            if (result == VK_SUCCESS) break;
-            if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) return false;
-            s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
-            s_descriptor_pool = VK_NULL_HANDLE;
-            if (empty) return false; // every supported layout fits an empty pool
-        }
+        set = allocate_descriptor_set(prog.set_layout, serial);
         if (!set) return false;
         std::array<VkWriteDescriptorSet, StageDescriptors::kMaxWrites> updates;
         std::array<VkDescriptorBufferInfo, StageDescriptors::kMaxBuffers> buffers;
@@ -5032,13 +5215,13 @@ bool is_triangle_topology(VkPrimitiveTopology t) {
 }
 
 bool apply_dynamic_state(VkCommandBuffer cb, VkPrimitiveTopology topology, bool indexed_restart,
-                         bool atmosphere_sky = false) {
+                         bool atmosphere_sky = false, bool any_blend = true) {
     const auto& g = S.raster;
     const auto area = s_area;
     // Viewport: GPU UPPER_LEFT (guest top at row 0) = negative-height Vulkan
     // viewport; LOWER_LEFT (guest h < 0) = positive height.
     if (g.viewport[2] <= 0 || g.viewport[3] <= 0) return false;
-    const auto scale = framebuffer_coordinate_scale();
+    const auto scale = s_rendering ? s_active_fb_scale : framebuffer_coordinate_scale();
     static int32_t s_last_vp_rect[4]{};
     static double s_last_vp_depth[2]{};
     static std::array<float, 2> s_last_vp_scale{};
@@ -5124,7 +5307,7 @@ bool apply_dynamic_state(VkCommandBuffer cb, VkPrimitiveTopology topology, bool 
         vkCmdSetStencilTestEnable(cb, stencil);
         s_dyn.stencil_test = stencil;
     }
-    if (!s_dyn.face_valid || !(g.front == s_dyn.guest_face[0]) || !(g.back == s_dyn.guest_face[1])) {
+    if (!s_dyn.face_valid || (stencil && (!(g.front == s_dyn.guest_face[0]) || !(g.back == s_dyn.guest_face[1])))) {
         for (unsigned f = 0; f < 2; ++f) {
             const auto& s = f ? g.back : g.front;
             if (s_dyn.face_valid && s == s_dyn.guest_face[f]) continue;
@@ -5154,14 +5337,16 @@ bool apply_dynamic_state(VkCommandBuffer cb, VkPrimitiveTopology topology, bool 
         vkCmdSetDepthBiasEnable(cb, bias);
         s_dyn.depth_bias = bias;
     }
-    const float clamp = gx2vk::caps().depth_bias_clamp ? g.offset_clamp : 0.0f;
-    if (s_dyn.bias[0] != g.offset_units || s_dyn.bias[1] != clamp || s_dyn.bias[2] != g.offset_factor) {
-        vkCmdSetDepthBias(cb, g.offset_units, clamp, g.offset_factor);
-        s_dyn.bias[0] = g.offset_units;
-        s_dyn.bias[1] = clamp;
-        s_dyn.bias[2] = g.offset_factor;
+    if (bias || std::isnan(s_dyn.bias[0])) {
+        const float clamp = gx2vk::caps().depth_bias_clamp ? g.offset_clamp : 0.0f;
+        if (s_dyn.bias[0] != g.offset_units || s_dyn.bias[1] != clamp || s_dyn.bias[2] != g.offset_factor) {
+            vkCmdSetDepthBias(cb, g.offset_units, clamp, g.offset_factor);
+            s_dyn.bias[0] = g.offset_units;
+            s_dyn.bias[1] = clamp;
+            s_dyn.bias[2] = g.offset_factor;
+        }
     }
-    if (std::memcmp(s_dyn.blend, g.blend_color.data(), 16) != 0) {
+    if ((any_blend || std::isnan(s_dyn.blend[0])) && std::memcmp(s_dyn.blend, g.blend_color.data(), 16) != 0) {
         vkCmdSetBlendConstants(cb, g.blend_color.data());
         std::memcpy(s_dyn.blend, g.blend_color.data(), 16);
     }
@@ -5182,8 +5367,8 @@ VkPrimitiveTopology vk_topology(uint32_t prim) {
     case 0x05: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     case 0x06: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     case 0x13:
-    case 0x14: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; // native assembly GS
-    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;              // TRIANGLES and RECT (GS)
+    case 0x14: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // CPU-expanded quads (no GS)
+    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // TRIANGLES and RECT (GS)
     }
 }
 bool list_topology(VkPrimitiveTopology t) {
@@ -5610,6 +5795,7 @@ struct PipelineReqTemplate {
     uint32_t target_masks = ~0u;
     bool color_write = false;
     bool blend = false;
+    bool per_target_blend_valid = false;
     bool xfb = false;
     uint32_t blend_src_rgb = ~0u;
     uint32_t blend_dst_rgb = ~0u;
@@ -5617,12 +5803,15 @@ struct PipelineReqTemplate {
     uint32_t blend_dst_alpha = ~0u;
     uint32_t blend_eq_rgb = ~0u;
     uint32_t blend_eq_alpha = ~0u;
+    std::array<RasterState::TargetBlendState, 8> target_blends{};
     VkFormat colors[8]{};
     VkPipelineColorBlendAttachmentState blend_states[8]{};
     VkFormat depth = VK_FORMAT_UNDEFINED;
     bool stencil = false;
+    bool any_blend = false;
     uint32_t uint_mask = 0;
     uint32_t sint_mask = 0;
+    uint32_t blend_hash = 0;
 };
 static PipelineReqTemplate s_req_tpl{};
 
@@ -5703,22 +5892,32 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
 
     uint64_t cur_color_masks = 0;
     std::memcpy(&cur_color_masks, S.raster.color_mask.data(), sizeof(cur_color_masks));
+    const bool blend_matches =
+        s_req_tpl.per_target_blend_valid == S.raster.per_target_blend_valid &&
+        (S.raster.per_target_blend_valid
+             ? std::equal(std::begin(S.raster.target_blends), std::end(S.raster.target_blends),
+                          s_req_tpl.target_blends.begin())
+             : (s_req_tpl.blend == S.raster.blend &&
+                (!S.raster.blend ||
+                 (s_req_tpl.blend_src_rgb == S.raster.blend_src_rgb &&
+                  s_req_tpl.blend_dst_rgb == S.raster.blend_dst_rgb &&
+                  s_req_tpl.blend_src_alpha == S.raster.blend_src_alpha &&
+                  s_req_tpl.blend_dst_alpha == S.raster.blend_dst_alpha &&
+                  s_req_tpl.blend_eq_rgb == S.raster.blend_eq_rgb &&
+                  s_req_tpl.blend_eq_alpha == S.raster.blend_eq_alpha))));
     if (s_req_tpl.prog == prog && s_req_tpl.fb_generation == s_fb_generation && s_req_tpl.fbo_id == S.current_fbo_id &&
         s_req_tpl.target_masks == S.target_masks && s_req_tpl.color_write == S.color_write &&
-        s_req_tpl.color_masks == cur_color_masks && s_req_tpl.blend == S.raster.blend && s_req_tpl.xfb == xfb &&
-        (!S.raster.blend ||
-         (s_req_tpl.blend_src_rgb == S.raster.blend_src_rgb && s_req_tpl.blend_dst_rgb == S.raster.blend_dst_rgb &&
-          s_req_tpl.blend_src_alpha == S.raster.blend_src_alpha &&
-          s_req_tpl.blend_dst_alpha == S.raster.blend_dst_alpha && s_req_tpl.blend_eq_rgb == S.raster.blend_eq_rgb &&
-          s_req_tpl.blend_eq_alpha == S.raster.blend_eq_alpha))) {
+        s_req_tpl.color_masks == cur_color_masks && s_req_tpl.xfb == xfb && blend_matches) {
         std::memcpy(r.colors, s_req_tpl.colors, sizeof(r.colors));
         std::memcpy(r.blend, s_req_tpl.blend_states, sizeof(r.blend));
         r.depth = s_req_tpl.depth;
         r.stencil = s_req_tpl.stencil;
         r.ps_uint_mask = s_req_tpl.uint_mask;
         r.ps_sint_mask = s_req_tpl.sint_mask;
+        r.blend_hash = s_req_tpl.blend_hash;
     } else {
         uint32_t uint_mask = 0, sint_mask = 0;
+        bool any_blend_en = false;
         const uint32_t outputs = prog->info[1].vk.pixel_outputs;
         for (unsigned i = 0; i < 8; ++i) {
             auto& b = r.blend[i];
@@ -5734,17 +5933,30 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
                     uint_mask |= 1u << i;
             }
             // GPU ignores blending for integer buffers.
+            const bool target_blend_en =
+                S.raster.per_target_blend_valid ? S.raster.target_blends[i].enable : S.raster.blend;
             const bool blendable =
-                S.raster.blend && !integer &&
+                target_blend_en && !integer &&
                 gx2vk::format_supports(t->fmt.attachment, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
-            b.blendEnable = S.raster.blend && blendable;
+            b.blendEnable = blendable;
             if (b.blendEnable) {
-                b.srcColorBlendFactor = vk_blend(S.raster.blend_src_rgb);
-                b.dstColorBlendFactor = vk_blend(S.raster.blend_dst_rgb);
-                b.colorBlendOp = vk_blend_op(S.raster.blend_eq_rgb);
-                b.srcAlphaBlendFactor = vk_blend(S.raster.blend_src_alpha);
-                b.dstAlphaBlendFactor = vk_blend(S.raster.blend_dst_alpha);
-                b.alphaBlendOp = vk_blend_op(S.raster.blend_eq_alpha);
+                any_blend_en = true;
+                if (S.raster.per_target_blend_valid) {
+                    const auto& tb = S.raster.target_blends[i];
+                    b.srcColorBlendFactor = vk_blend(tb.color_src);
+                    b.dstColorBlendFactor = vk_blend(tb.color_dst);
+                    b.colorBlendOp = vk_blend_op(tb.color_op);
+                    b.srcAlphaBlendFactor = vk_blend(tb.separate_alpha ? tb.alpha_src : tb.color_src);
+                    b.dstAlphaBlendFactor = vk_blend(tb.separate_alpha ? tb.alpha_dst : tb.color_dst);
+                    b.alphaBlendOp = vk_blend_op(tb.separate_alpha ? tb.alpha_op : tb.color_op);
+                } else {
+                    b.srcColorBlendFactor = vk_blend(S.raster.blend_src_rgb);
+                    b.dstColorBlendFactor = vk_blend(S.raster.blend_dst_rgb);
+                    b.colorBlendOp = vk_blend_op(S.raster.blend_eq_rgb);
+                    b.srcAlphaBlendFactor = vk_blend(S.raster.blend_src_alpha);
+                    b.dstAlphaBlendFactor = vk_blend(S.raster.blend_dst_alpha);
+                    b.alphaBlendOp = vk_blend_op(S.raster.blend_eq_alpha);
+                }
             }
             // Outputs the pixel shader does not write keep the attachment's contents.
             b.colorWriteMask = (outputs >> i & 1) ? S.raster.color_mask[i] : 0;
@@ -5754,6 +5966,7 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         r.stencil = fb.depth && fb.depth->stencil;
         r.ps_uint_mask = uint_mask;
         r.ps_sint_mask = sint_mask;
+        r.blend_hash = compute_blend_hash(r.blend);
 
         s_req_tpl.prog = prog;
         s_req_tpl.fb_generation = s_fb_generation;
@@ -5762,6 +5975,9 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         s_req_tpl.target_masks = S.target_masks;
         s_req_tpl.color_write = S.color_write;
         s_req_tpl.blend = S.raster.blend;
+        s_req_tpl.per_target_blend_valid = S.raster.per_target_blend_valid;
+        std::copy(std::begin(S.raster.target_blends), std::end(S.raster.target_blends),
+                  s_req_tpl.target_blends.begin());
         s_req_tpl.xfb = xfb;
         s_req_tpl.blend_src_rgb = S.raster.blend_src_rgb;
         s_req_tpl.blend_dst_rgb = S.raster.blend_dst_rgb;
@@ -5773,15 +5989,18 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         std::memcpy(s_req_tpl.blend_states, r.blend, sizeof(r.blend));
         s_req_tpl.depth = r.depth;
         s_req_tpl.stencil = r.stencil;
+        s_req_tpl.any_blend = any_blend_en;
         s_req_tpl.uint_mask = uint_mask;
         s_req_tpl.sint_mask = sint_mask;
+        s_req_tpl.blend_hash = r.blend_hash;
     }
     VkCommandBuffer cb = gx2vk::cmd();
     if (s_dynamic_serial != gx2vk::recording_serial()) reset_command_tracking();
     const bool restart = indices.indexed && indices.restart;
     if (gx2weather::hud_hidden()) return trace_skip("cinema");
     const bool atmosphere_sky = gx2weather::sky_draw(mem, count);
-    if (!apply_dynamic_state(cb, topology, restart, atmosphere_sky)) return trace_skip("dynamic-state");
+    if (!apply_dynamic_state(cb, topology, restart, atmosphere_sky, s_req_tpl.any_blend))
+        return trace_skip("dynamic-state");
     uint64_t applied_epoch = s_tracking_epoch;
     frame_trace_draw(*prog);
     const unsigned mode = prim & 31;
@@ -5816,7 +6035,8 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         }
         VertexBindings vb;
         setup_vertex_attribs(mem, *prog, vb);
-        r.input = vb.input;
+        r.input.count = vb.input.count;
+        if (vb.input.count) std::memcpy(r.input.attrs, vb.input.attrs, vb.input.count * sizeof(VertexInput::Attr));
         VkPipeline pipeline;
         {
             Gx2PerfScope pipe_scope(kPerfPipeline);
@@ -5827,9 +6047,27 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         bool stages_ok;
         {
             Gx2PerfScope stage_scope(kPerfStage);
-            stages_ok = build_stage(mem, *prog, 0, sd) && build_stage(mem, *prog, 1, sd);
+            StageBlockPrecheck precheck;
+            precheck_stage_uniform_blocks(mem, *prog, precheck);
+            stages_ok = build_stage(mem, *prog, 0, sd, &precheck) && build_stage(mem, *prog, 1, sd, &precheck);
         }
         if (!stages_ok) return any;
+        // AMD-only workaround: ending the pass for every draw that samples a
+        // bound attachment (ink, particles, soft depth) stutters heavily on
+        // other GPUs, which never showed the corruption. RBREW_FEEDBACK_BREAK=0/1
+        // overrides the vendor default.
+        static const bool s_feedback_break = [] {
+            const char* v = std::getenv("RBREW_FEEDBACK_BREAK");
+            if (v && v[0]) return v[0] != '0';
+            return gx2vk::caps().is_amd;
+        }();
+        if (s_feedback_break && s_rendering && sd.aliases_active_fb) {
+            // Break intra-pass attachment feedback loops so CB/DCC and DB/HTILE
+            // caches flush before sampling an image bound in the active pass
+            // (AMD RDNA 3.5 coherency & VUID-vkCmdDraw-None-06886).
+            end_rendering();
+            gx2vk::barrier_for(gx2vk::kSyncGraphics);
+        }
         // Refreshing a sampled depth array can end rendering for its copies.
         if (!ensure_rendering(streamout_only)) return any;
         // A trace readback or capture may have submitted since the state was
@@ -5840,12 +6078,21 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         if (s_dynamic_serial != gx2vk::recording_serial()) reset_command_tracking();
         // Packing descriptors does not change guest raster state. Revalidate
         // only if an upload/readback/internal pass invalidated command state.
-        if (applied_epoch != s_tracking_epoch && !apply_dynamic_state(cb, topology, restart, atmosphere_sky))
+        if (applied_epoch != s_tracking_epoch &&
+            !apply_dynamic_state(cb, topology, restart, atmosphere_sky, s_req_tpl.any_blend))
             return any;
         applied_epoch = s_tracking_epoch;
         if (pipeline != s_bound_pipeline) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             s_bound_pipeline = pipeline;
+            // On AMD PAL, push descriptors can be disturbed across pipeline switches
+            // on shared VkPipelineLayouts, so force a fresh complete push. Standard
+            // VkDescriptorSets stay valid across compatible VkPipelineLayouts.
+            if (s_bindings.is_push) {
+                s_bindings.descriptor_layout = VK_NULL_HANDLE;
+                s_bindings.descriptor_set = VK_NULL_HANDLE;
+                s_bindings.is_push = false;
+            }
             if (streamout_only) {
                 // Binding a rasterizerDiscardEnable=VK_TRUE pipeline with null
                 // pDepthStencilState/pColorBlendState invalidates depth/stencil/blend
@@ -5898,12 +6145,17 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
             s_submitted_primitives += prims * instances;
         }
         const bool discarded = (S.regs[0xA2AC] & 1) && (S.regs[0xA204] & (1u << 22));
+        bool noted_write = false;
         for (unsigned attachment = 0; attachment < 8; ++attachment)
-            if (!discarded && fb.colors[attachment] && r.blend[attachment].colorWriteMask)
+            if (!discarded && fb.colors[attachment] && r.blend[attachment].colorWriteMask) {
                 gx2vk::note_gpu_write(fb.colors[attachment]->image);
-        if (!discarded && fb.depth && ((S.raster.depth_test && S.raster.depth_write) || S.raster.stencil_test))
+                noted_write = true;
+            }
+        if (!discarded && fb.depth && ((S.raster.depth_test && S.raster.depth_write) || S.raster.stencil_test)) {
             gx2vk::note_gpu_write(fb.depth->image);
-        gx2vk::note_gpu_write();
+            noted_write = true;
+        }
+        if (!noted_write) gx2vk::note_gpu_write();
         any = true;
         gx2weather::observe_draw(mem, prim, count);
         if (g_trace_active) {
@@ -5924,6 +6176,7 @@ struct TargetClearHistory {
     uint64_t prev_frame = UINT64_MAX;
 };
 std::unordered_map<const void*, TargetClearHistory> s_target_clears;
+uint64_t s_target_clear_serial = 0;
 
 // A render target counts as recurring once it was drawn before the last present.
 bool recurring_target(const Framebuffer& fb) {
@@ -5953,16 +6206,41 @@ bool target_cleared_per_frame(const void* target, uint64_t frame) {
 }
 
 bool transient_cleared_target(const Framebuffer& fb) {
-    if (!recurring_target(fb)) return false;
+    static uint64_t s_last_fb_gen = UINT64_MAX, s_last_frame = UINT64_MAX, s_last_clear_serial = UINT64_MAX;
+    static const ColorTarget* s_last_c0 = nullptr;
+    static const DepthTarget* s_last_depth = nullptr;
+    static bool s_last_depth_only = false;
+    static bool s_last_result = false;
     const uint64_t frame = gx2vk::present_count();
-    if (fb.depth_only) return target_cleared_per_frame(fb.depth, frame);
-    bool any_color = false;
-    for (auto* c : fb.colors) {
-        if (!c) continue;
-        any_color = true;
-        if (!target_cleared_per_frame(c, frame)) return false;
+    if (s_last_fb_gen == s_fb_generation && s_last_frame == frame && s_last_clear_serial == s_target_clear_serial &&
+        s_last_c0 == fb.colors[0] && s_last_depth == fb.depth && s_last_depth_only == fb.depth_only)
+        return s_last_result;
+    bool result = false;
+    if (recurring_target(fb)) {
+        if (fb.depth_only) {
+            result = target_cleared_per_frame(fb.depth, frame);
+        } else {
+            bool any_color = false;
+            result = true;
+            for (auto* c : fb.colors) {
+                if (!c) continue;
+                any_color = true;
+                if (!target_cleared_per_frame(c, frame)) {
+                    result = false;
+                    break;
+                }
+            }
+            if (!any_color) result = false;
+        }
     }
-    return any_color;
+    s_last_fb_gen = s_fb_generation;
+    s_last_frame = frame;
+    s_last_clear_serial = s_target_clear_serial;
+    s_last_c0 = fb.colors[0];
+    s_last_depth = fb.depth;
+    s_last_depth_only = fb.depth_only;
+    s_last_result = result;
+    return result;
 }
 
 bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vertex, const IndexStream& indices,
@@ -6065,6 +6343,7 @@ void gx2r_note_target_cleared(const void* target) {
     if (h.last_frame != frame) {
         h.prev_frame = h.last_frame;
         h.last_frame = frame;
+        ++s_target_clear_serial;
     }
 }
 size_t gx2r_native_query_count() {
@@ -6143,6 +6422,86 @@ static void RBREW_TARGET_SSSE3 copy_swapped_indices(uint8_t* dst, const uint8_t*
 extern bool gx2r_capture_draw_if_armed(bool indexed, uint32_t prim, uint32_t count, uint32_t index_type,
                                        uint32_t index_addr, uint32_t first_vertex, uint8_t* mem);
 
+// CPU TRIANGLE_LIST expansion for GX2 QUADS (0x13) and QUAD_STRIP (0x14).
+// Preserves exact CCW winding and last-vertex provoking vertex `d` under
+// VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT while bypassing Geometry Shaders.
+static inline void append_quad_triangles(std::vector<uint32_t>& out, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
+                                         bool strip) {
+    if (strip)
+        // QUAD_STRIP perimeter is (a, b, d, c); triangles (a, b, d) and (c, a, d)
+        // preserve that exact winding with `d` as provoking vertex.
+        out.insert(out.end(), {a, b, d, c, a, d});
+    else
+        // QUADS perimeter is (a, b, c, d); triangles (a, b, d) and (b, c, d)
+        // preserve CCW winding with `d` as provoking vertex.
+        out.insert(out.end(), {a, b, d, b, c, d});
+}
+
+// Grow-on-demand static GPU index buffers for non-indexed QUADS / QUAD_STRIP:
+// sequential quad/strip TRIANGLE_LIST indices are constant, so consecutive UI
+// and billboard draws reuse one resident buffer with zero CPU expansion.
+static VkBuffer ensure_static_quad_indices(bool strip, uint32_t quads) {
+    constexpr uint32_t kMaxStaticQuads = 1u << 18; // 262,144 quads (6 MiB max)
+    if (!quads || quads > kMaxStaticQuads) return VK_NULL_HANDLE;
+    auto& cache = strip ? s_static_quad_strip_ib : s_static_quad_ib;
+    if (cache.buffer.buffer && cache.quad_capacity >= quads) return cache.buffer.buffer;
+    const uint32_t new_cap =
+        std::min(kMaxStaticQuads, std::max(quads, std::max(4096u, cache.quad_capacity * 2u)));
+    const VkDeviceSize bytes = VkDeviceSize(new_cap) * 6u * sizeof(uint32_t);
+    auto fill_indices = [&](uint32_t* dst) {
+        const uint32_t step = strip ? 2u : 4u;
+        for (uint32_t q = 0; q < new_cap; ++q) {
+            const uint32_t v = q * step;
+            uint32_t* o = dst + size_t(q) * 6u;
+            if (strip) {
+                o[0] = v;
+                o[1] = v + 1;
+                o[2] = v + 3;
+                o[3] = v + 2;
+                o[4] = v;
+                o[5] = v + 3;
+            } else {
+                o[0] = v;
+                o[1] = v + 1;
+                o[2] = v + 3;
+                o[3] = v + 1;
+                o[4] = v + 2;
+                o[5] = v + 3;
+            }
+        }
+    };
+    gx2vk::Buffer next;
+    if (!gx2vk::caps().low_vram_igpu) {
+        next = gx2vk::create_buffer(bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    gx2vk::MemoryUse::DeviceLocal);
+        if (next.buffer) {
+            const auto stage = gx2vk::upload(bytes, 16);
+            if (stage.data) {
+                fill_indices(reinterpret_cast<uint32_t*>(stage.data));
+                gx2vk::stage_buffer_copy(stage.buffer, stage.offset, next.buffer, 0, bytes);
+            } else {
+                gx2vk::destroy_buffer(next);
+            }
+        }
+    }
+    if (!next.buffer) {
+        next = gx2vk::create_buffer(bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, gx2vk::MemoryUse::Upload);
+        if (!next.buffer || !next.memory.mapped) {
+            gx2vk::destroy_buffer(next);
+            return VK_NULL_HANDLE;
+        }
+        fill_indices(reinterpret_cast<uint32_t*>(next.memory.mapped));
+        if (!gx2vk::flush_mapped(next.memory, 0, bytes)) {
+            gx2vk::destroy_buffer(next);
+            return VK_NULL_HANDLE;
+        }
+    }
+    if (cache.buffer.buffer) gx2vk::destroy_buffer(cache.buffer);
+    cache.buffer = next;
+    cache.quad_capacity = new_cap;
+    return cache.buffer.buffer;
+}
+
 void gx2_render_draw(uint32_t prim_type, uint32_t count, uint32_t first_vertex, uint8_t* mem, uint32_t instances,
                      uint32_t first_instance) {
     Gx2PerfScope perf_scope(kPerfDraw);
@@ -6164,26 +6523,39 @@ void gx2_render_draw(uint32_t prim_type, uint32_t count, uint32_t first_vertex, 
                         count, first_vertex, instances, first_instance);
     IndexStream indices;
     const unsigned mode = prim_type & 31;
-    if (mode == 0x13 || mode == 0x14 || mode == 0x0D) {
-        // QUADS/QUAD_STRIP: adjacency quadruplets for the assembly GS (0-based,
-        // base vertex = first); LINE_LOOP: strip closed by its first vertex.
-        std::vector<uint32_t> expanded;
-        if (mode == 0x0D) {
-            for (uint32_t v = 0; v < count; ++v) expanded.push_back(v);
-            if (count > 1) expanded.push_back(0);
-        } else
-            for (unsigned v = 0; v + 3 < count; v += mode == 0x13 ? 4 : 2) {
-                if (mode == 0x13)
-                    expanded.insert(expanded.end(), {v, v + 1, v + 2, v + 3});
-                else
-                    expanded.insert(expanded.end(), {v, v + 1, v + 3, v + 2});
-            }
-        if (expanded.empty()) return;
+    if (mode == 0x13 || mode == 0x14) {
+        const bool strip = mode == 0x14;
+        const uint32_t quads = count >= 4 ? (strip ? (count - 2u) / 2u : count / 4u) : 0u;
+        if (!quads) return;
         indices.indexed = true;
-        indices.count = uint32_t(expanded.size());
-        indices.span = gx2vk::upload(expanded.size() * 4, 16);
+        indices.type = VK_INDEX_TYPE_UINT32;
+        indices.count = quads * 6u;
+        if (const VkBuffer static_buf = ensure_static_quad_indices(strip, quads)) {
+            indices.span = {};
+            indices.span.buffer = static_buf;
+            indices.span.offset = 0;
+            indices.span.size = VkDeviceSize(indices.count) * 4u;
+        } else {
+            s_index_expand_out.clear();
+            s_index_expand_out.reserve(indices.count);
+            for (unsigned v = 0; v + 3 < count; v += strip ? 2 : 4)
+                append_quad_triangles(s_index_expand_out, v, v + 1, v + 2, v + 3, strip);
+            indices.span = gx2vk::upload(s_index_expand_out.size() * 4, 16);
+            if (!indices.span.data) return;
+            std::memcpy(indices.span.data, s_index_expand_out.data(), s_index_expand_out.size() * 4);
+        }
+    } else if (mode == 0x0D) {
+        // LINE_LOOP: strip closed by its first vertex.
+        s_index_expand_out.clear();
+        s_index_expand_out.reserve(count + 1);
+        for (uint32_t v = 0; v < count; ++v) s_index_expand_out.push_back(v);
+        if (count > 1) s_index_expand_out.push_back(0);
+        if (s_index_expand_out.empty()) return;
+        indices.indexed = true;
+        indices.count = uint32_t(s_index_expand_out.size());
+        indices.span = gx2vk::upload(s_index_expand_out.size() * 4, 16);
         if (!indices.span.data) return;
-        std::memcpy(indices.span.data, expanded.data(), expanded.size() * 4);
+        std::memcpy(indices.span.data, s_index_expand_out.data(), s_index_expand_out.size() * 4);
     }
     issue_draw(mem, prim_type, count, first_vertex, indices, s_xfb_pipeline, s_xfb_hook);
 }
@@ -6240,6 +6612,27 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
     const bool direct = mode != 0x13 && mode != 0x14 && mode != 0x0D &&
                         (!restart_on || (restart == (is_u32 ? UINT32_MAX : 0xFFFFu) &&
                                          (!list_topology(topology) || gx2vk::caps().list_restart)));
+    auto sweep_expired_index_ring = [&](uint64_t chunk_id, const IndexKey& keep_key) {
+        if (!chunk_id || s_index_chunk == chunk_id) return;
+        s_index_chunk = chunk_id;
+        // Bounded incremental bucket sweep instead of full-map erase_if so
+        // upload-ring rollovers never cause multi-ms stalls.
+        const size_t buckets = s_index_spans.bucket_count();
+        if (!buckets || s_index_spans.size() <= 512) return;
+        constexpr size_t kSweepBuckets = 512;
+        s_index_stale.clear();
+        for (size_t n = 0; n < kSweepBuckets && n < buckets; ++n) {
+            const size_t b = s_index_ring_sweep_bucket++ % buckets;
+            for (auto it = s_index_spans.begin(b); it != s_index_spans.end(b); ++it)
+                if (!it->second.device_local && !(it->first == keep_key) && !gx2vk::span_resident(it->second.span))
+                    s_index_stale.push_back(it->first);
+        }
+        if (!s_index_stale.empty()) {
+            for (const auto& stale : s_index_stale) s_index_spans.erase(stale);
+            s_last_idx_entry = nullptr;
+            s_idx_mru.fill({});
+        }
+    };
     if (direct) {
         stream.count = count;
         stream.type = is_u32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
@@ -6264,18 +6657,17 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
         }
         const bool untracked = written == kGx2WriteUntracked;
         const uint64_t epoch = g_gx2_frame_epoch.load(std::memory_order_relaxed);
+        const uint64_t serial = gx2vk::recording_serial();
         bool hit = false;
         uint64_t content = 0;
         const bool alive = cached_idx &&
                            ((cached_idx->device_local && cached_idx->vram_buffer.buffer != VK_NULL_HANDLE) ||
-                            gx2vk::span_alive(cached_idx->span));
+                            cached_idx->reserved_serial == serial || gx2vk::span_alive(cached_idx->span));
         if (alive) {
-            // Epoch model (Cemu's chronon): hash at most once per frame per
-            // buffer; later draws of that frame hit without re-reading.
+            // Never short-circuit on frame epoch when write-watch is unavailable:
+            // dynamic guest IBOs can be rewritten between draws in the same frame.
             if (untracked) {
-                if (cached_idx->epoch == epoch)
-                    hit = true;
-                else if ((content = hash_guest_bytes(mem + idx_guest_addr, idx_bytes)) == cached_idx->hash) {
+                if ((content = hash_guest_bytes(mem + idx_guest_addr, idx_bytes)) == cached_idx->hash) {
                     cached_idx->epoch = epoch;
                     hit = true;
                 }
@@ -6290,8 +6682,9 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
                 stream.span.buffer = cached_idx->vram_buffer.buffer;
                 stream.span.offset = 0;
                 stream.span.size = idx_bytes;
-                cached_idx->last_serial = gx2vk::recording_serial();
+                cached_idx->last_serial = serial;
             } else {
+                cached_idx->reserved_serial = serial;
                 stream.span = cached_idx->span;
             }
 #ifndef RBREW_DISABLE_LOGGING
@@ -6318,25 +6711,19 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
                 std::memcpy(stage.data, mem + idx_guest_addr, idx_bytes);
             else
                 copy_swapped_indices(stage.data, mem + idx_guest_addr, count, is_u32);
-            if (stage.chunk_id && s_index_chunk != stage.chunk_id) {
-                // Ring spans share the upload ring's lifetime; DEVICE_LOCAL
-                // index buffers persist across ring wraps until overwritten or evicted.
-                std::erase_if(s_index_spans, [](const auto& item) {
-                    return !item.second.device_local && !gx2vk::span_resident(item.second.span);
-                });
-                s_index_chunk = stage.chunk_id;
-                s_last_idx_entry = nullptr;
-                s_idx_mru.fill({});
-            }
+            sweep_expired_index_ring(stage.chunk_id, key);
             // Static index buffers (uploaded once or twice, 1 KiB..16 MiB) are
             // promoted to pure DEVICE_LOCAL VRAM via the submission prologue so
             // indexed draws read GDDR instead of PCIe upload memory and survive
-            // upload-ring wraps without re-uploading. RBREW_IBO_VRAM=0 disables.
-            static const bool s_ibo_vram = [] {
+            // upload-ring wraps without re-uploading. RBREW_IBO_VRAM=0/1 overrides
+            // auto (auto defaults OFF on low-VRAM iGPUs to preserve small local heaps).
+            static const int s_ibo_vram_env = [] {
                 const char* v = std::getenv("RBREW_IBO_VRAM");
-                return !(v && v[0] == '0');
+                if (!v || !v[0]) return -1;
+                return v[0] == '0' ? 0 : 1;
             }();
-            bool want_vram = s_ibo_vram && idx_bytes >= 1024 && idx_bytes <= (16u << 20) && next_rewrites <= 2;
+            const bool ibo_vram = s_ibo_vram_env >= 0 ? (s_ibo_vram_env != 0) : !gx2vk::caps().low_vram_igpu;
+            bool want_vram = ibo_vram && idx_bytes >= 1024 && idx_bytes <= (16u << 20) && next_rewrites <= 2;
 #ifndef RBREW_DISABLE_LOGGING
             if (cache_verify_enabled()) want_vram = false;
 #endif
@@ -6401,7 +6788,8 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
                         entry.epoch = epoch;
                         entry.rewrites = next_rewrites;
                         entry.last_use = ++s_index_clock;
-                        entry.last_serial = gx2vk::recording_serial();
+                        entry.last_serial = serial;
+                        entry.reserved_serial = 0;
                         stream.span = {};
                         stream.span.buffer = entry.vram_buffer.buffer;
                         stream.span.offset = 0;
@@ -6424,6 +6812,7 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
                         entry.epoch = epoch;
                         entry.rewrites = next_rewrites;
                         entry.last_use = ++s_index_clock;
+                        entry.reserved_serial = serial;
                     }
                 }
                 s_last_idx_key = key;
@@ -6437,21 +6826,74 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
         issue_draw(mem, prim_type, count, first_vertex, stream, s_xfb_pipeline, s_xfb_hook);
         return;
     }
-    std::vector<uint32_t> out;
-    out.reserve(count + 8);
+    // Persistent scratch vectors eliminate per-draw heap allocations on expanded paths.
+    s_index_expand_out.clear();
+    auto& out = s_index_expand_out;
     if (mode == 0x13 || mode == 0x14) {
-        // Respect restart boundaries before reordering quad-strip pairs; each
-        // segment contributes whole quads, so the restart index itself is not
-        // needed in the adjacency list.
+        // Cache CPU-expanded QUADS / QUAD_STRIP index buffers in s_index_spans
+        // (keyed distinctly from direct draws) so static UI/HUD/particle quads
+        // expand once and reuse the uploaded span across draws and frames.
+        const bool can_cache = !restart_on || restart <= 0xFFFFu || restart == 0xFFFFFFFFu;
+        const uint32_t exp_tag =
+            index_type | (mode << 8) | (restart_on ? (restart == 0xFFFFFFFFu ? (1u << 14) : ((1u << 15) | (restart << 16))) : 0u);
+        const IndexKey exp_key{mem, uint64_t(idx_guest_addr) << 32 | idx_bytes, exp_tag};
+        const size_t exp_mru = (exp_key.range ^ (exp_key.range >> 16) ^ (uint64_t(exp_tag) << 7)) & (s_idx_mru.size() - 1);
+        const uint64_t serial = gx2vk::recording_serial();
+        const uint64_t written = can_cache ? gx2_write_generation(mem, idx_guest_addr, idx_bytes) : kGx2WriteUntracked;
+        const bool untracked = written == kGx2WriteUntracked;
+        const uint64_t epoch = g_gx2_frame_epoch.load(std::memory_order_relaxed);
+        uint64_t content = 0;
+        CachedIndices* cached_idx = nullptr;
+        if (can_cache) {
+            if (s_idx_mru[exp_mru].entry && s_idx_mru[exp_mru].key == exp_key) {
+                cached_idx = s_idx_mru[exp_mru].entry;
+            } else if (s_last_idx_entry && s_last_idx_key == exp_key) {
+                cached_idx = s_last_idx_entry;
+                s_idx_mru[exp_mru] = {exp_key, cached_idx};
+            } else if (const auto found = s_index_spans.find(exp_key); found != s_index_spans.end()) {
+                cached_idx = &found->second;
+                s_last_idx_key = exp_key;
+                s_last_idx_entry = cached_idx;
+                s_idx_mru[exp_mru] = {exp_key, cached_idx};
+            }
+            const bool alive = cached_idx &&
+                               (cached_idx->expanded_count == 0 ||
+                                cached_idx->reserved_serial == serial || gx2vk::span_alive(cached_idx->span));
+            bool hit = false;
+            if (alive) {
+                if (untracked) {
+                    if ((content = hash_guest_bytes(mem + idx_guest_addr, idx_bytes)) == cached_idx->hash) {
+                        cached_idx->epoch = epoch;
+                        hit = true;
+                    }
+                } else {
+                    hit = written <= cached_idx->written;
+                }
+            }
+            if (hit) {
+                cached_idx->last_use = ++s_index_clock;
+                cached_idx->reserved_serial = serial;
+                index_scope.stop();
+                if (!cached_idx->expanded_count) return;
+                stream.count = cached_idx->expanded_count;
+                stream.type = VK_INDEX_TYPE_UINT32;
+                stream.restart = false;
+                stream.span = cached_idx->span;
+                issue_draw(mem, prim_type, stream.count, first_vertex, stream, s_xfb_pipeline, s_xfb_hook);
+                return;
+            }
+        }
+        out.reserve(mode == 0x13 ? (count / 4) * 6 + 6 : (count / 2) * 6 + 6);
+        // Respect restart boundaries before expanding quads/quad-strips to
+        // TRIANGLE_LIST; each segment contributes whole quads, so the restart
+        // index itself is not needed in the expanded index list.
         const bool strip = mode == 0x14;
-        std::vector<uint32_t> segment;
+        s_index_expand_segment.clear();
+        auto& segment = s_index_expand_segment;
         auto emit = [&] {
             for (unsigned i = 0; i + 3 < segment.size(); i += strip ? 2 : 4) {
                 const uint32_t a = segment[i], b = segment[i + 1], c = segment[i + 2], d = segment[i + 3];
-                if (strip)
-                    out.insert(out.end(), {a, b, d, c});
-                else
-                    out.insert(out.end(), {a, b, c, d});
+                append_quad_triangles(out, a, b, c, d, strip);
             }
             segment.clear();
         };
@@ -6464,7 +6906,34 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
         }
         emit();
         stream.restart = false;
+        index_scope.stop();
+        if (out.empty()) return;
+        stream.count = uint32_t(out.size());
+        stream.type = VK_INDEX_TYPE_UINT32;
+        stream.span = gx2vk::upload(out.size() * 4, 16);
+        if (!stream.span.data) return;
+        gx2_perf_bytes(kBytesIndex, out.size() * 4);
+        std::memcpy(stream.span.data, out.data(), out.size() * 4);
+        if (can_cache && stream.span.chunk_id) {
+            if (untracked && content == 0) content = hash_guest_bytes(mem + idx_guest_addr, idx_bytes);
+            sweep_expired_index_ring(stream.span.chunk_id, exp_key);
+            auto& entry = s_index_spans[exp_key];
+            entry.span = stream.span;
+            entry.written = written;
+            entry.hash = content;
+            entry.epoch = epoch;
+            entry.last_use = ++s_index_clock;
+            entry.reserved_serial = serial;
+            entry.expanded_count = stream.count;
+            entry.device_local = false;
+            s_last_idx_key = exp_key;
+            s_last_idx_entry = &entry;
+            s_idx_mru[exp_mru] = {exp_key, &entry};
+        }
+        issue_draw(mem, prim_type, stream.count, first_vertex, stream, s_xfb_pipeline, s_xfb_hook);
+        return;
     } else {
+        out.reserve(count + 8);
         // Vulkan restarts at all-ones of a 32-bit index: convert so any GX2
         // restart value (and a non-restart 0xFFFF) keeps its GPU meaning.
         const bool vk_restart = restart_on && (!list_topology(topology) || gx2vk::caps().list_restart);
@@ -6780,39 +7249,88 @@ void gx2r_streamout_flush_if_overlaps(uint8_t* mem, uint32_t address, uint64_t s
 }
 
 // ---------------------------------------------------------------------------
-// Internal transfer pass: depth -> R32F color (GX2CopySurface /
-// ConvertDepthBufferToTextureSurface), the GPU back-end's transfer program.
+// Internal transfer passes: depth -> R32F color (GX2CopySurface /
+// ConvertDepthBufferToTextureSurface) and depth -> depth scaling fallback
+// (for formats without VK_FORMAT_FEATURE_BLIT_DST_BIT such as D32_SFLOAT_S8_UINT).
 // ---------------------------------------------------------------------------
 namespace {
 VkDescriptorSetLayout s_transfer_set = VK_NULL_HANDLE;
 VkPipelineLayout s_transfer_layout = VK_NULL_HANDLE;
+bool s_transfer_use_push = false;
 std::map<VkFormat, VkPipeline> s_transfer_pipelines;
+std::map<VkFormat, VkPipeline> s_depth_transfer_pipelines;
 const char* kTransferVs =
     "#version 450\nvoid main(){vec2 p=vec2((gl_VertexIndex<<1)&2,gl_VertexIndex&2);gl_Position=vec4(p*2-1,0,1);}\n";
 const char* kTransferPs =
     "#version 450\nlayout(set=0,binding=0) uniform sampler2D source;layout(location=0) out vec4 value;"
     "layout(push_constant)uniform CopyScale{vec2 scale;}pc;"
     "void main(){value=vec4(texelFetch(source,ivec2(gl_FragCoord.xy*pc.scale),0).r,0,0,1);}\n";
+const char* kDepthTransferPs =
+    "#version 450\nlayout(set=0,binding=0) uniform sampler2D source;"
+    "layout(push_constant)uniform CopyScale{vec2 scale;}pc;"
+    "void main(){ivec2 lim=max(textureSize(source,0)-ivec2(1),ivec2(0));"
+    "gl_FragDepth=texelFetch(source,clamp(ivec2(gl_FragCoord.xy*pc.scale),ivec2(0),lim),0).r;}\n";
+
+bool ensure_transfer_layout() {
+    if (s_transfer_layout) return true;
+    s_transfer_use_push = push_descriptors_enabled() && gx2vk::caps().push_descriptor;
+    VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                         nullptr};
+    VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set.flags = s_transfer_use_push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
+    set.bindingCount = 1;
+    set.pBindings = &binding;
+    if (vkCreateDescriptorSetLayout(gx2vk::device(), &set, nullptr, &s_transfer_set) != VK_SUCCESS) {
+        s_transfer_set = VK_NULL_HANDLE;
+        return false;
+    }
+    VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout.setLayoutCount = 1;
+    layout.pSetLayouts = &s_transfer_set;
+    const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8};
+    layout.pushConstantRangeCount = 1;
+    layout.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(gx2vk::device(), &layout, nullptr, &s_transfer_layout) != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(gx2vk::device(), s_transfer_set, nullptr);
+        s_transfer_set = VK_NULL_HANDLE;
+        s_transfer_layout = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+bool prepare_transfer_descriptor(const VkDescriptorImageInfo& image, VkDescriptorSet& out_set) {
+    out_set = VK_NULL_HANDLE;
+    if (s_transfer_use_push) return true;
+    out_set = allocate_descriptor_set(s_transfer_set, gx2vk::recording_serial());
+    if (!out_set) return false;
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = out_set;
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &image;
+    vkUpdateDescriptorSets(gx2vk::device(), 1, &w, 0, nullptr);
+    return true;
+}
+
+void bind_transfer_descriptor(VkCommandBuffer cb, const VkDescriptorImageInfo& image, VkDescriptorSet pool_set) {
+    if (s_transfer_use_push) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &image;
+        vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_transfer_layout, 0, 1, &w);
+    } else {
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_transfer_layout, 0, 1, &pool_set, 0, nullptr);
+    }
+}
 } // namespace
 
 bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, uint32_t width, uint32_t height) {
     if (!(destination.image.desc.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
-    if (!s_transfer_layout) {
-        VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                             VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        set.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        set.bindingCount = 1;
-        set.pBindings = &binding;
-        vkCreateDescriptorSetLayout(gx2vk::device(), &set, nullptr, &s_transfer_set);
-        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout.setLayoutCount = 1;
-        layout.pSetLayouts = &s_transfer_set;
-        const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8};
-        layout.pushConstantRangeCount = 1;
-        layout.pPushConstantRanges = &push;
-        vkCreatePipelineLayout(gx2vk::device(), &layout, nullptr, &s_transfer_layout);
-    }
+    if (!ensure_transfer_layout()) return false;
     const VkFormat format = destination.fmt.attachment;
     auto& pipeline = s_transfer_pipelines[format];
     if (!pipeline) {
@@ -6872,6 +7390,17 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
     end_rendering();
     VkCommandBuffer cb = gx2vk::cmd();
     gx2vk::barrier_if_dirty();
+    gx2vk::ViewDesc sv;
+    sv.type = VK_IMAGE_VIEW_TYPE_2D;
+    sv.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    TexParams nearest;
+    nearest.min_filter = nearest.mag_filter = wire::NEAREST;
+    nearest.max_level = 0;
+    const VkImageView src_view = gx2vk::image_view(source.image, sv);
+    if (!src_view) return false;
+    VkDescriptorImageInfo image{tex_object_sampler(nearest, false, false), src_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorSet pool_set = VK_NULL_HANDLE;
+    if (!prepare_transfer_descriptor(image, pool_set)) return false;
     gx2vk::ViewDesc dv;
     dv.type = VK_IMAGE_VIEW_TYPE_2D;
     dv.format = format;
@@ -6897,20 +7426,7 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
     vkCmdSetScissor(cb, 0, 1, &sc);
     const float copy_scale[2] = {src_scale[0] / dst_scale[0], src_scale[1] / dst_scale[1]};
     vkCmdPushConstants(cb, s_transfer_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, copy_scale);
-    gx2vk::ViewDesc sv;
-    sv.type = VK_IMAGE_VIEW_TYPE_2D;
-    sv.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-    TexParams nearest;
-    nearest.min_filter = nearest.mag_filter = wire::NEAREST;
-    nearest.max_level = 0;
-    VkDescriptorImageInfo image{tex_object_sampler(nearest, false, false), gx2vk::image_view(source.image, sv),
-                                VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstBinding = 0;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo = &image;
-    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_transfer_layout, 0, 1, &w);
+    bind_transfer_descriptor(cb, image, pool_set);
     vkCmdDraw(cb, 3, 1, 0, 0);
     gx2_count_gpu_draw();
     vkCmdEndRendering(cb);
@@ -6919,6 +7435,171 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
     // A following draw in the same command buffer must emit all of it again.
     reset_command_tracking();
     gx2vk::note_gpu_write(destination.image);
+    return true;
+}
+
+bool gx2r::depth_to_depth_pass(gx2vk::Image& src, uint32_t src_level, uint32_t src_layer, gx2vk::Image& dst,
+                               uint32_t dst_level, uint32_t dst_layer, uint32_t dst_width, uint32_t dst_height) {
+    if (!src.image || !dst.image || !(src.desc.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return false;
+    if (src_level >= src.desc.levels || src_layer >= src.desc.layers) return false;
+    if (dst_level >= dst.desc.levels || dst_layer >= dst.desc.layers) return false;
+    const uint32_t src_w = std::max(1u, src.desc.width >> src_level);
+    const uint32_t src_h = std::max(1u, src.desc.height >> src_level);
+    const uint32_t dst_mip_w = std::max(1u, dst.desc.width >> dst_level);
+    const uint32_t dst_mip_h = std::max(1u, dst.desc.height >> dst_level);
+    const uint32_t copy_w = std::min(dst_width, dst_mip_w);
+    const uint32_t copy_h = std::min(dst_height, dst_mip_h);
+    if (!copy_w || !copy_h) return false;
+    const VkFormat format = dst.desc.format;
+    if (!gx2vk::format_is_depth(format)) return false;
+    if (!gx2vk::format_supports(format, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) return false;
+    const bool direct_attach = (dst.desc.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+    if (!direct_attach && !(dst.desc.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
+    if (!ensure_transfer_layout()) return false;
+    const bool has_stencil = gx2vk::format_has_stencil(format);
+    auto& pipeline = s_depth_transfer_pipelines[format];
+    if (!pipeline) {
+        VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = gx2vk::shader_module(VK_SHADER_STAGE_VERTEX_BIT, kTransferVs);
+        stages[0].pName = "main";
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = gx2vk::shader_module(VK_SHADER_STAGE_FRAGMENT_BIT, kDepthTransferPs);
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewport.viewportCount = 1;
+        viewport.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.lineWidth = 1.0f;
+        raster.cullMode = VK_CULL_MODE_NONE;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depth.depthTestEnable = VK_TRUE;
+        depth.depthWriteEnable = VK_TRUE;
+        depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        depth.stencilTestEnable = VK_FALSE;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = 2;
+        dynamic.pDynamicStates = dynamic_states;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.depthAttachmentFormat = format;
+        rendering.stencilAttachmentFormat = has_stencil ? format : VK_FORMAT_UNDEFINED;
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        info.pNext = &rendering;
+        info.stageCount = 2;
+        info.pStages = stages;
+        info.pVertexInputState = &vertex;
+        info.pInputAssemblyState = &assembly;
+        info.pViewportState = &viewport;
+        info.pRasterizationState = &raster;
+        info.pMultisampleState = &multisample;
+        info.pDepthStencilState = &depth;
+        info.pColorBlendState = &blend;
+        info.pDynamicState = &dynamic;
+        info.layout = s_transfer_layout;
+        if (!stages[0].module || !stages[1].module ||
+            vkCreateGraphicsPipelines(gx2vk::device(), gx2vk::pipeline_cache(), 1, &info, nullptr, &pipeline) !=
+                VK_SUCCESS) {
+            pipeline = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    gx2vk::Image scratch;
+    gx2vk::Image* target_img = &dst;
+    uint32_t target_level = dst_level, target_layer = dst_layer;
+    uint32_t render_w = dst_mip_w, render_h = dst_mip_h;
+    if (!direct_attach) {
+        gx2vk::ImageDesc desc;
+        desc.format = format;
+        desc.width = copy_w;
+        desc.height = copy_h;
+        desc.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (!gx2vk::create_image(scratch, desc)) return false;
+        target_img = &scratch;
+        target_level = 0;
+        target_layer = 0;
+        render_w = copy_w;
+        render_h = copy_h;
+    }
+    end_rendering();
+    VkCommandBuffer cb = gx2vk::cmd();
+    gx2vk::barrier_if_dirty();
+    gx2vk::ViewDesc sv;
+    sv.type = VK_IMAGE_VIEW_TYPE_2D;
+    sv.base_level = src_level;
+    sv.levels = 1;
+    sv.base_layer = src_layer;
+    sv.layers = 1;
+    sv.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    TexParams nearest;
+    nearest.min_filter = nearest.mag_filter = wire::NEAREST;
+    nearest.max_level = 0;
+    const VkImageView src_view = gx2vk::image_view(src, sv);
+    if (!src_view) {
+        if (scratch.image) gx2vk::destroy_image(scratch);
+        return false;
+    }
+    VkDescriptorImageInfo image{tex_object_sampler(nearest, false, false), src_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorSet pool_set = VK_NULL_HANDLE;
+    if (!prepare_transfer_descriptor(image, pool_set)) {
+        if (scratch.image) gx2vk::destroy_image(scratch);
+        return false;
+    }
+    gx2vk::ViewDesc dv;
+    dv.type = VK_IMAGE_VIEW_TYPE_2D;
+    dv.base_level = target_level;
+    dv.levels = 1;
+    dv.base_layer = target_layer;
+    dv.layers = 1;
+    dv.aspect = target_img->aspect;
+    const VkImageView dst_view = gx2vk::image_view(*target_img, dv);
+    if (!dst_view) {
+        if (scratch.image) gx2vk::destroy_image(scratch);
+        return false;
+    }
+    VkRenderingAttachmentInfo depth_att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depth_att.imageView = dst_view;
+    depth_att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth_att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo stencil_att = depth_att;
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, {render_w, render_h}};
+    info.layerCount = 1;
+    info.pDepthAttachment = &depth_att;
+    info.pStencilAttachment = has_stencil ? &stencil_att : nullptr;
+    vkCmdBeginRendering(cb, &info);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    const VkViewport vp{0, 0, float(copy_w), float(copy_h), 0, 1};
+    const VkRect2D sc{{0, 0}, {copy_w, copy_h}};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    const float copy_scale[2] = {float(src_w) / float(copy_w), float(src_h) / float(copy_h)};
+    vkCmdPushConstants(cb, s_transfer_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, copy_scale);
+    bind_transfer_descriptor(cb, image, pool_set);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    gx2_count_gpu_draw();
+    vkCmdEndRendering(cb);
+    reset_command_tracking();
+    if (scratch.image) {
+        gx2vk::note_gpu_write(scratch);
+        gx2vk::barrier_for(gx2vk::kSyncTransfer);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, dst_level, dst_layer, 1};
+        region.extent = {copy_w, copy_h, 1};
+        vkCmdCopyImage(cb, scratch.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        gx2vk::destroy_image(scratch);
+    }
+    gx2vk::note_gpu_write(dst);
     return true;
 }
 
@@ -6986,6 +7667,163 @@ bool gx2_render_vk_test_pipeline_cache() {
     request.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     request.blend[0].colorWriteMask = 0xf;
     return get_pipeline(request) == first;
+}
+
+// Authored GPU & CPU regression checks for QUADS/QUAD_STRIP TRIANGLE_LIST
+// expansion, per-slot swizzle views, and depth_to_depth_pass scaling fallback.
+void gx2_render_vk_test_quads_and_depth_copy() {
+    auto require = [](bool ok, const char* text) {
+        if (!ok) throw std::runtime_error(text);
+    };
+    // 1. CPU QUADS (0x13) and QUAD_STRIP (0x14) TRIANGLE_LIST expansion & topology.
+    require(vk_topology(0x13) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "QUADS did not map to TRIANGLE_LIST");
+    require(vk_topology(0x14) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "QUAD_STRIP did not map to TRIANGLE_LIST");
+    {
+        std::vector<uint32_t> quads;
+        append_quad_triangles(quads, 0, 1, 2, 3, false);
+        const std::vector<uint32_t> expect_quads{0, 1, 3, 1, 2, 3};
+        require(quads == expect_quads, "QUADS triangle expansion mismatch");
+        std::vector<uint32_t> strip;
+        append_quad_triangles(strip, 0, 1, 2, 3, true);
+        append_quad_triangles(strip, 2, 3, 4, 5, true);
+        const std::vector<uint32_t> expect_strip{0, 1, 3, 2, 0, 3, 2, 3, 5, 4, 2, 5};
+        require(strip == expect_strip, "QUAD_STRIP triangle expansion mismatch");
+        const VkBuffer q1 = ensure_static_quad_indices(false, 4);
+        const VkBuffer q2 = ensure_static_quad_indices(false, 16);
+        const VkBuffer qs1 = ensure_static_quad_indices(true, 4);
+        require(q1 != VK_NULL_HANDLE && q1 == q2 && qs1 != VK_NULL_HANDLE && qs1 != q1,
+                "static quad index buffer cache mismatch");
+    }
+    // 2. GPU QUADS draw: render a fullscreen quad via expanded TRIANGLE_LIST
+    //    (no geometry shader) and verify pixels across all 4 quadrants.
+    {
+        Program program;
+        program.id = UINT32_MAX - 200;
+        for (auto& info : program.info) {
+            info.attribute_locations.fill(-1);
+            info.buffer_bindings.fill(-1);
+            info.vk.uniform_buffer_bindings.fill(-1);
+            info.vk.texture_bindings.fill(-1);
+            info.vk.offset_tex_scale.fill(-1);
+        }
+        program.info[1].vk.pixel_outputs = 1;
+        program.vs = gx2vk::shader_module(
+            VK_SHADER_STAGE_VERTEX_BIT,
+            "#version 450\n"
+            "const vec2 kPos[4]=vec2[4](vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,1.0));\n"
+            "void main(){gl_Position=vec4(kPos[gl_VertexIndex&3],0.0,1.0);}\n");
+        program.ps_source =
+            "#version 450\nlayout(location=0)out vec4 c;void main(){c=vec4(0.25,0.5,0.75,1.0);}\n";
+        require(program.vs && create_program_layouts(program, true), "quad test program layout failed");
+        ColorTarget target;
+        target.width = target.height = 16;
+        gx2vk::ImageDesc cd;
+        cd.width = cd.height = 16;
+        cd.usage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        require(gx2vk::create_image(target.image, cd), "quad test color target failed");
+        VkClearColorValue zero{};
+        clear_image_color(target.image, zero);
+        std::vector<uint32_t> quad_idx;
+        append_quad_triangles(quad_idx, 0, 1, 2, 3, false);
+        IndexStream indices;
+        indices.indexed = true;
+        indices.type = VK_INDEX_TYPE_UINT32;
+        indices.count = uint32_t(quad_idx.size());
+        indices.span = gx2vk::upload(quad_idx.size() * 4, 16);
+        require(indices.span.data != nullptr, "quad test index upload failed");
+        std::memcpy(indices.span.data, quad_idx.data(), quad_idx.size() * 4);
+        S.raster = RasterState{};
+        S.raster.viewport[2] = S.raster.viewport[3] = 16;
+        S.draw_instances = 1;
+        S.draw_first_instance = 0;
+        S.target_masks = 1;
+        S.framebuffer = {};
+        S.framebuffer.colors[0] = &target;
+        S.framebuffer.valid = true;
+        note_framebuffer_changed();
+        require(issue_draw_program(&program, nullptr, 0x13, 4, 0, indices, false, nullptr),
+                "QUADS GPU draw failed");
+        end_rendering();
+        require(gx2vk::finish(), "QUADS GPU draw completion failed");
+        std::vector<uint8_t> rgba;
+        require(gx2vk::read_image(target.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 16, 16, rgba),
+                "QUADS readback failed");
+        for (unsigned p = 0; p < 16 * 16; ++p)
+            require(std::abs(int(rgba[p * 4 + 0]) - 64) <= 2 && std::abs(int(rgba[p * 4 + 1]) - 128) <= 2 &&
+                        std::abs(int(rgba[p * 4 + 2]) - 191) <= 2,
+                    "QUADS triangle expansion missed pixels");
+        // Verify per-slot swizzle_override returns distinct views without mutating tex.swizzle.
+        TexObject swiz_tex;
+        swiz_tex.image = &target.image;
+        swiz_tex.view_format = VK_FORMAT_R8G8B8A8_UNORM;
+        swiz_tex.levels = 1;
+        swiz_tex.layers = 1;
+        swiz_tex.swizzle = 0x06880000u; // RGBA
+        const uint32_t swiz_abgr = (3u << 16) | (2u << 19) | (1u << 22) | (0u << 25);
+        const VkImageView v_rgba = tex_object_view(swiz_tex, 2, false, false, swiz_tex.swizzle);
+        const VkImageView v_abgr = tex_object_view(swiz_tex, 2, false, false, swiz_abgr);
+        require(v_rgba != VK_NULL_HANDLE && v_abgr != VK_NULL_HANDLE && v_rgba != v_abgr,
+                "per-slot swizzle_override failed to produce distinct views");
+        require(swiz_tex.swizzle == 0x06880000u, "tex_object_view mutated shared TexObject::swizzle");
+        S.framebuffer = {};
+        gx2vk::destroy_image(target.image);
+        require(gx2vk::finish(), "QUADS cleanup wait failed");
+        s_last_pipeline_lookup.reset();
+        s_pipeline_req_mru.fill({});
+        for (auto it = s_pipelines.begin(); it != s_pipelines.end();) {
+            uint32_t id = 0;
+            std::memcpy(&id, it->first.data(), 4);
+            if (id != program.id) {
+                ++it;
+                continue;
+            }
+            if (auto pipe = await_compile(it->second)) vkDestroyPipeline(gx2vk::device(), pipe, nullptr);
+            it = s_pipelines.erase(it);
+        }
+        release_program_layouts(program);
+        reset_command_tracking();
+    }
+    // 3. depth_to_depth_pass GPU scaling test (D32_SFLOAT and D32_SFLOAT_S8_UINT when supported).
+    auto check_depth_copy = [&](VkFormat fmt, bool attachable) {
+        gx2vk::Image src, dst;
+        gx2vk::ImageDesc sd;
+        sd.format = fmt;
+        sd.width = 16;
+        sd.height = 16;
+        sd.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        require(gx2vk::create_image(src, sd), "depth_to_depth src allocation failed");
+        gx2vk::ImageDesc dd;
+        dd.format = fmt;
+        dd.width = 8;
+        dd.height = 8;
+        dd.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                   (attachable ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0u);
+        require(gx2vk::create_image(dst, dd), "depth_to_depth dst allocation failed");
+        clear_image_depth(src, 0.375f, 0);
+        clear_image_depth(dst, 1.0f, 0);
+        require(gx2r::depth_to_depth_pass(src, 0, 0, dst, 0, 0, 8, 8), "depth_to_depth_pass failed");
+        require(gx2vk::finish(), "depth_to_depth_pass completion failed");
+        std::vector<uint8_t> bytes;
+        require(gx2vk::read_image(dst, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 8, 8, bytes), "depth_to_depth readback failed");
+        require(bytes.size() == 8 * 8 * 4, "depth_to_depth unexpected readback size");
+        for (unsigned p = 0; p < 8 * 8; ++p) {
+            float z = 0.0f;
+            std::memcpy(&z, bytes.data() + p * 4, 4);
+            require(std::abs(z - 0.375f) < 1e-5f, "depth_to_depth_pass output depth mismatch");
+        }
+        gx2vk::destroy_image(src);
+        gx2vk::destroy_image(dst);
+    };
+    check_depth_copy(VK_FORMAT_D32_SFLOAT, true);
+    check_depth_copy(VK_FORMAT_D32_SFLOAT, false);
+    if (gx2vk::format_supports(VK_FORMAT_D32_SFLOAT_S8_UINT,
+                               VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+        check_depth_copy(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
+    require(gx2vk::finish(), "depth_to_depth cleanup wait failed");
+    require(gx2vk::validation_error_count() == 0, "Vulkan validation error in quads/depth_to_depth test");
+    std::printf("{\"metric\":\"quads_and_depth_copy\",\"passed\":true}\n");
 }
 #endif
 
@@ -7103,6 +7941,7 @@ void gx2r::shutdown_draw_state() {
     s_exact_reads.clear();
     s_exact_key_memos.clear();
     s_last_exact_key_memo = nullptr;
+    s_code_gen_cache.fill({});
     s_canonical.clear();
     s_canonical_reuses = 0;
     warm_reset();
@@ -7124,10 +7963,14 @@ void gx2r::shutdown_draw_state() {
     for (auto& [key, pipeline] : s_transfer_pipelines)
         if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
     s_transfer_pipelines.clear();
+    for (auto& [key, pipeline] : s_depth_transfer_pipelines)
+        if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    s_depth_transfer_pipelines.clear();
     if (s_transfer_layout) vkDestroyPipelineLayout(device, s_transfer_layout, nullptr);
     if (s_transfer_set) vkDestroyDescriptorSetLayout(device, s_transfer_set, nullptr);
     s_transfer_layout = VK_NULL_HANDLE;
     s_transfer_set = VK_NULL_HANDLE;
+    s_transfer_use_push = false;
     if (s_descriptor_pool) vkDestroyDescriptorPool(device, s_descriptor_pool, nullptr);
     for (auto& [serial, pool] : s_retired_pools) vkDestroyDescriptorPool(device, pool, nullptr);
     for (auto pool : s_free_descriptor_pools) vkDestroyDescriptorPool(device, pool, nullptr);
@@ -7151,18 +7994,28 @@ void gx2r::shutdown_draw_state() {
     s_index_clock = 0;
     s_index_vram_bytes = 0;
     s_index_evict_bucket = 0;
+    s_index_ring_sweep_bucket = 0;
     s_index_stale.clear();
+    s_index_expand_out.clear();
+    s_index_expand_segment.clear();
+    gx2vk::destroy_buffer(s_static_quad_ib.buffer);
+    s_static_quad_ib.quad_capacity = 0;
+    gx2vk::destroy_buffer(s_static_quad_strip_ib.buffer);
+    s_static_quad_strip_ib.quad_capacity = 0;
     s_last_idx_key = {};
     s_last_idx_entry = nullptr;
     s_idx_mru.fill({});
     s_uniform_spans.clear();
     s_uniform_chunk = 0;
+    s_uniform_sweep_bucket = 0;
+    s_uniform_stale.clear();
     s_ubo_mru.fill({});
     for (auto& stage : s_uniform_slot_memo)
         for (auto& memo : stage) memo = {};
     gx2vk::destroy_buffer(s_null_vertex);
     gx2vk::destroy_buffer(s_zero_ubo_buf);
     s_target_clears.clear();
+    ++s_target_clear_serial;
     s_sampler_mru.fill({});
     s_req_tpl = {};
     ++s_fb_generation;
@@ -7176,6 +8029,8 @@ void gx2r::shutdown_draw_state() {
     }
     s_shadow_copies.clear();
     s_active_fb = {};
+    s_active_fb_image_count = 0;
+    s_active_fb_scale = {1.0f, 1.0f};
     s_area = {};
     s_rendering = false;
     s_last_program = 0;

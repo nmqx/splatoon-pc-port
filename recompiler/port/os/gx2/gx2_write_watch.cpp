@@ -69,7 +69,7 @@ struct FastRangeMru {
     uint32_t epoch = ~0u;
     uint64_t generation = 0;
 };
-constexpr size_t kFastMruSize = 1024;
+constexpr size_t kFastMruSize = 4096;
 thread_local FastRangeMru t_fast_mru[kFastMruSize]{};
 
 inline size_t fast_mru_slot(uint32_t addr, uint32_t size) noexcept {

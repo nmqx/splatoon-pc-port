@@ -10,7 +10,26 @@ struct Types {
     std::array<uint32_t, VK_MAX_MEMORY_TYPES> indices{};
     uint32_t count = 0;
 };
-inline Types memory_types(const VkPhysicalDeviceMemoryProperties& memory, uint32_t bits, MemoryUse use) {
+inline bool prefer_shared_upload(const VkPhysicalDeviceMemoryProperties& memory, bool low_vram_igpu) {
+    if (!low_vram_igpu) return false;
+    uint64_t local_host_visible = 0;
+    uint64_t shared_host_visible = 0;
+    for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        const auto flags = memory.memoryTypes[i].propertyFlags;
+        if (flags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
+                     VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD))
+            continue;
+        if (!(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) continue;
+        const uint64_t size = memory.memoryHeaps[memory.memoryTypes[i].heapIndex].size;
+        if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            local_host_visible = std::max(local_host_visible, size);
+        else
+            shared_host_visible = std::max(shared_host_visible, size);
+    }
+    return shared_host_visible > local_host_visible;
+}
+inline Types memory_types(const VkPhysicalDeviceMemoryProperties& memory, uint32_t bits, MemoryUse use,
+                          bool prefer_shared_upload = false) {
     Types result;
     auto score = [&](uint32_t type) {
         const auto flags = memory.memoryTypes[type].propertyFlags;
@@ -19,6 +38,10 @@ inline Types memory_types(const VkPhysicalDeviceMemoryProperties& memory, uint32
         const int cached = (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? 1 : 0;
         if (use == MemoryUse::DeviceLocal) return local * 100;
         if (use == MemoryUse::Readback) return cached * 100 + coherent * 10 + local;
+        // On low-VRAM iGPUs with a small 256 MiB DEVICE_LOCAL BAR and large
+        // shared unified RAM, rank plain HOST_VISIBLE|HOST_COHERENT above the
+        // small BAR so streaming upload rings never exhaust DEVICE_LOCAL space.
+        if (prefer_shared_upload) return coherent * 100 + (1 - local) * 20 + (1 - cached);
         return local * 100 + coherent * 10;
     };
     for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {

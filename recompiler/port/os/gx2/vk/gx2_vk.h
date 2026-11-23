@@ -51,6 +51,10 @@ struct Caps {
     bool depth_clip_enable = false;     // VK_EXT_depth_clip_enable (PA_CL_CLIP_CNTL ZCLIP_*_DISABLE)
     bool validation = false;            // VK_LAYER_KHRONOS_validation enabled
     bool sync_validation = false;
+    bool is_amd = false;                // vendorID == 0x1002
+    bool is_igpu = false;               // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+    bool low_vram_igpu = false;         // iGPU / <= 1 GiB DEVICE_LOCAL with larger shared memory
+    uint64_t device_local_bytes = 0;    // sum of VK_MEMORY_HEAP_DEVICE_LOCAL_BIT heap sizes
     float max_anisotropy = 1.0f;
 };
 

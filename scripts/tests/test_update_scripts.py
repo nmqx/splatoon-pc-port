@@ -40,7 +40,9 @@ def write_dump(root, version, files):
 class UpdateCombinatorTests(unittest.TestCase):
     def test_only_setup_powershell_script_remains(self):
         names = sorted(p.name for p in SCRIPTS.glob('*.ps1'))
-        self.assertEqual(names, ['Setup.ps1'])
+        # Allow Setup.ps1 and the incremental developer build helper dev-build.ps1;
+        # reject any legacy update scripts (e.g. Install-Update.ps1).
+        self.assertEqual(names, ['Setup.ps1', 'dev-build.ps1'])
         self.assertFalse((SCRIPTS / 'Install-Update.ps1').exists())
 
     def test_setup_scripts_use_the_merged_rom_directly(self):

@@ -205,6 +205,19 @@ struct RasterState {
     uint32_t blend_src_rgb = wire::ONE, blend_dst_rgb = wire::ZERO, blend_src_alpha = wire::ONE,
              blend_dst_alpha = wire::ZERO;
     uint32_t blend_eq_rgb = wire::FUNC_ADD, blend_eq_alpha = wire::FUNC_ADD;
+    struct TargetBlendState {
+        bool enable = false;
+        uint32_t color_src = wire::ONE;
+        uint32_t color_dst = wire::ZERO;
+        uint32_t color_op = wire::FUNC_ADD;
+        uint32_t alpha_src = wire::ONE;
+        uint32_t alpha_dst = wire::ZERO;
+        uint32_t alpha_op = wire::FUNC_ADD;
+        bool separate_alpha = false;
+        bool operator==(const TargetBlendState&) const = default;
+    };
+    bool per_target_blend_valid = false;
+    TargetBlendState target_blends[8]{};
     std::array<float, 4> blend_color{};
     std::array<uint8_t, 8> color_mask{15, 15, 15, 15, 15, 15, 15, 15};
     bool alpha_to_coverage = false; // no effect: every native target is single-sample (as in GPU)
@@ -252,6 +265,7 @@ struct NativeQuery {
 
 struct BoundTexture {
     uint32_t address = 0;
+    uint32_t swizzle = 0x06880000; // SQ_TEX_RESOURCE_WORD4: R=0, G=1, B=2, A=3
     std::array<uint8_t, GX2TEX_SIZEOF> descriptor{};
 };
 struct AttribBufferState {
@@ -287,6 +301,8 @@ struct FetchShaderInfo {
     uint64_t revision = 0;
     uint64_t exact_hash = 0;
     uint64_t exact_hash_revision = 0;
+    uint64_t verified_batch_id = 0;
+    uint32_t verified_size = 0;
 };
 
 // Sampler state of one GX2 sampler slot (stage*18 + slot), as GPU sampler
@@ -312,8 +328,12 @@ struct State {
     uint64_t color_view_revision = 0, depth_view_revision = 0;
     uint64_t effective_color_revision() const noexcept { return color_view_revision + cb_map.size(); }
     uint64_t effective_depth_revision() const noexcept { return depth_view_revision + depth_map.size(); }
-    std::array<TextureEntryCache, 96> texture_entries{};
-    std::array<TextureEntryCache, 256> texture_entry_mru{};
+    struct SlotTextureCache {
+        const uint8_t* mem = nullptr;
+        Texture* entry = nullptr;
+    };
+    std::array<SlotTextureCache, 96> texture_entries{};
+    std::array<TextureEntryCache, 1024> texture_entry_mru{};
     std::unordered_map<TextureEntryIndexKey, Texture*, TextureEntryIndexHash> texture_entry_index;
     // Address index of tex_map image/mip ranges for gx2_render_invalidate_textures,
     // rebuilt when tex_map grows (entries are only added, or all reset).
@@ -345,6 +365,8 @@ struct State {
     uint32_t target_masks = 0xFFFFFFFF;
     bool color_write = true;
     bool conditional_draw = true;
+    uint8_t raster_reg_dirty = 0xFF; // bit0=poly, bit1=blend/color, bit2=depth/stencil, bit3=other
+    bool pm4_resource_dirty = false;
     RasterState raster;
     Framebuffer framebuffer;     // current GPU framebuffer binding
     uint32_t current_fbo_id = 0; // diagnostic name of the bound framebuffer
@@ -431,10 +453,14 @@ void before_submit();
 void shutdown_draw_state();
 TexObject* dummy_texture(uint32_t dim, bool integer, bool sint, bool shadow);
 VkImageView tex_object_view(TexObject& tex, uint32_t shader_dim, bool integer_sampler, bool sint_sampler);
+VkImageView tex_object_view(TexObject& tex, uint32_t shader_dim, bool integer_sampler, bool sint_sampler,
+                            uint32_t swizzle_override);
 VkSampler tex_object_sampler(const TexParams& params, bool shadow, bool integer);
 
-// Internal fullscreen-triangle passes (depth->R32F transfer, capture readback).
+// Internal fullscreen-triangle passes (depth->R32F transfer, depth->depth scale fallback, capture readback).
 bool depth_to_color_pass(DepthTarget& source, ColorTarget& destination, uint32_t width, uint32_t height);
+bool depth_to_depth_pass(gx2vk::Image& src, uint32_t src_level, uint32_t src_layer, gx2vk::Image& dst,
+                         uint32_t dst_level, uint32_t dst_layer, uint32_t dst_width, uint32_t dst_height);
 // Uploads a CPU-side linear level into a Vulkan image (outside rendering).
 void upload_image_level(gx2vk::Image& image, uint32_t level, uint32_t first_layer, uint32_t layers, uint32_t width,
                         uint32_t height, uint32_t depth, const uint8_t* data, size_t bytes, VkImageAspectFlags aspect);
