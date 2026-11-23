@@ -12,6 +12,7 @@
 #include <SDL_vulkan.h>
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,7 +100,12 @@ bool env_flag(const char* name) {
 // satisfies bufferImageGranularity.
 // ---------------------------------------------------------------------------
 constexpr VkDeviceSize kBlockSize = 64ull << 20;
+constexpr VkDeviceSize kLowVramBlockSize = 16ull << 20;
 constexpr VkDeviceSize kDedicatedThreshold = 16ull << 20;
+bool s_prefer_shared_upload = false;
+VkDeviceSize pool_block_size() {
+    return s_caps.low_vram_igpu ? kLowVramBlockSize : kBlockSize;
+}
 struct Block {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     uint8_t* mapped = nullptr;
@@ -1338,7 +1344,31 @@ bool init(SDL_Window* window, bool native_depth) {
     s_caps.api_version = props.apiVersion;
     s_caps.device_name = props.deviceName;
     s_caps.limits = props.limits;
+    s_caps.is_amd = props.vendorID == 0x1002u;
+    s_caps.is_igpu = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     vkGetPhysicalDeviceMemoryProperties(s_physical, &s_memory);
+    uint64_t device_local_bytes = 0;
+    uint64_t shared_host_visible_bytes = 0;
+    for (uint32_t h = 0; h < s_memory.memoryHeapCount; ++h) {
+        if (s_memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            device_local_bytes += s_memory.memoryHeaps[h].size;
+    }
+    for (uint32_t t = 0; t < s_memory.memoryTypeCount; ++t) {
+        const auto flags = s_memory.memoryTypes[t].propertyFlags;
+        if (flags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
+                     VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD))
+            continue;
+        if (!(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            shared_host_visible_bytes =
+                std::max(shared_host_visible_bytes, s_memory.memoryHeaps[s_memory.memoryTypes[t].heapIndex].size);
+    }
+    s_caps.device_local_bytes = device_local_bytes;
+    constexpr uint64_t kLowVramThreshold = 1024ull << 20; // 1 GiB
+    s_caps.low_vram_igpu = (s_caps.is_igpu && device_local_bytes <= kLowVramThreshold) ||
+                           (device_local_bytes > 0 && device_local_bytes <= kLowVramThreshold &&
+                            shared_host_visible_bytes > device_local_bytes);
+    s_prefer_shared_upload = memory_detail::prefer_shared_upload(s_memory, s_caps.low_vram_igpu);
 
     vkEnumerateDeviceExtensionProperties(s_physical, nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> device_extensions(count);
@@ -1483,9 +1513,9 @@ bool init(SDL_Window* window, bool native_depth) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT e_clip_enable{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
-    if (border_ext && border.customBorderColors) {
+    if (border_ext && border.customBorderColors && border.customBorderColorWithoutFormat) {
         e_border.customBorderColors = VK_TRUE;
-        e_border.customBorderColorWithoutFormat = border.customBorderColorWithoutFormat;
+        e_border.customBorderColorWithoutFormat = VK_TRUE;
         *tail = &e_border;
         tail = &e_border.pNext;
     }
@@ -1558,7 +1588,7 @@ bool init(SDL_Window* window, bool native_depth) {
         vkGetPhysicalDeviceProperties2(s_physical, &p2);
         s_caps.max_push_descriptors = push.maxPushDescriptors;
     }
-    s_caps.custom_border_color = e_border.customBorderColors;
+    s_caps.custom_border_color = e_border.customBorderColors && e_border.customBorderColorWithoutFormat;
     s_caps.list_restart = e_restart.primitiveTopologyListRestart;
     s_caps.transform_feedback = e_xfb.transformFeedback;
     s_caps.vertex_divisor = e_divisor.vertexAttributeInstanceRateDivisor;
@@ -1671,6 +1701,8 @@ void shutdown() {
     vkDestroyInstance(s_instance, nullptr);
     s_instance = VK_NULL_HANDLE;
     s_ready = false;
+    s_caps = Caps{};
+    s_prefer_shared_upload = false;
     s_next_serial = 1;
     s_completed = 0;
     s_recorded = false;
@@ -1726,7 +1758,8 @@ std::string last_validation_error() {
 Allocation allocate(const VkMemoryRequirements& requirements, MemoryUse use, bool linear,
                     const VkMemoryDedicatedAllocateInfo* dedicated) {
     if (!requirements.size) return {};
-    const auto types = memory_detail::memory_types(s_memory, requirements.memoryTypeBits, use);
+    const auto types = memory_detail::memory_types(s_memory, requirements.memoryTypeBits, use,
+                                                   use == MemoryUse::Upload && s_prefer_shared_upload);
     const bool mapped = use != MemoryUse::DeviceLocal;
     for (uint32_t candidate = 0; candidate < types.count; ++candidate) {
         const uint32_t type = types.indices[candidate];
@@ -1765,7 +1798,7 @@ Allocation allocate(const VkMemoryRequirements& requirements, MemoryUse use, boo
             }
         }
         Block block;
-        block.size = std::min(kBlockSize, s_memory.memoryHeaps[memory_type.heapIndex].size);
+        block.size = std::min(pool_block_size(), s_memory.memoryHeaps[memory_type.heapIndex].size);
         auto result = a.size <= block.size ? raw_allocate(block.size, type, mapped, nullptr, block.memory, block.mapped)
                                            : VK_ERROR_OUT_OF_DEVICE_MEMORY;
         if (result != VK_SUCCESS) {
@@ -2196,6 +2229,10 @@ bool gpu_dirty() {
 }
 void barrier_for(uint32_t dst_stages) {
     if (!dst_stages) return;
+    // Close any active dynamic rendering instance before snapshotting dirty
+    // masks: end_rendering() calls note_gpu_write(), so reading masks first
+    // could skip leave_rendering() or clear writes recorded by the ended pass.
+    leave_rendering();
     uint32_t raw = 0, war = 0;
     if (dst_stages & kSyncTransfer) {
         raw |= s_pending_write[kConsumerTransfer];
@@ -2269,6 +2306,11 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
         });
         return span;
     }
+    // Keep chunk size 32 MiB and reclaim threshold > 8 so multi-chunk residency
+    // contracts hold (upload chunks already route to shared system RAM via
+    // s_prefer_shared_upload on low-VRAM iGPUs); trim burst chunks tighter.
+    const size_t trim_high = s_caps.low_vram_igpu ? 12u : 16u;
+    const size_t trim_target = s_caps.low_vram_igpu ? 8u : 12u;
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (s_active_chunk >= 0) {
             auto& chunk = s_chunks[s_active_chunk];
@@ -2338,10 +2380,8 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
         s_chunk_meta[next].retain_until = s_next_serial;
         // Trim excess completed upload chunks left over from transient bursts
         // (e.g. stage loads) so process RAM never stays permanently elevated.
-        constexpr size_t kChunkTrimHigh = 16;
-        constexpr size_t kChunkTrimTarget = 12;
-        if (s_chunks.size() > kChunkTrimHigh) {
-            for (int i = int(s_chunks.size()) - 1; i >= 0 && s_chunks.size() > kChunkTrimTarget; --i) {
+        if (s_chunks.size() > trim_high) {
+            for (int i = int(s_chunks.size()) - 1; i >= 0 && s_chunks.size() > trim_target; --i) {
                 if (i == s_active_chunk) continue;
                 if (s_chunk_meta[i].retain_until > chunk_limit) continue;
                 Chunk doomed = std::move(s_chunks[i]);
@@ -2542,6 +2582,110 @@ uint32_t format_block_bytes(VkFormat f, VkImageAspectFlags aspect) {
     }
 }
 
+namespace {
+uint32_t mutable_view_formats(VkFormat format, VkImageUsageFlags usage, std::array<VkFormat, 4>& out) {
+    VkFormatFeatureFlags required = 0;
+    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) required |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) required |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) required |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (usage & VK_IMAGE_USAGE_STORAGE_BIT) required |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) required |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    if (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) required |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+
+    std::array<VkFormat, 4> candidates{};
+    uint32_t candidate_count = 0;
+    auto set = [&](std::initializer_list<VkFormat> list) {
+        for (VkFormat f : list)
+            if (candidate_count < candidates.size()) candidates[candidate_count++] = f;
+    };
+    const bool color_attachment = (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+        if (color_attachment)
+            set({VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM});
+        else
+            set({VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT});
+        break;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+        set({VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB});
+        break;
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8_SINT:
+        set({VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT});
+        break;
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8_UINT:
+    case VK_FORMAT_R8G8_SINT:
+        set({VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SINT});
+        break;
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT:
+        set({VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT});
+        break;
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16_SINT:
+        set({VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT});
+        break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R16G16B16A16_SINT:
+        set({VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UINT,
+             VK_FORMAT_R16G16B16A16_SINT});
+        break;
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
+        set({VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT});
+        break;
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32_SINT:
+        set({VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_SINT});
+        break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+        set({VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT});
+        break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+        set({VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_UINT_PACK32});
+        break;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        set({VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK});
+        break;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+        set({VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK});
+        break;
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+        set({VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK});
+        break;
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        set({VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK});
+        break;
+    default: return 0;
+    }
+
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < candidate_count; ++i) {
+        if (candidates[i] == format || format_supports(candidates[i], required)) out[count++] = candidates[i];
+    }
+    return count >= 2 ? count : 0;
+}
+} // namespace
+
 bool create_image(Image& image, const ImageDesc& desc) {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = desc.flags;
@@ -2556,6 +2700,16 @@ bool create_image(Image& image, const ImageDesc& desc) {
     info.usage = desc.usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::array<VkFormat, 4> view_formats{};
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    if (desc.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+        const uint32_t view_format_count = mutable_view_formats(desc.format, desc.usage, view_formats);
+        if (view_format_count >= 2) {
+            format_list.viewFormatCount = view_format_count;
+            format_list.pViewFormats = view_formats.data();
+            info.pNext = &format_list;
+        }
+    }
     if (vkCreateImage(s_device, &info, nullptr, &image.image) != VK_SUCCESS) {
         TXDIAG(txdiag::event("image_create_failed", "\"format\":%u,\"width\":%u,\"height\":%u", uint32_t(desc.format),
                              desc.width, desc.height));
@@ -2742,7 +2896,7 @@ VkSampler sampler(const VkSamplerCreateInfo& info, const VkClearColorValue* cust
     if (sampler) return sampler;
     VkSamplerCreateInfo create = info;
     VkSamplerCustomBorderColorCreateInfoEXT border{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
-    if (custom_border) {
+    if (custom_border && s_caps.custom_border_color) {
         border.customBorderColor = *custom_border;
         border.format = VK_FORMAT_UNDEFINED;
         create.pNext = &border;
@@ -2935,6 +3089,7 @@ bool present(Image& source, uint32_t width, uint32_t height) {
     }
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return false;
     const auto acquire_end = std::chrono::steady_clock::now();
+    leave_rendering();
     VkCommandBuffer cb = cmd();
     barrier_for(kSyncTransfer);
     VkImage target = s_swapchain.images[index];
