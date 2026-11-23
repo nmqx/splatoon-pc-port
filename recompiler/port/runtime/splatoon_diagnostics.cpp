@@ -1,4 +1,5 @@
 #include "splatoon_diagnostics.h"
+#include "crash_diagnostics.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,13 @@
 #include <psapi.h>
 #undef min
 #undef max
+#else
+#include <dlfcn.h>
+#include <signal.h>
+#include <unistd.h>
+#if defined(__GLIBC__)
+#include <execinfo.h>
+#endif
 #endif
 
 namespace SplatoonDiagnostics {
@@ -138,13 +146,15 @@ static int format_backtrace(CONTEXT context, char* out, size_t size) {
     return len;
 }
 
+static std::atomic<bool> s_crash_reported{false};
+
 // Unhandled-exception filter, not a vectored handler: the runtime handles
 // some access violations itself (__try in gx2_display_list.cpp, the hang
 // sampler), and a first-chance vectored handler wrote a "crash" report for
 // each of them. Only exceptions nobody handled reach this filter.
 static LONG WINAPI CrashUnhandledFilter(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
-    {
+    if (!s_crash_reported.exchange(true)) {
         // The process is already failing: keep this path short.
         char time_str[64];
         SYSTEMTIME st;
@@ -156,6 +166,17 @@ static LONG WINAPI CrashUnhandledFilter(PEXCEPTION_POINTERS ep) {
         std::string crash_dir = base + "\\" + time_str;
         CreateDirectoryA(base.c_str(), nullptr);
         CreateDirectoryA(crash_dir.c_str(), nullptr);
+
+        char backtrace_buf[2048]{};
+        int bt_len = format_backtrace(*ep->ContextRecord, backtrace_buf, sizeof(backtrace_buf));
+
+        // Resolve the module containing the faulting address for plain-English diagnosis.
+        char fault_mod_path[MAX_PATH]{};
+        HMODULE fault_mod = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress), &fault_mod)) {
+            GetModuleFileNameA(fault_mod, fault_mod_path, sizeof(fault_mod_path));
+        }
 
         std::string summary_path = crash_dir + "\\summary.txt";
         HANDLE hFile =
@@ -169,6 +190,7 @@ static LONG WINAPI CrashUnhandledFilter(PEXCEPTION_POINTERS ep) {
                          "============================================================\n"
                          "Exception Code:    0x%08X\n"
                          "Fault Address:     0x%p\n"
+                         "Fault Module:      %s\n"
                          "Thread ID:         %u\n"
                          "Frame Number:      %u\n"
                          "Timestamp:         %s\n\n"
@@ -179,17 +201,32 @@ static LONG WINAPI CrashUnhandledFilter(PEXCEPTION_POINTERS ep) {
                          "  RCX/ECX: 0x%p\n"
                          "  RDX/EDX: 0x%p\n"
                          "  RBX/EBX: 0x%p\n\n"
-                         "See performance.csv and events.jsonl for pre-crash telemetry.\n",
-                         (unsigned int)code, ep->ExceptionRecord->ExceptionAddress, (unsigned int)GetCurrentThreadId(),
+                         "See crash_report.txt, performance.csv and events.jsonl for details.\n",
+                         (unsigned int)code, ep->ExceptionRecord->ExceptionAddress,
+                         fault_mod_path[0] ? fault_mod_path : "?", (unsigned int)GetCurrentThreadId(),
                          s_frame_write_index.load(), time_str, (void*)ep->ContextRecord->Rip,
                          (void*)ep->ContextRecord->Rsp, (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rcx,
                          (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->Rbx);
             DWORD written = 0;
             WriteFile(hFile, buf, (DWORD)len, &written, nullptr);
-            len = format_backtrace(*ep->ContextRecord, buf, sizeof(buf));
-            WriteFile(hFile, buf, (DWORD)len, &written, nullptr);
+            if (bt_len > 0) WriteFile(hFile, backtrace_buf, (DWORD)bt_len, &written, nullptr);
             CloseHandle(hFile);
         }
+
+        rbrew::crash_diag::CrashContext ctx{};
+        ctx.seh_code = static_cast<uint32_t>(code);
+        ctx.fault_address = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+        if (fault_mod_path[0]) ctx.faulting_module = fault_mod_path;
+        ctx.backtrace = backtrace_buf;
+        ctx.frame_number = s_frame_write_index.load();
+
+        const rbrew::crash_diag::Diagnosis diag = rbrew::crash_diag::diagnose(ctx);
+        const std::string report_path =
+            rbrew::crash_diag::write_crash_report_to_dir(ctx, diag, crash_dir, time_str);
+        char detail_buf[192];
+        snprintf(detail_buf, sizeof(detail_buf), "Exception 0x%08X at 0x%p (%s)", (unsigned int)code,
+                 ep->ExceptionRecord->ExceptionAddress, fault_mod_path[0] ? fault_mod_path : "unknown module");
+        rbrew::crash_diag::show_error_dialog(diag, report_path, detail_buf);
     }
     return s_previous_filter ? s_previous_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -211,25 +248,37 @@ static void write_abort_report(const char* why) {
     std::string crash_dir = base + "\\" + time_str;
     CreateDirectoryA(base.c_str(), nullptr);
     CreateDirectoryA(crash_dir.c_str(), nullptr);
+    char backtrace_buf[4096]{};
+    int bt_len = format_backtrace(context, backtrace_buf, sizeof(backtrace_buf));
     std::string summary_path = crash_dir + "\\summary.txt";
     HANDLE hFile =
         CreateFileA(summary_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-    char buf[4096];
-    int len = snprintf(buf, sizeof(buf),
-                       "============================================================\n"
-                       "SPLATOON 1 PC PORT — ABORT REPORT (AUTOMATIC CAPTURE)\n"
-                       "============================================================\n"
-                       "Reason:            %s\n"
-                       "Thread ID:         %u\n"
-                       "Frame Number:      %u\n"
-                       "Timestamp:         %s\n",
-                       why, (unsigned int)GetCurrentThreadId(), s_frame_write_index.load(), time_str);
-    DWORD written = 0;
-    WriteFile(hFile, buf, (DWORD)len, &written, nullptr);
-    len = format_backtrace(context, buf, sizeof(buf));
-    WriteFile(hFile, buf, (DWORD)len, &written, nullptr);
-    CloseHandle(hFile);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        char buf[1024];
+        int len = snprintf(buf, sizeof(buf),
+                           "============================================================\n"
+                           "SPLATOON 1 PC PORT — ABORT REPORT (AUTOMATIC CAPTURE)\n"
+                           "============================================================\n"
+                           "Reason:            %s\n"
+                           "Thread ID:         %u\n"
+                           "Frame Number:      %u\n"
+                           "Timestamp:         %s\n",
+                           why, (unsigned int)GetCurrentThreadId(), s_frame_write_index.load(), time_str);
+        DWORD written = 0;
+        WriteFile(hFile, buf, (DWORD)len, &written, nullptr);
+        if (bt_len > 0) WriteFile(hFile, backtrace_buf, (DWORD)bt_len, &written, nullptr);
+        CloseHandle(hFile);
+    }
+    rbrew::crash_diag::CrashContext ctx{};
+    ctx.category = rbrew::crash_diag::FailureCategory::AbortOrTerminate;
+    ctx.signal_number = SIGABRT;
+    ctx.detail = why ? why : "abort()";
+    ctx.backtrace = backtrace_buf;
+    ctx.frame_number = s_frame_write_index.load();
+    const rbrew::crash_diag::Diagnosis diag = rbrew::crash_diag::diagnose(ctx);
+    const std::string report_path =
+        rbrew::crash_diag::write_crash_report_to_dir(ctx, diag, crash_dir, time_str);
+    rbrew::crash_diag::show_error_dialog(diag, report_path, ctx.detail);
 }
 static void on_sigabrt(int) {
     write_abort_report("abort() (SIGABRT)");
@@ -246,6 +295,67 @@ static void on_terminate() {
         }
     }
     write_abort_report(why.c_str());
+    std::abort();
+}
+#else
+// ---------------------------------------------------------------------------
+// POSIX / Linux crash handler (SIGSEGV / SIGILL / SIGBUS / SIGFPE / SIGABRT)
+// ---------------------------------------------------------------------------
+static std::atomic<bool> s_posix_crash_reported{false};
+
+static void posix_crash_signal_handler(int sig, siginfo_t* info, void*) {
+    if (!s_posix_crash_reported.exchange(true)) {
+        rbrew::crash_diag::CrashContext ctx{};
+        ctx.signal_number = sig;
+        ctx.frame_number = s_frame_write_index.load();
+        if (info && info->si_addr) {
+            ctx.fault_address = reinterpret_cast<uintptr_t>(info->si_addr);
+            Dl_info dli{};
+            if (dladdr(info->si_addr, &dli) != 0 && dli.dli_fname) {
+                ctx.faulting_module = dli.dli_fname;
+            }
+        }
+#if defined(__GLIBC__)
+        void* frames[24]{};
+        const int count = backtrace(frames, 24);
+        if (count > 0) {
+            if (char** symbols = backtrace_symbols(frames, count)) {
+                std::ostringstream bt;
+                for (int i = 0; i < count; ++i) {
+                    bt << "  #" << i << " " << symbols[i] << "\n";
+                }
+                ctx.backtrace = bt.str();
+                std::free(symbols);
+            }
+        }
+#endif
+        char detail_buf[192];
+        std::snprintf(detail_buf, sizeof(detail_buf), "Fatal signal %d at 0x%llX (%s)", sig,
+                      static_cast<unsigned long long>(ctx.fault_address),
+                      ctx.faulting_module.empty() ? "unknown module" : ctx.faulting_module.c_str());
+        ctx.detail = detail_buf;
+        const rbrew::crash_diag::Diagnosis diag = rbrew::crash_diag::diagnose(ctx);
+        const std::string report_path = rbrew::crash_diag::write_crash_report(ctx, diag);
+        rbrew::crash_diag::show_error_dialog(diag, report_path, ctx.detail);
+    }
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+static void posix_on_terminate() {
+    if (!s_posix_crash_reported.exchange(true)) {
+        std::string why = "std::terminate";
+        if (std::exception_ptr e = std::current_exception()) {
+            try {
+                std::rethrow_exception(e);
+            } catch (const std::exception& x) {
+                why = std::string("std::terminate, uncaught exception: ") + x.what();
+            } catch (...) {
+                why = "std::terminate, uncaught non-std exception";
+            }
+        }
+        rbrew::crash_diag::report_fatal_error(rbrew::crash_diag::FailureCategory::AbortOrTerminate, why.c_str());
+    }
     std::abort();
 }
 #endif
@@ -297,6 +407,17 @@ void Init() {
     s_previous_filter = SetUnhandledExceptionFilter(CrashUnhandledFilter);
     std::signal(SIGABRT, on_sigabrt);
     std::set_terminate(on_terminate);
+#else
+    struct sigaction sa{};
+    sa.sa_sigaction = posix_crash_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGILL, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGFPE, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    std::set_terminate(posix_on_terminate);
 #endif
 
     // Start watchdog (daemon thread)

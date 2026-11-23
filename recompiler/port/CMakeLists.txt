@@ -248,6 +248,7 @@ add_library(gambit_runtime STATIC
     loader/gambit_loader.cpp
     loader/native_console_profile.cpp
     runtime/splatoon_diagnostics.cpp
+    runtime/crash_diagnostics.cpp
     runtime/discord_rpc.cpp
     runtime/port_settings.cpp
 )
@@ -308,10 +309,14 @@ target_link_libraries(gambit_runtime PRIVATE rbrew_zlib_static)
 set_source_files_properties(os/stubs/zlib_guest.cpp PROPERTIES COMPILE_DEFINITIONS "RBREW_ZLIB_HEADER=\"${RBREW_ZLIB_HEADER}\"")
 
 if(WIN32)
-    target_link_libraries(gambit_runtime PUBLIC ws2_32 winmm)
+    target_link_libraries(gambit_runtime PUBLIC ws2_32 winmm user32)
     if(HAVE_MINIAUDIO)
         target_link_libraries(gambit_runtime PUBLIC ole32 ksuser)
     endif()
+endif()
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(gambit_runtime PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 if(UNIX AND NOT APPLE AND HAVE_MINIAUDIO)
@@ -535,6 +540,10 @@ if(RBREW_BUILD_TESTS)
     target_link_libraries(gambit_quit_confirm_tests PRIVATE gambit_runtime)
     target_include_directories(gambit_quit_confirm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME native_quit_confirm COMMAND gambit_quit_confirm_tests)
+    add_executable(gambit_crash_diagnostics_tests ../tests/test_crash_diagnostics.cpp)
+    target_link_libraries(gambit_crash_diagnostics_tests PRIVATE gambit_runtime)
+    target_include_directories(gambit_crash_diagnostics_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME native_crash_diagnostics COMMAND gambit_crash_diagnostics_tests)
     # Local developer tests/tools below are optional (not in the public tree).
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_frame_pacing.cpp")
         add_executable(gambit_frame_pacing_tests ../tests/test_frame_pacing.cpp)
