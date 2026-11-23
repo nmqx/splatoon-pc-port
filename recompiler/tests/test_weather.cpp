@@ -215,15 +215,16 @@ void math() {
     require(std::abs(sun_direction(6)[1]) < .001f && std::abs(sun_direction(18)[1]) < .001f,
             "sunrise/sunset timing is wrong");
     for (int quality = 0; quality < rbrew_settings::kShaderQualityCount; ++quality)
-        for (int fps : {30, 60, 120, 180}) {
+        for (int fps : {30, 60, 120, 165, 180, 240, rbrew_settings::kFrameRateDisplay}) {
             rbrew_settings::Values v;
             v.shader_quality = quality;
             v.frame_rate = fps;
             v.plaza_60fps = false;
             rbrew_settings::normalize(v);
-            require(v.frame_rate == (quality ? 60 : fps), "shader mode did not enforce exactly 60 FPS");
-            require(v.fps120 == (!quality && fps >= 120), "shader mode left interpolation enabled");
-            require(v.plaza_60fps == (quality != 0), "shader mode allowed the plaza's 30 FPS simulation");
+            require(v.frame_rate == fps, "normalize altered a supported frame rate");
+            require(v.fps120 == (fps >= 120 || fps == rbrew_settings::kFrameRateDisplay),
+                    "normalize did not match high-FPS interpolation flag");
+            require(!v.plaza_60fps, "normalize unexpectedly overrode plaza_60fps");
         }
     rbrew_settings::Values bad;
     bad.shader_quality = 99;
@@ -231,11 +232,12 @@ void math() {
     bad.time_of_day = 9000;
     bad.day_length = 0;
     bad.bloom = 1000;
+    bad.frame_rate = 75;
     rbrew_settings::normalize(bad);
     require(bad.shader_quality == 3 && bad.weather == 0 && bad.time_of_day == 1439 && bad.day_length == 5 &&
-                bad.bloom == 100,
+                bad.bloom == 100 && bad.frame_rate == 60 && !bad.fps120,
             "weather settings escaped supported bounds");
-    std::puts("weather: camera validation, clock rollover, sun path and mandatory shader FPS cap passed");
+    std::puts("weather: camera validation, clock rollover, sun path and settings normalization passed");
 }
 void collision() {
     using namespace gx2weather;
@@ -1097,6 +1099,46 @@ void main(){
             dome_v.shader_quality = q;
             require(gx2weather::apply(color, depth, cam, dome_v, 0), "s_dome frame-0 init/resize dispatch failed");
             read();
+        }
+        // Toggle clouds OFF -> ON -> OFF to verify s_dome skip/clear path and descriptor set caching.
+        for (bool clouds : {false, true, false}) {
+            reset(0.8f);
+            dome_v.clouds = clouds;
+            require(gx2weather::apply(color, depth, cam, dome_v, 0), "s_dome clouds toggle dispatch failed");
+            read();
+        }
+        // Exercise the s_scene_copy fallback path with a non-SAMPLED color image.
+        gx2vk::Image nonsampled_color;
+        {
+            gx2vk::ImageDesc nd;
+            nd.width = 73;
+            nd.height = 41;
+            nd.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+            nd.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            require(gx2vk::create_image(nonsampled_color, nd), "non-sampled color image creation failed");
+            gx2vk::barrier_if_dirty();
+            const VkImageSubresourceRange cr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const VkClearColorValue cv{{.2f, .3f, .4f, .625f}};
+            vkCmdClearColorImage(gx2vk::cmd(), nonsampled_color.image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &cr);
+            const VkImageSubresourceRange dr{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            const VkClearDepthStencilValue dz{.8f, 0};
+            vkCmdClearDepthStencilImage(gx2vk::cmd(), depth.image, VK_IMAGE_LAYOUT_GENERAL, &dz, 1, &dr);
+            gx2vk::note_gpu_write(nonsampled_color);
+            gx2vk::note_gpu_write(depth);
+            require(gx2weather::apply(nonsampled_color, depth, cam, dome_v, 0),
+                    "non-sampled scene_copy fallback dispatch failed");
+            std::vector<uint8_t> raw;
+            require(gx2vk::read_image(nonsampled_color, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 73, 41, raw),
+                    "non-sampled fallback readback failed");
+            for (size_t i = 0; i < raw.size(); i += 16) {
+                float px[4];
+                std::memcpy(px, raw.data() + i, 16);
+                for (float val : px)
+                    require(std::isfinite(val) && val >= 0, "non-sampled fallback produced non-finite output");
+                require(px[3] == .625f, "non-sampled fallback changed scene alpha");
+            }
+            gx2vk::destroy_image(nonsampled_color);
         }
     }
     gx2vk::finish();

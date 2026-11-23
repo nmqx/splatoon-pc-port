@@ -33,6 +33,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -52,7 +53,8 @@ template <typename T, size_t InlineN> class SmallBuffer {
     std::vector<T> heap_;
 
 public:
-    SmallBuffer() noexcept = default;
+    // Leave inline_ uninitialized while count_ == 0 (avoids 224 B dead zero-fill per Command).
+    SmallBuffer() noexcept {}
     SmallBuffer(const SmallBuffer& other) : count_(other.count_), heap_(other.heap_) {
         if (count_ > 0 && count_ <= InlineN) std::memcpy(inline_, other.inline_, count_ * sizeof(T));
     }
@@ -231,8 +233,13 @@ enum class BakedOpKind : uint8_t {
     SetAttribBuffer,
     SetUniformBlock,
     SetShader,
+    SetFetchShader,
     SetTexture,
     SetSampler,
+    SetReg1,
+    SetReg2,
+    SetTargetMasks,
+    CallDisplayList,
     Descriptor,
     Generic,
 };
@@ -261,6 +268,7 @@ struct BakedList {
     std::vector<BakedCall> call_pool;
     std::vector<uint32_t> word_pool;
     std::vector<uint8_t> desc_pool;
+    bool leaf = true; // true when no op can recursively call another display list
 };
 struct Recording {
     Commands commands;
@@ -311,6 +319,8 @@ uint32_t recording_bytes(const std::vector<Command>& commands) {
     return uint32_t(std::min<uint64_t>(bytes, UINT32_MAX));
 }
 std::unordered_map<uint32_t, uint32_t> s_lists; // buffer address -> latest id
+std::atomic<uint32_t> s_untagged_list_count{0}; // recordings published without a 12-byte tag
+std::atomic<uint64_t> s_static_patch_epoch{0};  // bumped by GX2PatchDisplayList
 uint32_t s_next_id = 0;
 uint64_t s_use_clock = 0;
 // 2^18: at 2^16 the game's per-frame lists pushed reused lists out to the
@@ -978,7 +988,9 @@ uint32_t recorded_size(const OpenList& list) {
 Gx2CommandFn s_draw_indexed_ex_fn = nullptr;
 Gx2CommandFn s_draw_indexed_ex2_fn = nullptr;
 Gx2CommandFn s_draw_ex_fn = nullptr;
+Gx2CommandFn s_list_call_fns[2] = {};
 Gx2BakedHotCommands s_hot_cmds{};
+void call_display_list_direct(CPUState* cpu, uint32_t list, uint32_t size, const char* api);
 
 uint32_t be_word(const uint8_t* d) {
     return (uint32_t(d[0]) << 24) | (uint32_t(d[1]) << 16) | (uint32_t(d[2]) << 8) | uint32_t(d[3]);
@@ -1003,17 +1015,30 @@ std::shared_ptr<const BakedList> bake_commands(const std::vector<Command>& comma
     auto baked = std::make_shared<BakedList>();
     baked->ops.reserve(commands.size());
     size_t word_total = 0, desc_total = 0, call_total = 0;
+    auto is_inline_reg_desc = [](const Command& c) {
+        if (!c.descriptor_fn) return false;
+        if (c.descriptor_fn == s_hot_cmds.set_ps_sampler || c.descriptor_fn == s_hot_cmds.set_vs_sampler)
+            return c.r[1] < 18 && c.descriptor.size() >= 12;
+        if (c.descriptor_fn == s_hot_cmds.set_depth_control_reg ||
+            c.descriptor_fn == s_hot_cmds.set_polygon_control_reg ||
+            c.descriptor_fn == s_hot_cmds.set_target_masks_reg)
+            return c.descriptor.size() >= 4;
+        if (c.descriptor_fn == s_hot_cmds.set_alpha_test_reg || c.descriptor_fn == s_hot_cmds.set_scissor_reg)
+            return c.descriptor.size() >= 8;
+        return false;
+    };
     for (const Command& c : commands) {
         if (!c.fn && !c.descriptor_fn)
             word_total += c.words.size();
         else if (c.descriptor_fn) {
-            if (!(c.descriptor_fn == s_hot_cmds.set_ps_sampler || c.descriptor_fn == s_hot_cmds.set_vs_sampler)) {
+            if (!is_inline_reg_desc(c)) {
                 desc_total += c.descriptor.size();
                 if (!(c.descriptor_fn == s_hot_cmds.set_ps_tex || c.descriptor_fn == s_hot_cmds.set_vs_tex)) ++call_total;
             }
         } else if (c.fn != s_draw_indexed_ex_fn && c.fn != s_draw_indexed_ex2_fn && c.fn != s_draw_ex_fn &&
                    c.fn != s_hot_cmds.set_attrib_buffer && c.fn != s_hot_cmds.set_vs_ubo &&
-                   c.fn != s_hot_cmds.set_ps_ubo && c.fn != s_hot_cmds.set_vs && c.fn != s_hot_cmds.set_ps) {
+                   c.fn != s_hot_cmds.set_ps_ubo && c.fn != s_hot_cmds.set_vs && c.fn != s_hot_cmds.set_ps &&
+                   c.fn != s_hot_cmds.set_fetch_shader && c.fn != s_list_call_fns[0] && c.fn != s_list_call_fns[1]) {
             ++call_total;
         }
     }
@@ -1081,6 +1106,19 @@ std::shared_ptr<const BakedList> bake_commands(const std::vector<Command>& comma
             op.is_pixel = (c.fn == s_hot_cmds.set_ps) ? 1 : 0;
             op.arg0 = c.r[0];
             baked->ops.push_back(op);
+        } else if (c.fn && c.fn == s_hot_cmds.set_fetch_shader) {
+            BakedOp op{};
+            op.kind = BakedOpKind::SetFetchShader;
+            op.arg0 = c.r[0];
+            baked->ops.push_back(op);
+        } else if (c.fn && (c.fn == s_list_call_fns[0] || c.fn == s_list_call_fns[1])) {
+            BakedOp op{};
+            op.kind = BakedOpKind::CallDisplayList;
+            op.is_pixel = (c.fn == s_list_call_fns[1]) ? 1 : 0;
+            op.arg0 = c.r[0];
+            op.arg1 = c.r[1];
+            baked->leaf = false;
+            baked->ops.push_back(op);
         } else if (c.descriptor_fn &&
                    (c.descriptor_fn == s_hot_cmds.set_ps_sampler || c.descriptor_fn == s_hot_cmds.set_vs_sampler) &&
                    c.r[1] < 18 && c.descriptor.size() >= 12) {
@@ -1093,6 +1131,36 @@ std::shared_ptr<const BakedList> bake_commands(const std::vector<Command>& comma
             op.arg1 = be_word(d);
             op.arg2 = be_word(d + 4);
             op.arg3 = be_word(d + 8);
+            baked->ops.push_back(op);
+        } else if (c.descriptor_fn &&
+                   (c.descriptor_fn == s_hot_cmds.set_depth_control_reg ||
+                    c.descriptor_fn == s_hot_cmds.set_polygon_control_reg) &&
+                   c.descriptor.size() >= 4) {
+            const bool is_poly = (c.descriptor_fn == s_hot_cmds.set_polygon_control_reg);
+            BakedOp op{};
+            op.kind = BakedOpKind::SetReg1;
+            op.is_pixel = is_poly ? 1 : 0;
+            op.arg0 = is_poly ? 0xA205u : 0xA200u;
+            op.arg1 = be_word(c.descriptor.data());
+            baked->ops.push_back(op);
+        } else if (c.descriptor_fn &&
+                   (c.descriptor_fn == s_hot_cmds.set_alpha_test_reg ||
+                    c.descriptor_fn == s_hot_cmds.set_scissor_reg) &&
+                   c.descriptor.size() >= 8) {
+            const bool is_scissor = (c.descriptor_fn == s_hot_cmds.set_scissor_reg);
+            const uint8_t* d = c.descriptor.data();
+            BakedOp op{};
+            op.kind = BakedOpKind::SetReg2;
+            op.is_pixel = is_scissor ? 1 : 0;
+            op.arg0 = is_scissor ? 0xA090u : 0xA104u;
+            op.arg1 = be_word(d);
+            op.arg2 = is_scissor ? 0xA091u : 0xA10Eu;
+            op.arg3 = be_word(d + 4);
+            baked->ops.push_back(op);
+        } else if (c.descriptor_fn && c.descriptor_fn == s_hot_cmds.set_target_masks_reg && c.descriptor.size() >= 4) {
+            BakedOp op{};
+            op.kind = BakedOpKind::SetTargetMasks;
+            op.arg0 = be_word(c.descriptor.data());
             baked->ops.push_back(op);
         } else if (c.descriptor_fn &&
                    (c.descriptor_fn == s_hot_cmds.set_ps_tex || c.descriptor_fn == s_hot_cmds.set_vs_tex)) {
@@ -1111,12 +1179,14 @@ std::shared_ptr<const BakedList> bake_commands(const std::vector<Command>& comma
             const uint32_t desc_off = uint32_t(baked->desc_pool.size());
             baked->desc_pool.insert(baked->desc_pool.end(), c.descriptor.begin(), c.descriptor.end());
             baked->call_pool.push_back({nullptr, c.descriptor_fn, desc_off, c.r, c.f});
+            baked->leaf = false;
             baked->ops.push_back(op);
         } else {
             BakedOp op{};
             op.kind = BakedOpKind::Generic;
             op.arg0 = uint32_t(baked->call_pool.size());
             baked->call_pool.push_back({c.fn, nullptr, 0, c.r, c.f});
+            baked->leaf = false;
             baked->ops.push_back(op);
         }
     }
@@ -1201,6 +1271,15 @@ void replay_baked(CPUState* cpu, const BakedList& baked, unsigned depth) {
                                   gx2_perf_now() - start);
             break;
         }
+        case BakedOpKind::SetFetchShader: {
+            const uint64_t start = perf ? gx2_perf_now() : 0;
+            call.r[3] = c.arg0;
+            s_hot_cmds.set_fetch_shader(&call);
+            if (perf)
+                gx2_perf_function(0, reinterpret_cast<const void*>(s_hot_cmds.set_fetch_shader),
+                                  gx2_perf_now() - start);
+            break;
+        }
         case BakedOpKind::SetSampler: {
             const uint64_t start = perf ? gx2_perf_now() : 0;
             const Gx2RegisterWrite reg_writes[3] = {{c.arg0, c.arg1}, {c.arg0 + 1, c.arg2}, {c.arg0 + 2, c.arg3}};
@@ -1210,6 +1289,47 @@ void replay_baked(CPUState* cpu, const BakedList& baked, unsigned depth) {
                     0,
                     reinterpret_cast<const void*>(c.is_pixel ? s_hot_cmds.set_ps_sampler : s_hot_cmds.set_vs_sampler),
                     gx2_perf_now() - start);
+            break;
+        }
+        case BakedOpKind::SetReg1: {
+            const uint64_t start = perf ? gx2_perf_now() : 0;
+            const Gx2RegisterWrite reg_write{c.arg0, c.arg1};
+            gx2_render_apply_registers(&reg_write, 1);
+            if (perf)
+                gx2_perf_function(0,
+                                  reinterpret_cast<const void*>(c.is_pixel ? s_hot_cmds.set_polygon_control_reg
+                                                                           : s_hot_cmds.set_depth_control_reg),
+                                  gx2_perf_now() - start);
+            break;
+        }
+        case BakedOpKind::SetReg2: {
+            const uint64_t start = perf ? gx2_perf_now() : 0;
+            const Gx2RegisterWrite reg_writes[2] = {{c.arg0, c.arg1}, {c.arg2, c.arg3}};
+            gx2_render_apply_registers(reg_writes, 2);
+            if (perf)
+                gx2_perf_function(0,
+                                  reinterpret_cast<const void*>(c.is_pixel ? s_hot_cmds.set_scissor_reg
+                                                                           : s_hot_cmds.set_alpha_test_reg),
+                                  gx2_perf_now() - start);
+            break;
+        }
+        case BakedOpKind::SetTargetMasks: {
+            const uint64_t start = perf ? gx2_perf_now() : 0;
+            if (g_gx2_frame_trace_active) RBREW_LOG_DEBUG("ftrace", "SetTargetChannelMasksReg %08X\n", c.arg0);
+            gx2_render_set_target_channel_masks(c.arg0);
+            if (perf)
+                gx2_perf_function(0, reinterpret_cast<const void*>(s_hot_cmds.set_target_masks_reg),
+                                  gx2_perf_now() - start);
+            break;
+        }
+        case BakedOpKind::CallDisplayList: {
+            const uint64_t start = perf ? gx2_perf_now() : 0;
+            ++draws_done;
+            call_display_list_direct(&call, c.arg0, c.arg1,
+                                     c.is_pixel ? "GX2DirectCallDisplayList" : "GX2CallDisplayList");
+            if (perf)
+                gx2_perf_function(0, reinterpret_cast<const void*>(s_list_call_fns[c.is_pixel ? 1 : 0]),
+                                  gx2_perf_now() - start);
             break;
         }
         case BakedOpKind::SetTexture: {
@@ -1577,8 +1697,6 @@ void ListCall::operator delete(void* p) noexcept {
 bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out,
                     std::shared_ptr<const BakedList>& baked_out);
 bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out);
-// GX2CallDisplayList / GX2DirectCallDisplayList, set at registration.
-Gx2CommandFn s_list_call_fns[2] = {};
 
 // Append to this core's open display list, or post to the render thread.
 void push_command(Command&& c, uint8_t* mem, uint32_t lr) {
@@ -1603,8 +1721,10 @@ void push_command(Command&& c, uint8_t* mem, uint32_t lr) {
 
 thread_local unsigned t_depth = 0;
 
-constexpr size_t kDlMruSize = 256;
+constexpr size_t kDlMruSize = 1024;
 constexpr size_t kDlMruMask = kDlMruSize - 1;
+constexpr size_t kStaticMruSize = 1024;
+constexpr size_t kStaticMruMask = kStaticMruSize - 1;
 
 bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out,
                     std::shared_ptr<const BakedList>& baked_out) {
@@ -1630,6 +1750,7 @@ bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out,
         }
         return false;
     }
+    if (s_untagged_list_count.load(std::memory_order_acquire) == 0) return false;
     RegistryLock lock;
     if (auto it = s_lists.find(list); it != s_lists.end()) return use_recording(it->second, out, baked_out);
     return false;
@@ -1639,12 +1760,12 @@ bool find_recording(uint8_t* mem, uint32_t list, uint32_t size, Commands& out) {
     return find_recording(mem, list, size, out, dummy);
 }
 
-void call_display_list(CPUState* cpu, const char* api) {
-    Gx2PerfScope perf_scope(kPerfDisplayList);
-    const uint32_t list = ARG0, size = ARG1;
-    Commands recorded;
-    std::shared_ptr<const BakedList> baked;
-    bool found = false;
+void call_display_list_direct(CPUState* cpu, uint32_t list, uint32_t size, const char* api) {
+    // Only open a kPerfDisplayList scope at top-level so nested display-list
+    // calls do not double-count into `dlist`.
+    const bool top_level = (t_depth == 0);
+    std::optional<Gx2PerfScope> perf_scope;
+    if (top_level) perf_scope.emplace(kPerfDisplayList);
     if (size >= 12 && rbrew_memory_accessible(MEM, list, 12) && rbrew_read32(MEM, list) == kTagNop &&
         rbrew_read32(MEM, list + 4) == kTagMagic) {
         const uint32_t id = rbrew_read32(MEM, list + 8);
@@ -1655,29 +1776,56 @@ void call_display_list(CPUState* cpu, const char* api) {
         };
         thread_local DlMru t_call_mru[kDlMruSize]{};
         const size_t slot = id & kDlMruMask;
-        if (t_call_mru[slot].id == id && (t_call_mru[slot].commands || t_call_mru[slot].baked)) {
-            recorded = t_call_mru[slot].commands;
-            baked = t_call_mru[slot].baked;
-            found = true;
-        } else {
+        auto& entry = t_call_mru[slot];
+        if (entry.id == id && (entry.baked || entry.commands)) {
+            ++t_depth;
+            if (entry.baked && entry.baked->leaf) {
+                // Leaf list cannot recurse or clobber t_call_mru[slot]: borrow directly with 0 refcount ops.
+                replay_baked(cpu, *entry.baked, t_depth);
+            } else if (entry.baked) {
+                auto keep = entry.baked;
+                replay_baked(cpu, *keep, t_depth);
+            } else {
+                auto keep = entry.commands;
+                replay(cpu, *keep, t_depth);
+            }
+            --t_depth;
+            return;
+        }
+        Commands recorded;
+        std::shared_ptr<const BakedList> baked;
+        {
             RegistryLock lock;
             if (use_recording(id, recorded, baked)) {
-                t_call_mru[slot] = {id, recorded, baked};
-                found = true;
+                entry = {id, recorded, baked};
             }
         }
-    } else {
-        RegistryLock lock;
-        if (auto it = s_lists.find(list); it != s_lists.end()) found = use_recording(it->second, recorded, baked);
-    }
-    if (found) {
-        ++t_depth;
-        if (baked)
-            replay_baked(cpu, *baked, t_depth);
-        else if (recorded)
-            replay(cpu, *recorded, t_depth);
-        --t_depth;
-        return;
+        if (baked || recorded) {
+            ++t_depth;
+            if (baked)
+                replay_baked(cpu, *baked, t_depth);
+            else
+                replay(cpu, *recorded, t_depth);
+            --t_depth;
+            return;
+        }
+    } else if (s_untagged_list_count.load(std::memory_order_acquire) != 0) {
+        Commands recorded;
+        std::shared_ptr<const BakedList> baked;
+        bool found = false;
+        {
+            RegistryLock lock;
+            if (auto it = s_lists.find(list); it != s_lists.end()) found = use_recording(it->second, recorded, baked);
+        }
+        if (found) {
+            ++t_depth;
+            if (baked)
+                replay_baked(cpu, *baked, t_depth);
+            else if (recorded)
+                replay(cpu, *recorded, t_depth);
+            --t_depth;
+            return;
+        }
     }
     if (!list || !size || !rbrew_memory_accessible(MEM, list, size)) return;
     struct StaticListCache {
@@ -1685,16 +1833,23 @@ void call_display_list(CPUState* cpu, const char* api) {
         uint32_t size = 0;
         uint32_t w0 = 0;
         uint32_t w1 = 0;
+        uint32_t w_last = 0;
+        uint64_t patch_epoch = 0;
         std::vector<Gx2RegisterWrite> writes;
         bool ok = false;
     };
-    static thread_local StaticListCache t_static_mru[32]{};
+    static thread_local StaticListCache t_static_mru[kStaticMruSize]{};
     const uint32_t w0 = rbrew_read32(MEM, list);
     const uint32_t w1 = size >= 8 ? rbrew_read32(MEM, list + 4) : 0;
-    const size_t slot = ((list >> 4) ^ size) & 31;
-    if (t_static_mru[slot].list == list && t_static_mru[slot].size == size && t_static_mru[slot].w0 == w0 &&
-        t_static_mru[slot].w1 == w1 && t_static_mru[slot].ok) {
-        gx2_render_apply_registers(t_static_mru[slot].writes.data(), t_static_mru[slot].writes.size());
+    const uint32_t w_last = size >= 12 ? rbrew_read32(MEM, list + (size & ~3u) - 4) : w1;
+    const uint64_t patch_epoch = s_static_patch_epoch.load(std::memory_order_relaxed);
+    uint32_t h = ((list >> 2) * 2654435761u) ^ (size * 2246822519u);
+    h ^= h >> 16;
+    const size_t slot = size_t(h) & kStaticMruMask;
+    auto& cached = t_static_mru[slot];
+    if (cached.ok && cached.list == list && cached.size == size && cached.w0 == w0 && cached.w1 == w1 &&
+        cached.w_last == w_last && cached.patch_epoch == patch_epoch) {
+        gx2_render_apply_registers(cached.writes.data(), cached.writes.size());
         return;
     }
     const auto state = gx2_decode_static_display_list(MEM + list, size);
@@ -1713,9 +1868,13 @@ void call_display_list(CPUState* cpu, const char* api) {
                                  rbrew_read32(MEM, list + 12), cpu->lr);
     }
     if (state.ok) {
-        t_static_mru[slot] = {list, size, w0, w1, state.writes, true};
-        gx2_render_apply_registers(state.writes.data(), state.writes.size());
+        cached = {list, size, w0, w1, w_last, patch_epoch, state.writes, true};
+        gx2_render_apply_registers(cached.writes.data(), cached.writes.size());
     }
+}
+
+void call_display_list(CPUState* cpu, const char* api) {
+    call_display_list_direct(cpu, ARG0, ARG1, api);
 }
 } // namespace
 
@@ -1838,7 +1997,7 @@ static void count_list_queries(uint8_t* mem, uint32_t list, uint32_t size, unsig
     if (size >= 12 && rbrew_memory_accessible(mem, list, 12) && rbrew_read32(mem, list) == kTagNop &&
         rbrew_read32(mem, list + 4) == kTagMagic)
         id = rbrew_read32(mem, list + 8);
-    else {
+    else if (s_untagged_list_count.load(std::memory_order_acquire) != 0) {
         RegistryLock lock;
         if (auto it = s_lists.find(list); it != s_lists.end()) id = it->second;
     }
@@ -2019,6 +2178,7 @@ static void GX2EndDisplayList(CPUState* cpu) {
         }
     }
     s_lists[buffer] = id;
+    if (!tagged) s_untagged_list_count.fetch_add(1, std::memory_order_release);
     // RBREW_DL_STATS=1 (diagnostics): new versus reused recordings and their
     // commands, every 300 frames.
     static const bool stats = [] {
@@ -2230,6 +2390,7 @@ static void GX2PatchDisplayList(CPUState* cpu) {
     const Field& f = fields[type];
     const uint32_t program = rbrew_read32(MEM, shader + (rbrew_read32(MEM, shader + f.test) ? f.program : f.fallback));
     rbrew_write32(MEM, list + offset + 8, program >> 8);
+    s_static_patch_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 static void GX2CallDisplayList(CPUState* cpu) {

@@ -438,11 +438,12 @@ float density(vec3 q, float hf, bool detail) {
 // cauliflower towers to ~8 km) built from stacked lobes and eroded by the
 // noise volumes, so its edges billow like a real one.
 vec2 g_heroCenter = vec2(0.0);                    // the cloud being marched
-float g_heroAmount = 0.0, g_heroTurn = 0.0;
+float g_heroAmount = 0.0;
+vec2 g_heroRot = vec2(1.0, 0.0);                  // (cos, sin) of cloud turn
 float heroDensity(vec3 q) {                       // q = (x km, height km, z km)
     float scale=max(p.hero.w,.01);
     vec2 d2 = (q.xz - g_heroCenter)/scale;
-    d2 = vec2(cos(g_heroTurn) * d2.x - sin(g_heroTurn) * d2.y, sin(g_heroTurn) * d2.x + cos(g_heroTurn) * d2.y);   // each cloud its own shape
+    d2 = vec2(g_heroRot.x * d2.x - g_heroRot.y * d2.y, g_heroRot.y * d2.x + g_heroRot.x * d2.y);   // each cloud its own shape
     float h = q.y/scale;
     if (h < 1.45 || h > 9.6 || dot(d2, d2) > 42.0) return 0.0;
     // Wide base, staggered towers narrowing upwards, a crown of small domes.
@@ -459,10 +460,14 @@ float heroDensity(vec3 q) {                       // q = (x km, height km, z km)
     vec3 billow=r0+macroWarp*1.15;
     float f = 0.0;
     for (int i = 0; i < 22; ++i) {
-        vec3 c = vec3(lobes[i].x, lobes[i].z, lobes[i].y);
-        f = max(f, 1.0 - length(billow - c) / lobes[i].w);
+        vec3 dv = billow - vec3(lobes[i].x, lobes[i].z, lobes[i].y);
+        float r = lobes[i].w;
+        float maxD = r * (1.0 - f);
+        float dist2 = dot(dv, dv);
+        if (dist2 < maxD * maxD) f = 1.0 - sqrt(dist2) / r;
     }
     f *= smoothstep(1.45, 1.7, h);                // flat base
+    if (f <= 0.015) return 0.0;
     float n = textureLod(shapeNoise, (r0 + w) * 0.30, 0.0).r;
     vec3 detailPos=(r0+w)*1.4;
     vec3 warp=textureLod(detailNoise,detailPos*.37+vec3(.17,.43,.71),0.0).rgb-.5;
@@ -491,104 +496,109 @@ void main() {
     float t0 = raySphere(o, d, Rg + cloudBottom), t1 = min(raySphere(o, d, Rg + cloudTop), 90.0);
     vec3 scattered = vec3(0.0);
     float T = 1.0;
-    if (t1 > t0) {
-        int quality = int(p.exposure.w);
-        int steps = quality <= 1 ? 32 : quality == 2 ? 64 : 128;
-        int lightSteps = quality <= 1 ? 4 : quality == 2 ? 6 : 10;
-        float dt = (t1 - t0) / float(steps);
+    bool doLayer = t1 > t0 && p.clouds.x > 0.001;
+    bool doHero = p.hero.x > 0.0 || p.extra.w > 0.0;
+    if (doLayer || doHero) {
         // Light: the sun by day, the moon by night (whichever is brighter).
         vec3 sunE = sunIlluminance(), moonE = moonIlluminance();
         bool useMoon = luminance(moonE) > luminance(sunE);
         vec3 L = useMoon ? p.moon.xyz : p.sun.xyz;
+        vec3 activeLightE = useMoon ? moonE : sunE;
         float cosTheta = dot(d, L);
         vec3 skyTop = (skyView(vec3(0.0, 1.0, 0.0), false) * sunE + skyView(vec3(0.0, 1.0, 0.0), true) * moonE) * PI;
-        vec3 skySide = (skyView(normalize(vec3(L.x, 0.25, L.z)), false) * sunE + skyView(normalize(vec3(L.x, 0.25, L.z)), true) * moonE) * PI;
+        vec3 sideDir = normalize(vec3(L.x, 0.25, L.z));
+        vec3 skySide = (skyView(sideDir, false) * sunE + skyView(sideDir, true) * moonE) * PI;
+        vec3 groundLight = sunE * groundAlbedo * saturate(p.sun.y) * transmittance(Rg, p.sun.y);
+        vec3 cityAmb = cityGlow(vec3(0.0)) * 0.5;
+        // Precompute multi-octave cloud phase terms once for this ray direction.
+        float ph0 = 0.82 * hgPhase(cosTheta, 0.76) + 0.12 * hgPhase(cosTheta, 0.92) + 0.06 * hgPhase(cosTheta, -0.25);
+        float ph1 = 0.35 * (0.85 * hgPhase(cosTheta, 0.38) + 0.15 * hgPhase(cosTheta, -0.125));
+        float ph2 = 0.1225 * (0.85 * hgPhase(cosTheta, 0.19) + 0.15 * hgPhase(cosTheta, -0.0625));
         const float sigma = 38.0;                  // extinction per km at density 1
-        for (int i = 0; i < steps && T > 0.01; ++i) {
-            float t = t0 + (float(i) + jitter) * dt;
-            vec3 q = o + d * t;
-            float h = length(q) - Rg, hf = saturate((h - cloudBottom) / (cloudTop - cloudBottom));
-            vec3 qw = vec3(q.x, h, q.z);
-            float rho = density(qw, hf, true);
-            if (rho <= 0.0) continue;
-            // Light march towards the light, growing steps.
-            float od = 0.0, ls = 0.04, lt = 0.0;
-            for (int k = 0; k < lightSteps; ++k) {
-                lt += ls;
-                vec3 lq = q + L * lt;
-                float lh = length(lq) - Rg;
-                if (lh > cloudTop) break;
-                od += density(vec3(lq.x, lh, lq.z), saturate((lh - cloudBottom) / (cloudTop - cloudBottom)), false) * ls;
-                ls *= 1.7;
+        const float inv4Pi = 1.0 / (4.0 * PI);
+        int quality = int(p.exposure.w);
+        if (doLayer) {
+            int steps = quality <= 1 ? 32 : quality == 2 ? 64 : 128;
+            int lightSteps = quality <= 1 ? 4 : quality == 2 ? 6 : 10;
+            float dt = (t1 - t0) / float(steps);
+            for (int i = 0; i < steps && T > 0.01; ++i) {
+                float t = t0 + (float(i) + jitter) * dt;
+                vec3 q = o + d * t;
+                float qLen = length(q);
+                float h = qLen - Rg, hf = saturate((h - cloudBottom) / (cloudTop - cloudBottom));
+                float rho = density(vec3(q.x, h, q.z), hf, true);
+                if (rho <= 0.0) continue;
+                // Light march towards the light, growing steps.
+                float od = 0.0, ls = 0.04, lt = 0.0;
+                for (int k = 0; k < lightSteps; ++k) {
+                    lt += ls;
+                    vec3 lq = q + L * lt;
+                    float lh = length(lq) - Rg;
+                    if (lh > cloudTop) break;
+                    od += density(vec3(lq.x, lh, lq.z), saturate((lh - cloudBottom) / (cloudTop - cloudBottom)), false) * ls;
+                    ls *= 1.7;
+                }
+                vec3 lightE = activeLightE * transmittance(qLen, dot(q, L) / qLen);
+                float e0 = exp(-max(od, 0.0) * sigma);
+                float e1 = sqrt(e0);
+                float ms = ph0 * e0 + ph1 * e1 + ph2 * sqrt(e1);
+                float powder = 1.0 - 0.6 * exp(-sigma * rho * 0.35);
+                vec3 ambient = mix(skySide * .5, skyTop, hf) * mix(.4, .9, hf) + (cityAmb + groundLight * 0.25) * (1.0 - hf);
+                vec3 S = lightE * ms * powder + ambient * inv4Pi;
+                float stepT = exp(-sigma * rho * dt);
+                scattered += T * S * (1.0 - stepT);
+                T *= stepT;
             }
-            vec3 up = q / length(q);
-            vec3 lightT = transmittance(length(q), dot(up, L));
-            vec3 lightE = (useMoon ? moonE : sunE) * lightT;
-            float ms=cloudScattering(cosTheta,od,sigma);
-            float powder = 1.0 - 0.6 * exp(-sigma * rho * 0.35);
-            vec3 ambient = mix(skySide*.5,skyTop,hf)*mix(.4,.9,hf);
-            ambient += cityGlow(vec3(0.0)) * 0.5 * (1.0 - hf);  // street light from below
-            ambient += sunE * groundAlbedo * saturate(p.sun.y) * transmittance(Rg, p.sun.y) * 0.25 * (1.0 - hf);
-            vec3 S = sigma * rho * (lightE * ms * powder + ambient / (4.0 * PI));
-            float stepT = exp(-sigma * rho * dt);
-            scattered += T * S * (1.0 - stepT) / (sigma * rho);
-            T *= stepT;
+            // Distant clouds fade into the haze in front of them.
+            float haze = exp(-max(t0 - 8.0, 0.0) / 14.0);   // far clouds melt into the horizon haze
+            scattered *= haze;
+            T = mix(1.0, T, haze);
         }
-        // Distant clouds fade into the haze in front of them.
-        float haze = exp(-max(t0 - 8.0, 0.0) / 14.0);   // far clouds melt into the horizon haze
-        scattered *= haze;
-        T = mix(1.0, T, haze);
-    }
-    // The hero clouds behind the layer (one behind the tower, one across).
-    for (int heroIndex = 0; heroIndex < 2; ++heroIndex) {
-    g_heroCenter = heroIndex == 0 ? p.hero.yz : p.extra.yz;
-    g_heroAmount = heroIndex == 0 ? p.hero.x : p.extra.w;
-    g_heroTurn = heroIndex == 0 ? 0.0 : 2.4;
-    if (g_heroAmount > 0.0 && T > 0.01) {
-        vec3 hc = vec3(g_heroCenter.x, Rg + 4.5*p.hero.w, g_heroCenter.y);
-        vec3 oc = o - hc;
-        float b = dot(oc, d), cc = dot(oc, oc) - 64.0*p.hero.w*p.hero.w, disc = b * b - cc;
-        if (disc > 0.0) {
-            float sq = sqrt(disc), ta = max(-b - sq, 0.0), tb = -b + sq;
-            if (tb > ta) {
-                vec3 sunE = sunIlluminance(), moonE = moonIlluminance();
-                bool useMoon = luminance(moonE) > luminance(sunE);
-                vec3 L = useMoon ? p.moon.xyz : p.sun.xyz;
-                float cosTheta = dot(d, L);
-                vec3 skyTop = (skyView(vec3(0.0, 1.0, 0.0), false) * sunE + skyView(vec3(0.0, 1.0, 0.0), true) * moonE) * PI;
-                vec3 skySide = (skyView(normalize(vec3(L.x, 0.25, L.z)), false) * sunE + skyView(normalize(vec3(L.x, 0.25, L.z)), true) * moonE) * PI;
-                const float sigma = 38.0;
-                int quality=int(p.exposure.w);
-                int steps = quality <= 1 ? 48 : quality == 2 ? 96 : 192;
-                float dt = (tb - ta) / float(steps);
-                for (int i = 0; i < steps && T > 0.01; ++i) {
-                    float t = ta + (float(i) + jitter) * dt;
-                    vec3 q = o + d * t;
-                    float h = length(q) - Rg;
-                    float rho = heroDensity(vec3(q.x, h, q.z));
-                    if (rho <= 0.0) continue;
-                    float od = 0.0, ls = 0.035, lt = 0.0;
-                    for (int k = 0; k < (quality>=3?10:6); ++k) {
-                        lt += ls;
-                        vec3 lq = q + L * lt;
-                        od += heroDensity(vec3(lq.x, length(lq) - Rg, lq.z)) * ls;
-                        ls *= 1.7;
+        // The hero clouds behind the layer (one behind the tower, one across).
+        for (int heroIndex = 0; heroIndex < 2; ++heroIndex) {
+            g_heroCenter = heroIndex == 0 ? p.hero.yz : p.extra.yz;
+            g_heroAmount = heroIndex == 0 ? p.hero.x : p.extra.w;
+            g_heroRot = heroIndex == 0 ? vec2(1.0, 0.0) : vec2(-0.7373937, 0.6754632);
+            if (g_heroAmount > 0.0 && T > 0.01) {
+                vec3 hc = vec3(g_heroCenter.x, Rg + 4.5 * p.hero.w, g_heroCenter.y);
+                vec3 oc = o - hc;
+                float b = dot(oc, d), cc = dot(oc, oc) - 64.0 * p.hero.w * p.hero.w, disc = b * b - cc;
+                if (disc > 0.0) {
+                    float sq = sqrt(disc), ta = max(-b - sq, 0.0), tb = -b + sq;
+                    if (tb > ta) {
+                        int steps = quality <= 1 ? 48 : quality == 2 ? 96 : 192;
+                        int heroLightSteps = quality >= 3 ? 10 : 6;
+                        float dt = (tb - ta) / float(steps);
+                        for (int i = 0; i < steps && T > 0.01; ++i) {
+                            float t = ta + (float(i) + jitter) * dt;
+                            vec3 q = o + d * t;
+                            float qLen = length(q);
+                            float h = qLen - Rg;
+                            float rho = heroDensity(vec3(q.x, h, q.z));
+                            if (rho <= 0.0) continue;
+                            float od = 0.0, ls = 0.035, lt = 0.0;
+                            for (int k = 0; k < heroLightSteps; ++k) {
+                                lt += ls;
+                                vec3 lq = q + L * lt;
+                                od += heroDensity(vec3(lq.x, length(lq) - Rg, lq.z)) * ls;
+                                ls *= 1.7;
+                            }
+                            vec3 lightE = activeLightE * transmittance(qLen, dot(q, L) / qLen);
+                            float e0 = exp(-max(od, 0.0) * sigma);
+                            float e1 = sqrt(e0);
+                            float ms = ph0 * e0 + ph1 * e1 + ph2 * sqrt(e1);
+                            float hf = saturate((h / p.hero.w - 1.5) / 7.0);
+                            float powder = 1.0 - 0.6 * exp(-sigma * rho * 0.35);
+                            vec3 ambient = mix(skySide * .4, skyTop * .85, hf) * mix(.35, 1.0, hf) + groundLight * 0.3 * (1.0 - hf);
+                            vec3 S = lightE * ms * powder + ambient * inv4Pi;
+                            float stepT = exp(-sigma * rho * dt);
+                            scattered += T * S * (1.0 - stepT);
+                            T *= stepT;
+                        }
                     }
-                    vec3 up = q / length(q);
-                    vec3 lightE = (useMoon ? moonE : sunE) * transmittance(length(q), dot(up, L));
-                    float ms=cloudScattering(cosTheta,od,sigma);
-                    float hf = saturate((h/p.hero.w - 1.5) / 7.0);
-                    float powder = 1.0 - 0.6 * exp(-sigma * rho * 0.35);
-                    vec3 ambient = mix(skySide*.4,skyTop*.85,hf)*mix(.35,1.0,hf);
-                    ambient += sunE * groundAlbedo * saturate(p.sun.y) * transmittance(Rg, p.sun.y) * 0.3 * (1.0 - hf);
-                    vec3 S = sigma * rho * (lightE * ms * powder + ambient / (4.0 * PI));
-                    float stepT = exp(-sigma * rho * dt);
-                    scattered += T * S * (1.0 - stepT) / (sigma * rho);
-                    T *= stepT;
                 }
             }
         }
-    }
     }
     vec4 result = vec4(scattered, T);
     if (p.clouds.z >= p.dome.w * p.dome.w) result = mix(imageLoad(domeImage, texel), result, 0.6);
@@ -790,7 +800,7 @@ void main() {
                 for (int hI = 0; hI < 2; ++hI) {
                     g_heroCenter = hI == 0 ? p.hero.yz : p.extra.yz;
                     g_heroAmount = hI == 0 ? p.hero.x : p.extra.w;
-                    g_heroTurn = hI == 0 ? 0.0 : 2.4;
+                    g_heroRot = hI == 0 ? vec2(1.0, 0.0) : vec2(-0.7373937, 0.6754632);
                     if (g_heroAmount <= 0.0) continue;
                     for (int k = 0; k < 6; ++k) {
                         float hh = (1.6 + float(k) * 1.3) * p.hero.w;
@@ -806,10 +816,16 @@ void main() {
             air = saturate(total / 14.0);
         }
     }
-    vec3 sunView=vec3(dot(vec3(p.cam0.x,p.cam1.x,p.cam2.x),p.sun.xyz),dot(vec3(p.cam0.y,p.cam1.y,p.cam2.y),p.sun.xyz),
-                      dot(vec3(p.cam0.z,p.cam1.z,p.cam2.z),p.sun.xyz));
-    vec2 sunRadius=.0047*p.proj.xy*.5/max(-sunView.z,.05);
-    float visibility=sunDiscVisibility(sunUv,sunRadius)*cloudsAt(normalize(p.sun.xyz)).a;
+    // kComposite only samples raysTexture.a at vec2(0.5); compute the frame-uniform
+    // sun-disc visibility only on the center neighborhood (2x2 for even, 3x3 for odd sizes).
+    float visibility = 0.0;
+    if (abs(id.x * 2 + 1 - size.x) <= 2 && abs(id.y * 2 + 1 - size.y) <= 2) {
+        vec3 sunView = vec3(dot(vec3(p.cam0.x, p.cam1.x, p.cam2.x), p.sun.xyz),
+                            dot(vec3(p.cam0.y, p.cam1.y, p.cam2.y), p.sun.xyz),
+                            dot(vec3(p.cam0.z, p.cam1.z, p.cam2.z), p.sun.xyz));
+        vec2 sunRadius = .0047 * p.proj.xy * .5 / max(-sunView.z, .05);
+        visibility = sunDiscVisibility(sunUv, sunRadius) * cloudsAt(normalize(p.sun.xyz)).a;
+    }
     imageStore(outImage, id, vec4(rays, lit, air, visibility));   // r screen rays, g lit air share, b air length
 }
 )glsl";
@@ -835,24 +851,32 @@ void main() {
     N = dot(N, N) > 1e-12 ? normalize(N) : vec3(0.0, 0.0, 1.0);
     if (dot(N, -P) < 0.0) N = -N;
     const float radius = 9.0;                         // game units (an Inkling is ~16)
+    const float maxDist2 = radius * radius * 1.6;
+    const float invRadius2 = 1.0 / maxDist2;
     float screenRadius = clamp(radius * p.proj.y / max(-P.z, 1.0) * 0.5, 3.0 * texel.y, 0.12);
+    vec2 aspectRadius = vec2(float(size.y) / float(size.x), 1.0) * screenRadius;
     int dirs = int(p.exposure.w) >= 3 ? 8 : 6, steps = 5;
     float noise = hash12(vec2(id) + p.clouds.z * 7.13) * 6.2831853;
+    float stepAngle = 6.2831853 / float(dirs);
+    vec2 rotStep = vec2(cos(stepAngle), sin(stepAngle));
+    vec2 rot = vec2(cos(noise), sin(noise));
     float occlusion = 0.0;
     for (int i = 0; i < dirs; ++i) {
-        float a = noise + float(i) * 6.2831853 / float(dirs);
-        vec2 dir = vec2(cos(a), sin(a)) * vec2(size.y / float(size.x), 1.0) * screenRadius;
+        vec2 dir = rot * aspectRadius;
         float best = 0.0;
         for (int s = 1; s <= steps; ++s) {
             float t = (float(s) - hash12(vec2(id) + float(i * 7 + s))) / float(steps);
             vec2 q = uv + dir * t;
             if (any(lessThan(q, vec2(0.0))) || any(greaterThan(q, vec2(1.0)))) break;
             vec3 v = viewPos(q) - P;
-            float len = length(v);
-            float falloff = saturate(1.0 - len * len / (radius * radius * 1.6));
-            best = max(best, saturate(dot(N, v / max(len, 1e-4)) - 0.12) * falloff);
+            float d2 = dot(v, v);
+            if (d2 >= maxDist2) continue;
+            float falloff = 1.0 - d2 * invRadius2;
+            float invLen = d2 > 1e-8 ? inversesqrt(d2) : 1e4;
+            best = max(best, saturate(dot(N, v) * invLen - 0.12) * falloff);
         }
         occlusion += best;
+        rot = vec2(rot.x * rotStep.x - rot.y * rotStep.y, rot.x * rotStep.y + rot.y * rotStep.x);
     }
     float visibility = pow(saturate(1.0 - occlusion / float(dirs)), 1.6);
     vec4 outAo = vec4(visibility, -P.z, 0.0, 1.0);
@@ -1064,15 +1088,12 @@ layout(binding = 12, r32ui) uniform uimage2D lookHistogram;   // input of the lo
 // The camera's white balance adapts to a low sun: its light reads golden
 // white instead of the raw orange-red transmittance (as gx2_env_light.cpp).
 vec3 whiteBalance(vec3 t) { return mix(t, luminance(t) * vec3(1.08, 0.96, 0.78), 0.6); }
-vec3 skyReflection(vec3 d) {
+vec3 skyReflection(vec3 d, vec3 sunE, vec3 moonE, float skyScale) {
     d.y = max(d.y, 0.02); d = normalize(d);
-    vec3 sunE = sunIlluminance(), moonE = moonIlluminance();
     vec3 sky = skyView(d, false) * sunE + skyView(d, true) * moonE;
-    float zenith = luminance(skyView(vec3(0.0, 1.0, 0.0), false) * sunE);
-    float scale = p.exposure.x * clamp(pow(p.exposure.y / max(zenith, 1e-7), 0.42), 1.0, 40.0);
     vec4 cl = cloudsAt(d);
-    vec3 night = (vec3(0.0026, 0.0038, 0.0085) + cityGlow(d) * 0.35) / scale;
-    vec3 c = (sky+night)*cl.a*scale+exposedCloud(cl.rgb,scale);
+    vec3 night = (vec3(0.0026, 0.0038, 0.0085) + cityGlow(d) * 0.35) / skyScale;
+    vec3 c = (sky+night)*cl.a*skyScale+exposedCloud(cl.rgb,skyScale);
     return c / (1.0 + c);                             // the game's highlights roll off too
 }
 vec3 wetReflection(vec3 at, vec3 n, vec3 fallback,float roughness) {
@@ -1132,17 +1153,17 @@ vec2 rippleNormal(vec2 xz, float t) {
 )glsl"
                                           R"glsl(
 vec3 srcColor(vec2 uv) { return textureLod(sceneColor, uv, 0.0).rgb; }
-float srcLuma(vec2 uv) {
-    float l = luminance(srcColor(uv));
+float colorLuma(vec3 c) {
+    float l = luminance(c);
     return (isnan(l) || isinf(l)) ? 0.0 : sqrt(max(l, 0.0));
 }
+float srcLuma(vec2 uv) { return colorLuma(srcColor(uv)); }
 // FXAA 3.11 (Lottes), quality search along the edge.
-vec3 fxaa(vec2 uv, vec2 px) {
-    float lM = srcLuma(uv), lN = srcLuma(uv + vec2(0.0, -px.y)), lS = srcLuma(uv + vec2(0.0, px.y));
-    float lW = srcLuma(uv + vec2(-px.x, 0.0)), lE = srcLuma(uv + vec2(px.x, 0.0));
+vec3 fxaa(vec2 uv, vec2 px, vec3 cM, vec3 cN, vec3 cS, vec3 cW, vec3 cE) {
+    float lM = colorLuma(cM), lN = colorLuma(cN), lS = colorLuma(cS), lW = colorLuma(cW), lE = colorLuma(cE);
     float lo = min(lM, min(min(lN, lS), min(lW, lE))), hi = max(lM, max(max(lN, lS), max(lW, lE)));
     float range = hi - lo;
-    if (range < max(0.0312, hi * 0.125)) return srcColor(uv);
+    if (range < max(0.0312, hi * 0.125)) return cM;
     float lNW = srcLuma(uv + vec2(-px.x, -px.y)), lNE = srcLuma(uv + vec2(px.x, -px.y));
     float lSW = srcLuma(uv + vec2(-px.x, px.y)), lSE = srcLuma(uv + vec2(px.x, px.y));
     float edgeH = abs(lNW + lNE - 2.0 * lN) + 2.0 * abs(lW + lE - 2.0 * lM) + abs(lSW + lSE - 2.0 * lS);
@@ -1261,9 +1282,9 @@ void main() {
     // Contrast adaptive sharpening (AMD FidelityFX CAS, simplified).
     vec3 a = textureLod(sceneColor, uv + vec2(0.0, -px.y), 0.0).rgb;
     vec3 b = textureLod(sceneColor, uv + vec2(-px.x, 0.0), 0.0).rgb;
-    vec3 c = p.post.x > 0.0 ? fxaa(uv, px) : source.rgb;
     vec3 e = textureLod(sceneColor, uv + vec2(px.x, 0.0), 0.0).rgb;
     vec3 f = textureLod(sceneColor, uv + vec2(0.0, px.y), 0.0).rgb;
+    vec3 c = p.post.x > 0.0 ? fxaa(uv, px, source.rgb, a, f, b, e) : source.rgb;
     vec3 mn = min(min(min(a, b), min(c, e)), f), mx = max(max(max(a, b), max(c, e)), f);
     vec3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, vec3(1e-4))));
     vec3 wgt = -amp / mix(8.0, 5.0, 0.55) * (p.post.x > 0.0 ? 0.18 : 0.6)*p.gradeTools.w;
@@ -1280,31 +1301,35 @@ void main() {
     float d = textureLod(sceneDepth, uv, 0.0).r;
     bool sky = skyMask(d) > 0.5;
     if(sky && p.cloudControl.y>.5){imageStore(outImage,id,source);return;}
+    vec3 rawWorldDir = worldDirection(viewDirection(uv));
+    float rawDirLen = length(rawWorldDir);
+    vec3 vdir = rawWorldDir / rawDirLen;
+    float viewDist = sky ? 0.0 : viewDistance(d);
+    vec3 at = sky ? vec3(0.0) : eye() + rawWorldDir * viewDist;
+    float eyeDist = sky ? 6000.0 : rawDirLen * viewDist;
     if (!sky && p.look.x > 0.0) {
+        const vec2 clarityOffsets[8] = vec2[8](
+            vec2(1.0, 0.0), vec2(0.7071068, 0.7071068), vec2(0.0, 1.0), vec2(-0.7071068, 0.7071068),
+            vec2(-1.0, 0.0), vec2(-0.7071068, -0.7071068), vec2(0.0, -1.0), vec2(0.7071068, -0.7071068));
         float around = 0.0;
-        for (int k = 0; k < 8; ++k) {
-            float a = float(k) * 0.785398;
-            around += luminance(srcColor(uv + vec2(cos(a), sin(a)) * px * 3.0));
-        }
-        around /= 8.0;
+        for (int k = 0; k < 8; ++k) around += luminance(srcColor(uv + clarityOffsets[k] * px * 3.0));
+        around *= 0.125;
         float yc = luminance(c);
         float detail = clamp(yc - around, -0.12, 0.12);
         c *= 1.0 + detail*.3*p.cloudControl.z/max(yc,.04)*smoothstep(.02,.15,yc);
     }
     float aoVis = 1.0;
     if (!sky && p.depthRange.w > 0.0) {
-        aoVis = aoAt(uv, viewDistance(d));
+        aoVis = aoAt(uv, viewDist);
         float y = luminance(c);
         c *= mix(1.0, aoVis, p.depthRange.w * (1.0 - 0.6 * saturate(y * 1.5)));
     }
     // Weathering: dirt gathers in corners and joints, large surfaces vary
     // a little in tone (world-space noise, so it sticks to the surfaces).
     if (!sky && p.look.x > 0.0) {
-        float dist = viewDistance(d);
-        vec3 wp = worldPoint(uv, d);
-        float n1 = textureLod(detailNoise, wp * 0.021, 0.0).r;
-        float n2 = textureLod(shapeNoise, wp * 0.0042, 0.0).g;
-        float fade = 1.0 - smoothstep(600.0, 2500.0, dist);
+        float n1 = textureLod(detailNoise, at * 0.021, 0.0).r;
+        float n2 = textureLod(shapeNoise, at * 0.0042, 0.0).g;
+        float fade = 1.0 - smoothstep(600.0, 2500.0, viewDist);
         float crevice = saturate((1.0 - aoVis) * 2.2) * smoothstep(0.35, 0.75, n1);
         float blotch = (n2 - 0.5) * 0.16 + (n1 - 0.5) * 0.06;
         vec3 dirt = vec3(0.86, 0.80, 0.70);
@@ -1314,7 +1339,7 @@ void main() {
     // Depth of field: far buildings soften like through a real lens
     // (the blurred-minus-sharp difference keeps every other effect).
     if ((p.look.x > 0.0 && p.look.w > 0.0) || p.cinema.x > 0.0) {
-        float dist = sky ? 1e5 : viewDistance(d);
+        float dist = sky ? 1e5 : viewDist;
         float coc = p.look.x > 0.0 ? smoothstep(900.0, 4500.0, dist) * p.look.w : 0.0;     // radius in pixels
         // Focus blur (menu): sharp at the distance of what the screen centre
         // shows (the character), softer in front and behind like a big lens.
@@ -1323,21 +1348,34 @@ void main() {
             coc = max(coc, p.cinema.x * saturate(abs(dist - focus) / max(focus, 1.0)));
         }
         if (coc > 0.3) {
-            vec3 sharp = srcColor(uv), blur = vec3(0.0);
+            const vec2 dofOuter[8] = vec2[8](
+                vec2(0.9249091, 0.3801884), vec2(0.3851757, 0.9228433), vec2(-0.3801884, 0.9249091), vec2(-0.9228433, 0.3851757),
+                vec2(-0.9249091, -0.3801884), vec2(-0.3851757, -0.9228433), vec2(0.3801884, -0.9249091), vec2(0.9228433, -0.3851757));
+            const vec2 dofInner[8] = vec2[8](
+                vec2(0.3554568, 0.3516400), vec2(0.0026992, 0.4999927), vec2(-0.3516400, 0.3554568), vec2(-0.4999927, 0.0026992),
+                vec2(-0.3554568, -0.3516400), vec2(-0.0026992, -0.4999927), vec2(0.3516400, -0.3554568), vec2(0.4999927, -0.0026992));
+            vec3 sharp = source.rgb, blur = vec3(0.0);
+            vec2 rad = px * coc;
             for (int k = 0; k < 8; ++k) {
-                float a = float(k) * 0.785398 + 0.39;
-                blur += srcColor(uv + vec2(cos(a), sin(a)) * px * coc);
-                blur += srcColor(uv + vec2(cos(a + 0.39), sin(a + 0.39)) * px * coc * 0.5);
+                blur += srcColor(uv + dofOuter[k] * rad);
+                blur += srcColor(uv + dofInner[k] * rad);
             }
-            blur = (blur / 16.0) * 0.75 + sharp * 0.25;
+            blur = (blur * 0.0625) * 0.75 + sharp * 0.25;
             c = max(c + (blur - sharp), vec3(0.0));
         }
     }
+    vec3 sunE = sunIlluminance(), moonE = moonIlluminance();
+    vec3 sunThrough = whiteBalance(transmittance(Rg + viewHeight, max(p.sun.y, 0.0))) * sunE;
+    vec3 sunColor = sunThrough * p.wind.w;
     float wet = p.effects.y;
-    vec3 at = vec3(0.0), n = vec3(0.0, 1.0, 0.0);
+    float skyScale = 0.0;
+    if (wet > 0.001 || (!sky && p.taa.z < 0.5) || p.picture.w > 0.0) {
+        float zenith = luminance(skyView(vec3(0.0, 1.0, 0.0), false) * sunE);
+        skyScale = p.exposure.x * clamp(pow(p.exposure.y / max(zenith, 1e-7), 0.42), 1.0, 40.0);
+    }
+    vec3 n = vec3(0.0, 1.0, 0.0);
     float surfaceFootprint=0.0;
     if (!sky) {
-        at = worldPoint(uv, d);
         vec2 dp = 1.0 / vec2(textureSize(sceneDepth, 0));
         float zl = textureLod(sceneDepth, uv - vec2(dp.x, 0.0), 0.0).r, zr = textureLod(sceneDepth, uv + vec2(dp.x, 0.0), 0.0).r;
         float zu = textureLod(sceneDepth, uv - vec2(0.0, dp.y), 0.0).r, zd = textureLod(sceneDepth, uv + vec2(0.0, dp.y), 0.0).r;
@@ -1354,8 +1392,7 @@ void main() {
     if (!sky && p.look.x > 0.0 && p.sun.y > 0.02 && p.wind.w > 0.05) {
         float lit = dot(n, p.sun.xyz);
         if (lit > 0.0) {
-            float dist0 = viewDistance(d);
-            float stepLen = clamp(dist0 * 0.004, 0.25, 2.0);
+            float stepLen = clamp(viewDist * 0.004, 0.25, 2.0);
             float noise = hash12(vec2(id) + p.clouds.z * 3.1);
             float shadow = 0.0;
             for (int k = 1; k <= 14; ++k) {
@@ -1369,7 +1406,7 @@ void main() {
                 if (diff > 0.05 && diff < stepLen * 6.0) { shadow = 1.0 - float(k) / 16.0; break; }
             }
             float daylight = smoothstep(0.02, 0.2, p.sun.y) * p.wind.w;
-            c *= 1.0 - shadow * 0.6 * daylight * saturate(lit * 3.0) * (1.0 - smoothstep(400.0, 1200.0, dist0));
+            c *= 1.0 - shadow * 0.6 * daylight * saturate(lit * 3.0) * (1.0 - smoothstep(400.0, 1200.0, viewDist));
         }
     }
     // Dry ground still has a sheen: brighter towards grazing angles and a
@@ -1377,14 +1414,12 @@ void main() {
     if (!sky && p.look.x > 0.0 && wet < 0.6) {
         float floorish = smoothstep(0.75, 0.95, n.y);
         if (floorish > 0.0) {
-            vec3 view = normalize(at - eye());
-            float cosv = max(dot(n, -view), 0.0);
+            float cosv = max(dot(n, -vdir), 0.0);
             float fres = 0.04 + 0.96 * pow(1.0 - cosv, 5.0);
-            vec3 r = reflect(view, n);
+            vec3 r = reflect(vdir, n);
             float dry = floorish * (1.0 - wet / 0.6);
             // (no sky mix: it washed dry asphalt out to a milky grey)
-            vec3 sunCol = whiteBalance(transmittance(Rg + viewHeight, max(p.sun.y, 0.0))) * sunIlluminance() * p.wind.w;
-            c += sunCol * pow(saturate(dot(r, p.sun.xyz)), 32.0) * fres * 0.45 * dry;
+            c += sunColor * pow(saturate(dot(r, p.sun.xyz)), 32.0) * fres * 0.45 * dry;
         }
     }
     if (wet > 0.001 && !sky) {
@@ -1404,38 +1439,35 @@ void main() {
             vec2 grain = vec2(textureLod(detailNoise, vec3(at.xz * 0.35, 0.6), 0.0).r, textureLod(detailNoise, vec3(at.xz * 0.35 + 0.37, 0.2), 0.0).g) - 0.5;
             float rough = mix(.45,.06,puddle);
             vec3 nn = wetSurfaceNormal(n,grain,ripple,puddle,surfaceFootprint);
-            vec3 view = normalize(at - eye());
-            float cosv = max(dot(nn, -view), 0.0);
+            float cosv = max(dot(nn, -vdir), 0.0);
             float fresnel = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);
             fresnel *= mix(0.45, 1.0, puddle);                 // rough surfaces lose the grazing mirror
-            vec3 reflection = wetReflection(at, nn, skyReflection(reflect(view, nn)),rough);
+            vec3 reflDir = reflect(vdir, nn);
+            vec3 reflection = wetReflection(at, nn, skyReflection(reflDir, sunE, moonE, skyScale), rough);
             // Darker and slightly richer when soaked.
             vec3 soaked = c * c * 1.8;
             c = mix(c, mix(c * 0.72, soaked, 0.35), w);
             float amount = wetReflectionAmount(w,fresnel,puddle);
             c = mix(c, reflection, amount);
             // The sun's glints: wide and soft on asphalt, sharp on puddles.
-            vec3 sunCol = whiteBalance(transmittance(Rg + viewHeight, max(p.sun.y, 0.0))) * sunIlluminance() * p.wind.w;
-            float spec = pow(saturate(dot(reflect(view, nn), p.sun.xyz)), mix(60.0, 700.0, puddle));
-            c += sunCol * spec * w * fresnel * mix(1.2, 5.0, puddle);
+            float spec = pow(saturate(dot(reflDir, p.sun.xyz)), mix(60.0, 700.0, puddle));
+            c += sunColor * spec * w * fresnel * mix(1.2, 5.0, puddle);
         }
     }
     float warm = saturate(1.0 - p.sun.y * 3.0) * smoothstep(-0.1, 0.02, p.sun.y);
     vec3 rays = textureLod(raysTexture, uv, 0.0).rgb;
-    vec3 sunColor = whiteBalance(transmittance(Rg + viewHeight, max(p.sun.y, 0.0))) * sunIlluminance() * p.wind.w;
+    float cosS = dot(vdir, p.sun.xyz);
     if (p.effects.x > 0.0) {
         // Shafts are seen near the sun and mostly when it is low; elsewhere
         // they would only veil the picture.
-        float toward = pow(saturate(dot(normalize(worldDirection(viewDirection(uv))), p.sun.xyz)), mix(8.0, 3.0, saturate(p.extra.x / 1.5)));
-        vec3 sunThrough = whiteBalance(transmittance(Rg + viewHeight, max(p.sun.y, 0.0))) * sunIlluminance();   // gaps let the full sun through
+        float toward = pow(saturate(cosS), mix(8.0, 3.0, saturate(p.extra.x / 1.5)));
         vec3 shafts = sunThrough * rays.r * rays.r * toward * p.effects.x * (0.2 + 2.2 * warm) * (1.0 + p.extra.x);
-        float distance=sky?6000.0:length(at-eye());
         // Crepuscular rays across the sky: with broken clouds the lit
         // shafts fan out from the sun and the shadowed air between them
         // darkens, so they read as rays, not as a glow.
         float broken = saturate(p.extra.x / 1.5);
         if (sky && broken > 0.0) {
-            float fan = pow(saturate(dot(normalize(worldDirection(viewDirection(uv))), p.sun.xyz)), 2.0);
+            float fan = pow(saturate(cosS), 2.0);
             // Relative to the sky's own brightness: never washes it out.
             float k = fan * broken * p.effects.x * 2.0;
             c *= max(1.0 + (rays.r * rays.r * 1.1 - (1.0 - rays.r) * 0.45) * k, 0.4);
@@ -1443,27 +1475,23 @@ void main() {
         // Volumetric beams (rays pass g/b): lit air brightens, shaded air
         // darkens, strongest looking towards the sun (forward scattering).
         if (p.clouds.x > 0.03) {
-            float cosV = dot(normalize(worldDirection(viewDirection(uv))), p.sun.xyz);
-            float forward = hgPhase(cosV, 0.72) / hgPhase(1.0, 0.72);
+            float forward = hgPhase(cosS, 0.72) / hgPhase(1.0, 0.72);
             float beams = (rays.g - 0.55) * rays.b * p.effects.x * (0.5 + broken) * (0.35 + 4.0 * forward) * (1.0 + 1.5 * warm);
             c *= max(1.0 + beams * 1.6, 0.35);
         }
-        c += shafts * airOpacity(distance,mix(.000003,.000018,warm)+p.picture.w*.00009) * (1.0-c*.5);
+        c += shafts * airOpacity(eyeDist,mix(.000003,.000018,warm)+p.picture.w*.00009) * (1.0-c*.5);
     }
 )glsl"
                                           R"glsl(
     // Air: aerial perspective and, at a low sun, golden light scattered in
     // the haze; distant buildings fade into it and become silhouettes.
-    vec3 vdir = normalize(worldDirection(viewDirection(uv)));
     float golden = saturate(1.0 - p.sun.y * 4.5) * smoothstep(-0.12, 0.0, p.sun.y);
     if (!sky && p.taa.z < 0.5) {
-        float dist = length(at-eye());
         float density = mix(0.000003, 0.000018, golden) * (1.0 + 1.5 * p.clouds.y);   // distant buildings only
-        float cosS = dot(vdir, p.sun.xyz);
         float towardSun = pow(saturate(cosS), 4.0);
         // Haze only in the distance: nothing hangs in the air near the camera.
-        float haze = airOpacity(dist,density*(1.0+2.5*golden*towardSun));
-        vec3 ambientAir = skyReflection(normalize(vec3(vdir.x, 0.12, vdir.z)));
+        float haze = airOpacity(eyeDist,density*(1.0+2.5*golden*towardSun));
+        vec3 ambientAir = skyReflection(normalize(vec3(vdir.x, 0.12, vdir.z)), sunE, moonE, skyScale);
         vec3 sunAir = sunColor * (hgPhase(cosS, 0.72) * 3.0 + hgPhase(cosS, 0.92) * 3.0 * golden + 0.04) * (0.3 + 0.7 * rays.r);
         c = mix(c, ambientAir * mix(0.8, 0.45, golden) + sunAir, haze * 0.6);
     }
@@ -1500,7 +1528,7 @@ void main() {
                 vec2 center = vec2(hash12(cell + 2.3), hash12(cell + 5.9)) * 0.8 + 0.1;
                 float dd = length(f - center) / K / pixelAngle;      // pixels
                 float speck = exp(-dd * dd / (layer == 0 ? 2.5 : 1.2));
-                float forward = pow(saturate(dot(vdir, p.sun.xyz)), 4.0);
+                float forward = pow(saturate(cosS), 4.0);
                 c += lightNow * speck * rays.r * (0.25 + forward) * 0.35;
             }
         }
@@ -1508,26 +1536,23 @@ void main() {
     // Fog: exponential height fog thickest near the ground, lit by the sky
     // and by the sun through it (shafts show inside it).
     if (p.picture.w > 0.0) {
-        float dist = sky ? 6000.0 : length(at-eye());
-        vec3 at2 = eye() + vdir * dist;
+        vec3 at2 = sky ? eye() + vdir * 6000.0 : at;
         float groundY = 0.0; // plaza world datum: the fog must not move up and down with the camera
         float h0 = max(eye().y - groundY, 0.0), h1 = max(at2.y - groundY, 0.0);
         const float H = 60.0;
         // Integral of exp(-h/H) along the ray.
         float dh = h1 - h0;
         float integral = abs(dh) > 0.01 ? H * (exp(-h0 / H) - exp(-h1 / H)) / dh : exp(-h0 / H);
-        float optical = p.picture.w * 0.004 * max(dist - 120.0, 0.0) * integral;   // clear right around the player
+        float optical = p.picture.w * 0.004 * max(eyeDist - 120.0, 0.0) * integral;   // clear right around the player
         float fogT = exp(-optical);
-        float cosS = dot(vdir, p.sun.xyz);
-        vec3 fogSun = whiteBalance(transmittance(Rg + viewHeight, max(p.sun.y, 0.0))) * sunIlluminance() * p.wind.w
-                    * (hgPhase(cosS, 0.6) * 2.5 + 0.08) * (0.35 + 0.65 * rays.r);
-        vec3 fogSky = skyReflection(normalize(vec3(vdir.x, 0.15, vdir.z))) * 0.75;
+        vec3 fogSun = sunColor * (hgPhase(cosS, 0.6) * 2.5 + 0.08) * (0.35 + 0.65 * rays.r);
+        vec3 fogSky = skyReflection(normalize(vec3(vdir.x, 0.15, vdir.z)), sunE, moonE, skyScale) * 0.75;
         c = c * fogT + (fogSky + fogSun) * (1.0 - fogT);
     }
     // Bloom from the HDR scene: energy above the display range spreads.
+    vec3 bloomSample = p.depthRange.z > 0.0 ? textureLod(bloom0, uv, 0.0).rgb : vec3(0.0);
     if (p.depthRange.z > 0.0) {
-        vec3 bright = textureLod(bloom0, uv, 0.0).rgb;
-        c += bright * p.depthRange.z * 0.45 * (1.0 + 1.8 * golden);
+        c += bloomSample * p.depthRange.z * 0.45 * (1.0 + 1.8 * golden);
     }
     // Filmic grade: gentle S-curve around mid grey, vibrance, warm light and
     // cool shadows following the sun, soft vignette.
@@ -1548,8 +1573,9 @@ void main() {
         vec3 s = displayColor(saturate(c));
         if (p.look.y > 0.0 && (id.x & 3) == 0 && (id.y & 3) == 0 && !(uv.y < 0.17 && uv.x > 0.6))
             imageAtomicAdd(lookHistogram, ivec2(min(int(dot(s, vec3(0.299, 0.587, 0.114)) * 128.0), 127), 0), 1u);
-        float golden = saturate(1.0 - p.sun.y * 4.5) * smoothstep(-0.12, 0.0, p.sun.y);
-        vec3 graded2 = mix(lookExact(s, false), lookExact(s, true), golden);
+        vec3 graded2 = golden <= 0.0 ? lookExact(s, false)
+                     : golden >= 1.0 ? lookExact(s, true)
+                                     : mix(lookExact(s, false), lookExact(s, true), golden);
         // Subtle by day; the golden look carries the sunset (warm, calmer colours).
         float strength = p.look.x*smoothstep(-.12,.04,p.sun.y);
         c = linearColor(mix(s, graded2, strength));
@@ -1564,7 +1590,7 @@ void main() {
         c *= wb / luminance(wb);
     }
     // Halation: low sun light bleeds warm around bright areas.
-    if (p.depthRange.z > 0.0) c += textureLod(bloom0, uv, 0.0).rgb * vec3(1.0, 0.7, 0.45) * warm * 0.03;
+    if (p.depthRange.z > 0.0) c += bloomSample * vec3(1.0, 0.7, 0.45) * warm * 0.03;
     // Film grain, stronger in the darks, new every frame.
     if (p.post.y > 0.0) {
         float g = hash12(vec2(id) + p.post.w * 113.0) + hash12(vec2(id.yx) * 1.31 + p.post.w * 71.0) - 1.0;

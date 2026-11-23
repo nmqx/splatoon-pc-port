@@ -74,6 +74,22 @@ std::map<std::array<uint32_t, 10>, VkPipeline> s_sky_pipelines;
 std::map<VkFormat, VkPipeline> s_rain_pipelines;
 VkDescriptorPool s_pool = VK_NULL_HANDLE;
 unsigned s_pool_sets = 0;
+struct SetKey {
+    std::array<uint64_t, kBindingCount - 1> serials{};
+    bool depth = false;
+    bool operator==(const SetKey&) const = default;
+};
+struct SetKeyHash {
+    size_t operator()(const SetKey& k) const noexcept {
+        uint64_t h = 14695981039346656037ull ^ (k.depth ? 1ull : 0ull);
+        for (uint64_t s : k.serials) {
+            h ^= s;
+            h *= 1099511628211ull;
+        }
+        return size_t(h);
+    }
+};
+std::unordered_map<SetKey, VkDescriptorSet, SetKeyHash> s_set_cache;
 VkSampler s_sampler_linear = VK_NULL_HANDLE, s_sampler_repeat = VK_NULL_HANDLE, s_sampler_nearest = VK_NULL_HANDLE,
           s_sampler_dome = VK_NULL_HANDLE;
 gx2vk::Image s_t_lut, s_ms_lut, s_sv_lut, s_shape, s_detail, s_dome, s_dummy2d, s_dummy3d, s_dummy_storage2d,
@@ -104,6 +120,15 @@ bool s_cover_started = false;
 bool s_failed = false, s_static_ready = false, s_skyview_ready = false;
 uint64_t s_dome_frames = 0;
 int s_dome_quality = 0;
+bool s_dome_has_clouds = false;
+
+uint64_t sky_dump_frame() {
+    static const uint64_t dump_at = [] {
+        const char* v = std::getenv("RBREW_SKY_DUMP");
+        return v ? std::strtoull(v, nullptr, 10) : 0ull;
+    }();
+    return dump_at;
+}
 
 // Calibration of the physical sky to the game's HDR scene colour: the sky at
 // the game's sun elevation matches the brightness of its painted dome.
@@ -222,6 +247,7 @@ VkDescriptorSet allocate_set() {
         gx2vk::defer([device, retired] { vkDestroyDescriptorPool(device, retired, nullptr); });
         s_pool = VK_NULL_HANDLE;
         s_pool_sets = 0;
+        s_set_cache.clear();
     }
     if (!s_pool) {
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kPoolSets * 17},
@@ -264,8 +290,22 @@ struct Bind {
     bool depth = false;
 };
 VkDescriptorSet make_set(const Bind& b) {
+    if (!s_ubo.buffer) return VK_NULL_HANDLE;
+    gx2vk::Image* resolved[kBindingCount]{};
+    SetKey key;
+    key.depth = b.depth;
+    for (uint32_t i = 1; i < kBindingCount; ++i) {
+        gx2vk::Image* image = b.images[i];
+        const bool volume = i == kShape || i == kDetail || i == kOut3D;
+        if (!image)
+            image =
+                storage(i) ? (volume ? &s_dummy_storage3d : &s_dummy_storage2d) : (volume ? &s_dummy3d : &s_dummy2d);
+        resolved[i] = image;
+        key.serials[i - 1] = image->image_serial;
+    }
+    if (const auto it = s_set_cache.find(key); it != s_set_cache.end()) return it->second;
     VkDescriptorSet set = allocate_set();
-    if (!set || !s_ubo.buffer) return VK_NULL_HANDLE;
+    if (!set) return VK_NULL_HANDLE;
     if (!s_sampler_linear) {
         s_sampler_linear = make_sampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -293,11 +333,7 @@ VkDescriptorSet make_set(const Bind& b) {
             writes[i].pBufferInfo = &buffer;
             continue;
         }
-        gx2vk::Image* image = b.images[i];
-        const bool volume = i == kShape || i == kDetail || i == kOut3D;
-        if (!image)
-            image =
-                storage(i) ? (volume ? &s_dummy_storage3d : &s_dummy_storage2d) : (volume ? &s_dummy3d : &s_dummy2d);
+        gx2vk::Image* image = resolved[i];
         VkSampler sampler = i == kShape || i == kDetail  ? repeat
                             : i == kDome                 ? dome
                             : i == kDepth || i == kCover ? nearest
@@ -309,6 +345,7 @@ VkDescriptorSet make_set(const Bind& b) {
         writes[i].pImageInfo = &images[i];
     }
     vkUpdateDescriptorSets(gx2vk::device(), kBindingCount, writes, 0, nullptr);
+    s_set_cache.emplace(key, set);
     return set;
 }
 uint32_t upload(const Params& params, bool camera_dependent = false) {
@@ -696,6 +733,8 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
     const uint32_t dw = std::min(quality == 1 ? 1024u : quality == 2 ? 2048u : 4096u, max_dw);
     const uint32_t dh = dw / 4;
     const uint32_t grid = quality >= 3 ? 8u : 4u;
+    const bool any_clouds = p.clouds[0] > 0.001f || p.hero[0] > 0.0f || p.extra[3] > 0.0f;
+    bool dome_cleared = false;
     if (quality != s_dome_quality || !s_dome || s_dome.desc.width != dw || s_dome.desc.height != dh) {
         if (!make_image(s_dome, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, 1,
                         kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
@@ -709,7 +748,21 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
         gx2vk::note_gpu_write(s_dome, gx2vk::kSyncTransfer);
         s_dome_quality = quality;
         s_dome_frames = 0;
+        s_dome_has_clouds = false;
+        dome_cleared = true;
         fill(p, f, w, h);
+    }
+    if (!any_clouds) {
+        if (s_dome_has_clouds && !dome_cleared) {
+            gx2vk::barrier_for(gx2vk::kSyncTransfer);
+            const VkClearColorValue clear_dome{{0.0f, 0.0f, 0.0f, 1.0f}};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(gx2vk::cmd(), s_dome.image, VK_IMAGE_LAYOUT_GENERAL, &clear_dome, 1, &range);
+            gx2vk::note_gpu_write(s_dome, gx2vk::kSyncTransfer);
+            s_dome_frames = 0;
+            s_dome_has_clouds = false;
+        }
+        return;
     }
     p.clouds[2] = float(s_dome_frames);
     Bind d;
@@ -719,6 +772,7 @@ void update(const Frame& f, uint32_t w, uint32_t h) {
     d.images[kDetail] = &s_detail;
     d.images[kDomeImage] = &s_dome;
     dispatch(s_dome_pass, d, p, (dw / grid + 7) / 8, (dh / grid + 7) / 8, 1, &s_dome);
+    s_dome_has_clouds = true;
     ++s_dome_frames;
 }
 
@@ -969,8 +1023,12 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
     if (!will_taa) p.clouds[2] = 0.f;
     const bool rays = settings.sun_rays && f.sky.sun_elevation > -1.5f && f.sky.rain < 0.6f;
     {
-        if (!make_image(s_scene_copy, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1,
-                        kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+        const bool direct_scene_color =
+            !sky_dump_frame() && (color.desc.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0 &&
+            gx2vk::format_supports(color.desc.format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+        if ((!direct_scene_color &&
+             !make_image(s_scene_copy, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1,
+                         kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ||
             !make_image(s_result, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, 1,
                         kStorageSampled | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
             !make_image(s_rays, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, (w + 1) / 2, (h + 1) / 2, 1,
@@ -978,15 +1036,18 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
             !make_image(s_ao, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, (w + 1) / 2, (h + 1) / 2, 1,
                         kStorageSampled))
             return false;
-        const auto cb = gx2vk::cmd();
-        gx2vk::barrier_for(gx2vk::kSyncTransfer);
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = blit.dstOffsets[1] = {int32_t(w), int32_t(h), 1};
-        vkCmdBlitImage(cb, color.image, VK_IMAGE_LAYOUT_GENERAL, s_scene_copy.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                       VK_FILTER_NEAREST);
-        gx2vk::note_gpu_write(s_scene_copy, gx2vk::kSyncTransfer);
-        gx2vk::note_gpu_read(gx2vk::kSyncTransfer);
+        if (!direct_scene_color) {
+            const auto cb = gx2vk::cmd();
+            gx2vk::barrier_for(gx2vk::kSyncTransfer);
+            vkCmdBlitImage(cb, color.image, VK_IMAGE_LAYOUT_GENERAL, s_scene_copy.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                           &blit, VK_FILTER_NEAREST);
+            gx2vk::note_gpu_write(s_scene_copy, gx2vk::kSyncTransfer);
+            gx2vk::note_gpu_read(gx2vk::kSyncTransfer);
+        }
+        gx2vk::Image* scene_color_src = direct_scene_color ? &color : &s_scene_copy;
         // s_rays, s_ao, and s_bloom[0] read already-completed scene targets and
         // write disjoint outputs: sync Compute once on the first pass so all
         // three overlap concurrently on the GPU.
@@ -1089,7 +1150,7 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
         c.images[kDetail] = &s_detail;
         c.images[kDepth] = &depth;
         c.depth = true;
-        c.images[kColor] = &s_scene_copy;
+        c.images[kColor] = scene_color_src;
         c.images[kCover] = s_cover ? &s_cover : nullptr;
         c.images[kOut2D] = &s_result;
         c.images[kRaysTexture] = rays ? &s_rays : nullptr;
@@ -1197,10 +1258,7 @@ bool apply(gx2vk::Image& color, gx2vk::Image& depth, const Camera& camera, const
     }
     // RBREW_SKY_DUMP=<frame>: the dome and the sky-view LUT as raw RGBA16F
     // files next to the executable (diagnostics).
-    static const uint64_t dump_at = [] {
-        const char* v = std::getenv("RBREW_SKY_DUMP");
-        return v ? std::strtoull(v, nullptr, 10) : 0ull;
-    }();
+    const uint64_t dump_at = sky_dump_frame();
     static bool dumped = false;
     if (dump_at && !dumped && gx2vk::present_count() >= dump_at) {
         dumped = true;
@@ -1736,6 +1794,7 @@ void shutdown() {
     if (s_set_layout) vkDestroyDescriptorSetLayout(device, s_set_layout, nullptr);
     s_pool = VK_NULL_HANDLE;
     s_pool_sets = 0;
+    s_set_cache.clear();
     s_sampler_linear = s_sampler_repeat = s_sampler_nearest = s_sampler_dome = VK_NULL_HANDLE;
     s_layout = VK_NULL_HANDLE;
     s_set_layout = VK_NULL_HANDLE;
@@ -1747,5 +1806,6 @@ void shutdown() {
     s_static_ready = s_skyview_ready = false;
     s_dome_quality = 0;
     s_dome_frames = 0;
+    s_dome_has_clouds = false;
 }
 } // namespace gx2weather

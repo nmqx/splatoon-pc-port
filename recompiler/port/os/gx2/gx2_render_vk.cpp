@@ -609,6 +609,8 @@ void gx2_render_init() {
     // Default GPU state set by gx2_render.cpp's init: depth test on, LEQUAL,
     // back-face culling, CCW, no blend, no scissor.
     S.raster = RasterState{};
+    S.raster_reg_dirty = 0xFF;
+    S.pm4_resource_dirty = false;
     S.raster.depth_test = true;
     S.raster.depth_write = true;
     S.raster.depth_func = wire::LEQUAL;
@@ -803,6 +805,7 @@ void gx2r::bind_target_framebuffer() {
 }
 
 void gx2_render_set_target_channel_masks(uint32_t masks) {
+    if (S.target_masks == masks && S.regs[0xA08E] == masks) return;
     S.regs[0xA08E] = masks;
     S.target_masks = masks;
     apply_channel_masks();
@@ -1309,6 +1312,7 @@ void gx2_render_set_depth_stencil_control(bool depth_test, bool depth_write, uin
 
 void gx2_render_set_polygon_control(uint32_t front_face, bool cull_front, bool cull_back) {
     ++S.reg_generation;
+    S.raster_reg_dirty |= 1u;
     S.raster.front_face = front_face == GX2_FRONT_FACE_CW ? wire::CW : wire::CCW;
     if (cull_front && cull_back) {
         S.raster.cull = true;
@@ -1395,6 +1399,7 @@ void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t 
             S.raster.blend_eq_alpha = tb0.alpha_op;
         }
         if (color_control) gx2_render_set_color_write(((color >> 4) & 7) != 1);
+        S.raster_reg_dirty &= uint8_t(~2u);
     }
     if (alpha) S.raster.alpha_to_coverage = (S.regs[0xA351] & 1) != 0;
     if (point) S.raster.point_size = std::max(0.125f, float(S.regs[0xA280] >> 16) / 8);
@@ -1434,10 +1439,12 @@ void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t 
             s.write_mask = (maskword >> 16) & 255;
         }
         if (active != (S.raster.depth_test || S.raster.stencil_test)) bind_target_framebuffer();
+        S.raster_reg_dirty &= uint8_t(~4u);
     }
     if (polygon) {
         const uint32_t w = S.regs[0xA205];
         gx2_render_set_polygon_control((w >> 2) & 1, (w & 1) != 0, (w & 2) != 0);
+        S.raster_reg_dirty &= uint8_t(~1u);
         S.raster.polygon_offset_fill = (w & 0x1800) != 0;
         S.raster.polygon_offset_line = S.raster.polygon_offset_point = (w & 0x2000) != 0;
     }
@@ -1447,10 +1454,12 @@ void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t 
         S.raster.offset_units = f(0xA381);
         S.raster.offset_clamp = f(0xA37F);
     }
+    if (mask || blend || alpha || point || restart || viewport || offset) S.raster_reg_dirty &= uint8_t(~8u);
 }
 
 void gx2_render_set_blend_control(bool blend_enable, uint32_t src_color, uint32_t dst_color, uint32_t color_combine,
                                   uint32_t src_alpha, uint32_t dst_alpha, uint32_t alpha_combine) {
+    S.raster_reg_dirty |= 2u;
     auto& tb0 = S.raster.target_blends[0];
     if (blend_enable) {
         S.raster.blend = true;
@@ -1475,6 +1484,7 @@ void gx2_render_set_blend_control(bool blend_enable, uint32_t src_color, uint32_
 }
 
 void gx2_render_set_color_write(bool enable) {
+    S.raster_reg_dirty |= 2u;
     S.color_write = enable;
     apply_channel_masks();
 }
@@ -1556,8 +1566,22 @@ void gx2_render_apply_registers(const Gx2RegisterWrite* w, size_t n) {
             const unsigned stage = off >> 7;
             const unsigned rem = off & 0x7Fu;
             if (stage < 3 && rem < 18 * 4 && changed) sampler_mask |= 1ull << (stage * 18 + (rem >> 2));
+        } else if (idx >= 0xE000 && idx < 0xF000) {
+            if (changed) S.pm4_resource_dirty = true;
         } else if (idx >= 0xA080 && idx <= 0xA390) {
-            any_raster = true;
+            if (changed) {
+                any_raster = true;
+            } else if (idx == 0xA205) {
+                any_raster |= (S.raster_reg_dirty & 1u) != 0;
+            } else if ((idx >= 0xA1E0 && idx <= 0xA1E7) || idx == 0xA202) {
+                any_raster |= (S.raster_reg_dirty & 2u) != 0;
+            } else if (idx == 0xA200 || idx == 0xA10C || idx == 0xA10D) {
+                any_raster |= (S.raster_reg_dirty & 4u) != 0;
+            } else if (idx == 0xA090 || idx == 0xA091) {
+                any_raster |= !S.raster.scissor_test;
+            } else {
+                any_raster |= (S.raster_reg_dirty & 8u) != 0;
+            }
         }
     }
     if (any_changed) ++S.reg_generation;
@@ -1832,17 +1856,23 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
 #endif
     s_refresh_alias_memo[slot].direct = false;
     auto& bound_slot = S.bound_textures[slot];
-    if (bound_slot.address != tex_addr ||
-        (bound_slot.descriptor.data() != data && std::memcmp(bound_slot.descriptor.data(), data, GX2TEX_SIZEOF) != 0)) {
+    const bool same_slot_desc =
+        bound_slot.address == tex_addr &&
+        (bound_slot.descriptor.data() == data || std::memcmp(bound_slot.descriptor.data(), data, GX2TEX_SIZEOF) == 0);
+    uint32_t word4;
+    if (!same_slot_desc) {
         bound_slot.address = tex_addr;
         std::memcpy(bound_slot.descriptor.data(), data, GX2TEX_SIZEOF);
+        word4 = descriptor_word(data, 0x90);
+        bound_slot.swizzle = word4;
+        r700_texture_registers(S.regs.data(), data, slot);
+    } else {
+        word4 = bound_slot.swizzle;
+        if (S.pm4_resource_dirty) r700_texture_registers(S.regs.data(), data, slot);
     }
-    const uint32_t word4 = descriptor_word(data, 0x90);
-    bound_slot.swizzle = word4;
-    r700_texture_registers(S.regs.data(), data, slot);
 
     auto& cached = S.texture_entries[slot];
-    if (!cached.entry || cached.mem != mem || std::memcmp(cached.layout.data(), data, cached.layout.size()) != 0) {
+    if (!same_slot_desc || !cached.entry || cached.mem != mem) {
         uint64_t k0, k1, k2;
         std::memcpy(&k0, data + 0x10, 8);
         std::memcpy(&k1, data + 0x20, 8);
@@ -1852,7 +1882,8 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             (S.texture_entry_mru.size() - 1);
         auto& mru = S.texture_entry_mru[mru_slot];
         if (mru.entry && mru.mem == mem && std::memcmp(mru.layout.data(), data, mru.layout.size()) == 0) {
-            cached = mru;
+            cached.entry = mru.entry;
+            cached.mem = mem;
         } else {
             TextureEntryIndexKey index_key{mem};
             std::memcpy(index_key.layout.data(), data, index_key.layout.size());
@@ -1864,8 +1895,9 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             cached.entry = indexed->second;
             TXDIAG(txdiag::count(txdiag::Misses));
             cached.mem = mem;
-            cached.layout = index_key.layout;
-            mru = cached;
+            mru.entry = cached.entry;
+            mru.mem = mem;
+            mru.layout = index_key.layout;
         }
     }
     auto& entry = *cached.entry;
@@ -2613,12 +2645,16 @@ void gx2_render_restore_context_state(uint32_t context_state, uint8_t* mem) {
             block.size = saved[1];
         }
     S.active_fetch = snapshot.fetch_shader;
+    S.raster_reg_dirty = 0xFF;
+    S.pm4_resource_dirty = true;
     for (unsigned slot = 0; slot < S.bound_textures.size(); ++slot) {
         const auto& bound = snapshot.bound_textures[slot];
         if (!bound.address) {
             s_refresh_alias_memo[slot].direct = false;
+            S.texture_entries[slot] = {};
         } else if (prev_textures[slot].address != bound.address ||
                    std::memcmp(prev_textures[slot].descriptor.data(), bound.descriptor.data(), GX2TEX_SIZEOF) != 0) {
+            S.texture_entries[slot] = {};
             gx2_render_upload_texture(bound.address, slot, mem, bound.descriptor.data());
         }
     }
@@ -3527,6 +3563,8 @@ void gx2_render_store_fetch_attributes(uint32_t program, const std::vector<R700F
     fetch.attributes = attributes;
     fetch.revision = S.next_fetch_revision++;
     fetch.program.clear();
+    fetch.verified_batch_id = 0;
+    fetch.verified_size = 0;
     S.invalidate_fetch_cache();
 }
 void gx2_render_store_fetch_attributes(uint32_t program, const std::vector<R700FetchAttribute>& attributes,
@@ -3535,20 +3573,38 @@ void gx2_render_store_fetch_attributes(uint32_t program, const std::vector<R700F
     auto it = S.fetch_shaders.find(program);
     if (attributes.empty()) {
         // Undecodable bytes: keep a known layout, but stop re-decoding them.
-        if (it != S.fetch_shaders.end()) it->second.program.assign(bytes, bytes + size);
+        if (it != S.fetch_shaders.end()) {
+            it->second.program.assign(bytes, bytes + size);
+            it->second.verified_batch_id = 0;
+            it->second.verified_size = 0;
+        }
         return;
     }
     auto& fetch = it != S.fetch_shaders.end() ? it->second : S.fetch_shaders[program];
     fetch.attributes = attributes;
     fetch.revision = S.next_fetch_revision++;
     fetch.program.assign(bytes, bytes + size);
+    fetch.verified_batch_id = gx2_write_watch_batch_id();
+    fetch.verified_size = size;
     S.invalidate_fetch_cache();
 }
 bool gx2_render_fetch_program_current(uint32_t program, const uint8_t* bytes, uint32_t size) {
-    const auto* info = S.find_fetch_info(program);
+    auto* info = S.find_fetch_info(program);
     if (!info || info->attributes.empty()) return false;
     const auto& known = info->program;
-    return known.empty() || (known.size() == size && std::memcmp(known.data(), bytes, size) == 0);
+    if (known.empty()) return true;
+    if (known.size() != size) return false;
+    const uint64_t batch = gx2_write_watch_batch_id();
+    if (batch != 0 && info->verified_batch_id == batch && info->verified_size == size) {
+        // Trailing 8 bytes carry stepped instance divisors when present; check them in 1 compare.
+        if (size < 8 || std::memcmp(known.data() + size - 8, bytes + size - 8, 8) == 0) return true;
+    }
+    if (std::memcmp(known.data(), bytes, size) == 0) {
+        info->verified_batch_id = batch;
+        info->verified_size = size;
+        return true;
+    }
+    return false;
 }
 uint32_t gx2_render_active_fetch_attribute_count() {
     const auto* info = S.active_fetch_info();
@@ -3593,7 +3649,10 @@ void gx2_render_set_uniform_reg(bool is_pixel, uint32_t index, uint32_t src_addr
 void gx2_render_set_uniform_words(bool is_pixel, uint32_t index, const uint32_t* words, uint32_t count) {
     index &= 0x7FFF;
     if (!words || !count || index >= 1024 || count > 1024 - index) return;
-    std::memcpy(S.uniform_words[is_pixel].data() + index, words, count * sizeof(uint32_t));
+    auto* dst = S.uniform_words[is_pixel].data() + index;
+    const size_t bytes = count * sizeof(uint32_t);
+    if (std::memcmp(dst, words, bytes) == 0) return;
+    std::memcpy(dst, words, bytes);
     ++S.uniform_generation[is_pixel ? 1 : 0];
 }
 uint32_t gx2_render_uniform_word(bool is_pixel, uint32_t index) {

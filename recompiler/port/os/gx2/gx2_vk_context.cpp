@@ -68,8 +68,9 @@ bool s_executing = false;   // guarded by s_queue_mutex
 uint32_t s_next_ticket = 0; // guarded by s_queue_mutex
 std::atomic<uint32_t> s_pushed{0}, s_done{0};
 std::atomic<int> s_query_waiters{0}; // guest reads waiting for one query (gx2_draw.cpp)
-std::atomic<bool> s_sleeping{false};
-std::atomic<bool> s_event_sleeping{false};
+constexpr uint32_t kSleepPush = 1u;
+constexpr uint32_t kSleepEvent = 2u;
+std::atomic<uint32_t> s_sleep_mask{0};
 #if defined(_WIN32)
 std::mutex s_wake_event_mutex;
 HANDLE s_wake_event = nullptr;
@@ -156,7 +157,7 @@ struct RenderWaitResources {
     }
 
     void close() {
-        s_event_sleeping.store(false, std::memory_order_seq_cst);
+        s_sleep_mask.fetch_and(~kSleepEvent, std::memory_order_seq_cst);
         {
             std::lock_guard lock(s_wake_event_mutex);
             if (s_wake_event == wake_event) s_wake_event = nullptr;
@@ -190,9 +191,9 @@ struct RenderWaitResources {
             _mm_pause();
             return;
         }
-        // Clear any stale signal BEFORE publishing s_event_sleeping (Dekker pair with wake_render_thread).
+        // Clear any stale signal BEFORE publishing kSleepEvent (Dekker pair with wake_render_thread).
         ResetEvent(wake_event);
-        s_event_sleeping.store(true, std::memory_order_seq_cst);
+        s_sleep_mask.fetch_or(kSleepEvent, std::memory_order_seq_cst);
         if (s_pushed.load(std::memory_order_seq_cst) == seen) {
             HANDLE handles[2] = {wake_event, timer};
             const DWORD timeout_ms = DWORD(sleep_ns / 1'000'000 + 20);
@@ -201,12 +202,12 @@ struct RenderWaitResources {
         } else {
             CancelWaitableTimer(timer);
         }
-        s_event_sleeping.store(false, std::memory_order_seq_cst);
+        s_sleep_mask.fetch_and(~kSleepEvent, std::memory_order_seq_cst);
     }
 #else
     bool high_res = true;
 
-    void close() { s_event_sleeping.store(false, std::memory_order_seq_cst); }
+    void close() { s_sleep_mask.fetch_and(~kSleepEvent, std::memory_order_seq_cst); }
 
     ~RenderWaitResources() { close(); }
 
@@ -215,12 +216,12 @@ struct RenderWaitResources {
     void wait_for_work_or_ns(uint32_t seen, uint64_t sleep_ns) {
         sleep_ns = std::min<uint64_t>(sleep_ns, 100'000'000ull);
         std::unique_lock lock(s_wake_cv_mutex);
-        s_event_sleeping.store(true, std::memory_order_seq_cst);
+        s_sleep_mask.fetch_or(kSleepEvent, std::memory_order_seq_cst);
         if (s_pushed.load(std::memory_order_seq_cst) == seen) {
             s_wake_cv.wait_for(lock, std::chrono::nanoseconds(sleep_ns),
                                [seen] { return s_pushed.load(std::memory_order_seq_cst) != seen; });
         }
-        s_event_sleeping.store(false, std::memory_order_seq_cst);
+        s_sleep_mask.fetch_and(~kSleepEvent, std::memory_order_seq_cst);
     }
 #endif
     RenderWaitResources(const RenderWaitResources&) = delete;
@@ -229,8 +230,9 @@ struct RenderWaitResources {
 
 void wake_render_thread() {
     s_pushed.fetch_add(1, std::memory_order_seq_cst);
-    if (s_sleeping.load(std::memory_order_seq_cst)) s_pushed.notify_one();
-    if (s_event_sleeping.load(std::memory_order_seq_cst)) {
+    const uint32_t mask = s_sleep_mask.load(std::memory_order_seq_cst);
+    if (mask & kSleepPush) s_pushed.notify_one();
+    if (mask & kSleepEvent) {
 #if defined(_WIN32)
         std::lock_guard lock(s_wake_event_mutex);
         if (s_wake_event) SetEvent(s_wake_event);
@@ -334,9 +336,9 @@ void render_thread() {
             }
             if (!queued) {
                 gx2_render_query_poll();
-                s_sleeping.store(true, std::memory_order_seq_cst);
+                s_sleep_mask.fetch_or(kSleepPush, std::memory_order_seq_cst);
                 if (s_pushed.load(std::memory_order_seq_cst) == seen) s_pushed.wait(seen, std::memory_order_acquire);
-                s_sleeping.store(false, std::memory_order_relaxed);
+                s_sleep_mask.fetch_and(~kSleepPush, std::memory_order_relaxed);
             }
             continue;
         }
@@ -345,9 +347,12 @@ void render_thread() {
         for (Item& item : batch) {
             // The caller's core selects its display list, as if it ran there.
             rbrew_thread_core_slot = item.core;
-            gx2interp::before_item(); // 120 FPS mode: a new frame's capture starts here
+            const bool interp_active =
+                gx2interp::mode_enabled() || gx2interp::capturing() || gx2interp::deadline_ns() != 0;
+            if (interp_active) gx2interp::before_item(); // 120 FPS mode: a new frame's capture starts here
             if (item.work) {
-                const auto work_start = std::chrono::steady_clock::now();
+                const auto work_start =
+                    interp_active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 try {
                     item.work->run();
                 } catch (...) {
@@ -355,11 +360,15 @@ void render_thread() {
                     if (!s_async_error) s_async_error = std::current_exception();
                     s_has_async_error.store(true, std::memory_order_release);
                 }
-                gx2interp::add_busy(uint64_t(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - work_start)
-                        .count()));
-                gx2interp::keep(item.work); // kept for the 120 FPS replay, else deleted
-                gx2interp::service();
+                if (interp_active) {
+                    gx2interp::add_busy(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - work_start)
+                                                     .count()));
+                    gx2interp::keep(item.work); // kept for the 120 FPS replay, else deleted
+                    gx2interp::service();
+                } else {
+                    delete item.work;
+                }
             } else {
                 try {
                     item.run(item.context);

@@ -115,10 +115,16 @@ struct Gx2BakedHotCommands {
     Gx2CommandFn set_ps_ubo = nullptr;
     Gx2CommandFn set_vs = nullptr;
     Gx2CommandFn set_ps = nullptr;
+    Gx2CommandFn set_fetch_shader = nullptr;
     Gx2DescriptorFn set_ps_tex = nullptr;
     Gx2DescriptorFn set_vs_tex = nullptr;
     Gx2DescriptorFn set_ps_sampler = nullptr;
     Gx2DescriptorFn set_vs_sampler = nullptr;
+    Gx2DescriptorFn set_depth_control_reg = nullptr;
+    Gx2DescriptorFn set_polygon_control_reg = nullptr;
+    Gx2DescriptorFn set_alpha_test_reg = nullptr;
+    Gx2DescriptorFn set_scissor_reg = nullptr;
+    Gx2DescriptorFn set_target_masks_reg = nullptr;
 };
 
 void gx2_display_list_register(CPUState* cpu);

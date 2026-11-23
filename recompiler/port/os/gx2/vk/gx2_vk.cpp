@@ -2,6 +2,7 @@
 #include "../../../runtime/texture_diagnostics.h"
 #include "../../../runtime/port_settings.h"
 #include "../../../runtime/splatoon_diagnostics.h"
+#include "../../../runtime/crash_diagnostics.h"
 #include "gx2_vk.h"
 #include "gx2_vk_capture.h"
 #include "gx2_vk_memory.h"
@@ -51,11 +52,41 @@ uint32_t s_queue_family = 0;
 VkSurfaceKHR s_surface = VK_NULL_HANDLE;
 VkPhysicalDeviceMemoryProperties s_memory{};
 Caps s_caps;
-std::unordered_map<VkFormat, VkFormatProperties> s_format_properties;
+struct FormatPropertiesCacheEntry {
+    bool valid = false;
+    VkFormatProperties props{};
+};
+constexpr uint32_t kFastFormatCount = 256;
+std::array<FormatPropertiesCacheEntry, kFastFormatCount> s_format_properties_fast{};
+std::unordered_map<VkFormat, VkFormatProperties> s_format_properties_ext;
+void clear_format_properties_cache() {
+    s_format_properties_fast.fill({});
+    s_format_properties_ext.clear();
+}
+const VkFormatProperties& cached_format_properties(VkFormat format) {
+    const uint32_t idx = static_cast<uint32_t>(format);
+    if (idx < kFastFormatCount) {
+        auto& entry = s_format_properties_fast[idx];
+        if (!entry.valid) {
+            vkGetPhysicalDeviceFormatProperties(s_physical, format, &entry.props);
+            entry.valid = true;
+        }
+        return entry.props;
+    }
+    auto [it, inserted] = s_format_properties_ext.try_emplace(format);
+    if (inserted) vkGetPhysicalDeviceFormatProperties(s_physical, format, &it->second);
+    return it->second;
+}
 uint64_t s_image_generation = 0;
 uint64_t s_image_serial = 0;
 bool s_ready = false;
 bool s_debug_utils = false;
+std::atomic<bool> s_fatal_reported{false};
+void report_vk_fatal(rbrew::crash_diag::FailureCategory category, const char* detail, int vk_result = 0,
+                     const char* faulting_module = nullptr) {
+    if (s_fatal_reported.exchange(true, std::memory_order_acq_rel)) return;
+    rbrew::crash_diag::report_fatal_error(category, detail, vk_result, faulting_module);
+}
 #ifdef RBREW_TEXTURE_DIAGNOSTICS
 bool s_diagnostic_shutdown_idle = false;
 #endif
@@ -625,16 +656,18 @@ void recorder() {
 // Producer side (the render thread). Returns the packet body (16-aligned).
 uint64_t s_head = 0; // producer's private head
 uint64_t s_published_head = 0;
+uint64_t s_cached_tail = 0; // producer's cached copy of r.tail (avoids cross-core reads per vkCmd*)
 uint32_t s_batch_depth = 0;
 void publish();
 uint8_t* reserve(size_t body, Replay fn) {
     Ring& r = *s_ring;
     const size_t size = 16 + align16(body);
     for (;;) {
-        const uint64_t tail = r.tail.load(std::memory_order_acquire);
         const size_t offset = s_head % kRing;
         const size_t needed = size + (offset + size > kRing ? kRing - offset : 0);
-        if (kRing - (s_head - tail) >= needed) {
+        if (kRing - (s_head - s_cached_tail) < needed)
+            s_cached_tail = r.tail.load(std::memory_order_acquire);
+        if (kRing - (s_head - s_cached_tail) >= needed) {
             if (offset + size > kRing) { // wrap marker, continue at the start
                 const uint32_t wrap = kWrap;
                 std::memcpy(r.data.data() + offset, &wrap, 4);
@@ -666,14 +699,21 @@ void drain() {
     if (!s_active.load(std::memory_order_acquire)) return;
     if (s_published_head != s_head) publish();
     Ring& r = *s_ring;
-    if (r.tail.load(std::memory_order_acquire) == s_head) return;
+    if (r.tail.load(std::memory_order_acquire) == s_head) {
+        s_cached_tail = s_head;
+        return;
+    }
     for (unsigned n = 0; n < 2048; ++n) {
-        if (r.tail.load(std::memory_order_acquire) == s_head) return;
+        if (r.tail.load(std::memory_order_acquire) == s_head) {
+            s_cached_tail = s_head;
+            return;
+        }
         _mm_pause();
     }
     r.drain_waiting.store(true, std::memory_order_seq_cst);
     for (uint64_t t; (t = r.tail.load(std::memory_order_acquire)) != s_head;) r.tail.wait(t, std::memory_order_acquire);
     r.drain_waiting.store(false, std::memory_order_relaxed);
+    s_cached_tail = s_head;
 }
 
 // A packet whose body is a trivially-copyable lambda (plus `extra` bytes the
@@ -1166,6 +1206,7 @@ void install() {
     s_ring->head.store(s_head, std::memory_order_relaxed);
     s_ring->tail.store(s_head, std::memory_order_relaxed);
     s_published_head = s_head;
+    s_cached_tail = s_head;
     s_batch_depth = 0;
     s_exit = false;
     s_recorder.thread = std::thread(recorder);
@@ -1209,15 +1250,22 @@ void end_command_batch() {
 // ---------------------------------------------------------------------------
 bool init(SDL_Window* window, bool native_depth) {
     if (s_ready) return true;
-    s_format_properties.clear();
+    clear_format_properties_cache();
+    s_fatal_reported.store(false, std::memory_order_release);
     s_window = window;
     if (volkInitialize() != VK_SUCCESS) {
         RBREW_LOG_FATAL("vk", "FATAL: the Vulkan loader (vulkan-1.dll) is not available\n");
+        report_vk_fatal(rbrew::crash_diag::FailureCategory::VulkanLoaderMissing,
+                        "the Vulkan loader (vulkan-1.dll / libvulkan) is not available", 0, "vulkan-1.dll");
         return false;
     }
     if (volkGetInstanceVersion() < VK_API_VERSION_1_3) {
-        RBREW_LOG_FATAL("vk", "FATAL: Vulkan 1.3 is required (loader reports %u.%u)\n",
-                        VK_API_VERSION_MAJOR(volkGetInstanceVersion()), VK_API_VERSION_MINOR(volkGetInstanceVersion()));
+        const uint32_t loader_ver = volkGetInstanceVersion();
+        char detail[128];
+        std::snprintf(detail, sizeof(detail), "Vulkan 1.3 is required (loader reports %u.%u)",
+                      VK_API_VERSION_MAJOR(loader_ver), VK_API_VERSION_MINOR(loader_ver));
+        RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+        report_vk_fatal(rbrew::crash_diag::FailureCategory::VulkanVersionTooOld, detail);
         return false;
     }
     std::vector<const char*> extensions;
@@ -1280,7 +1328,13 @@ bool init(SDL_Window* window, bool native_depth) {
     if (!layers.empty() && sync_validation) info.pNext = &features;
     VkResult result = vkCreateInstance(&info, nullptr, &s_instance);
     if (result != VK_SUCCESS) {
-        RBREW_LOG_FATAL("vk", "FATAL: vkCreateInstance failed (%d)\n", int(result));
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "vkCreateInstance failed (%d)", int(result));
+        RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+        report_vk_fatal(result == VK_ERROR_INCOMPATIBLE_DRIVER
+                            ? rbrew::crash_diag::FailureCategory::VulkanDriverIncompatible
+                            : rbrew::crash_diag::FailureCategory::VulkanInitFailure,
+                        detail, int(result));
         return false;
     }
     volkLoadInstance(s_instance);
@@ -1301,7 +1355,10 @@ bool init(SDL_Window* window, bool native_depth) {
         if (s_caps.validation) vkCreateDebugUtilsMessengerEXT(s_instance, &messenger, nullptr, &s_messenger);
     }
     if (window && !SDL_Vulkan_CreateSurface(window, s_instance, &s_surface)) {
-        RBREW_LOG_FATAL("vk", "FATAL: SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+        RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+        report_vk_fatal(rbrew::crash_diag::FailureCategory::VulkanInitFailure, detail);
         return false;
     }
 
@@ -1337,10 +1394,25 @@ bool init(SDL_Window* window, bool native_depth) {
     }
     if (!s_physical) {
         RBREW_LOG_FATAL("vk", "FATAL: no Vulkan 1.3 device with a graphics/present queue\n");
+        report_vk_fatal(devices.empty() ? rbrew::crash_diag::FailureCategory::VulkanDriverIncompatible
+                                        : rbrew::crash_diag::FailureCategory::VulkanVersionTooOld,
+                        "no Vulkan 1.3 device with a graphics/present queue");
         return false;
     }
-    VkPhysicalDeviceProperties props{};
-    vkGetPhysicalDeviceProperties(s_physical, &props);
+    VkPhysicalDeviceDriverProperties driver_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2.pNext = &driver_props;
+    vkGetPhysicalDeviceProperties2(s_physical, &props2);
+    const VkPhysicalDeviceProperties& props = props2.properties;
+    {
+        std::string driver_desc = driver_props.driverName;
+        if (driver_props.driverInfo[0] != '\0') {
+            if (!driver_desc.empty()) driver_desc += " ";
+            driver_desc += driver_props.driverInfo;
+        }
+        rbrew::crash_diag::record_gpu_info(props.deviceName, props.vendorID, props.deviceID, props.apiVersion,
+                                           props.driverVersion, driver_desc.empty() ? nullptr : driver_desc.c_str());
+    }
     s_caps.api_version = props.apiVersion;
     s_caps.device_name = props.deviceName;
     s_caps.limits = props.limits;
@@ -1463,8 +1535,11 @@ bool init(SDL_Window* window, bool native_depth) {
     };
     for (const auto& r : required) {
         if (!r.value) {
-            RBREW_LOG_FATAL("vk", "FATAL: required device feature %s is not supported by %s\n", r.name,
-                            props.deviceName);
+            char detail[256];
+            std::snprintf(detail, sizeof(detail), "required device feature %s is not supported by %s", r.name,
+                          props.deviceName);
+            RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+            report_vk_fatal(rbrew::crash_diag::FailureCategory::VulkanExtensionOrFeatureMissing, detail);
             return false;
         }
     }
@@ -1567,7 +1642,15 @@ bool init(SDL_Window* window, bool native_depth) {
     if (result != VK_SUCCESS && fg::device_revert(enable, device_info, &queue_info))
         result = vkCreateDevice(s_physical, &device_info, nullptr, &s_device);
     if (result != VK_SUCCESS) {
-        RBREW_LOG_FATAL("vk", "FATAL: vkCreateDevice failed (%d)\n", int(result));
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "vkCreateDevice failed (%d)", int(result));
+        RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+        const auto cat = (result == VK_ERROR_EXTENSION_NOT_PRESENT || result == VK_ERROR_FEATURE_NOT_PRESENT)
+                             ? rbrew::crash_diag::FailureCategory::VulkanExtensionOrFeatureMissing
+                         : result == VK_ERROR_INCOMPATIBLE_DRIVER
+                             ? rbrew::crash_diag::FailureCategory::VulkanDriverIncompatible
+                             : rbrew::crash_diag::FailureCategory::VulkanInitFailure;
+        report_vk_fatal(cat, detail, int(result));
         return false;
     }
     volkLoadDevice(s_device);
@@ -1639,7 +1722,9 @@ bool init(SDL_Window* window, bool native_depth) {
 
 void shutdown() {
     record::stop();
-    s_format_properties.clear();
+    clear_format_properties_cache();
+    s_fatal_reported.store(false, std::memory_order_release);
+    rbrew::crash_diag::clear_gpu_info();
     fg::shutdown_all();
     if (!s_device) return;
 #ifdef RBREW_TEXTURE_DIAGNOSTICS
@@ -1927,8 +2012,13 @@ bool wait_serial(uint64_t serial, uint64_t timeout_ns) {
     TXDIAG(if (result != VK_SUCCESS)
                txdiag::event("wait_failed", "\"waiting_for\":%llu,\"result\":%d", serial, int(result)));
     poll_completed();
-    if (result == VK_ERROR_DEVICE_LOST)
-        RBREW_LOG_FATAL("vk", "FATAL: device lost while waiting for submission %llu\n", (unsigned long long)serial);
+    if (result == VK_ERROR_DEVICE_LOST) {
+        char detail[128];
+        std::snprintf(detail, sizeof(detail), "device lost while waiting for submission %llu",
+                      (unsigned long long)serial);
+        RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+        report_vk_fatal(rbrew::crash_diag::FailureCategory::VulkanDeviceLost, detail, int(result));
+    }
     return result == VK_SUCCESS;
 }
 
@@ -2066,7 +2156,17 @@ uint64_t submit_with(const VkSemaphore* wait, VkPipelineStageFlags2 wait_stage, 
            txdiag::journal().completed = s_completed; if (result != VK_SUCCESS || txdiag::sample("submit", 0))
                txdiag::event("submit", "\"submitted\":%llu,\"command_buffers\":%u,\"result\":%d", serial, cb_count,
                              int(result)));
-    if (result != VK_SUCCESS) RBREW_LOG_FATAL("vk", "FATAL: vkQueueSubmit2 failed (%d)\n", int(result));
+    if (result != VK_SUCCESS) {
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "vkQueueSubmit2 failed (%d)", int(result));
+        RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+        const auto cat = result == VK_ERROR_DEVICE_LOST
+                             ? rbrew::crash_diag::FailureCategory::VulkanDeviceLost
+                         : (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY)
+                             ? rbrew::crash_diag::FailureCategory::VulkanOutOfMemory
+                             : rbrew::crash_diag::FailureCategory::VulkanInitFailure;
+        report_vk_fatal(cat, detail, int(result));
+    }
     s_pending_commands.push_back({s_current, serial});
     s_current = VK_NULL_HANDLE;
     s_recorded = false;
@@ -2367,6 +2467,8 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
                                          MemoryUse::Upload);
             if (!chunk.buffer.buffer || !chunk.buffer.memory.mapped) {
                 RBREW_LOG_FATAL("vk", "FATAL: cannot allocate a host-visible upload chunk\n");
+                report_vk_fatal(rbrew::crash_diag::FailureCategory::VulkanOutOfMemory,
+                                "cannot allocate a host-visible upload chunk", int(VK_ERROR_OUT_OF_DEVICE_MEMORY));
                 return {};
             }
             s_chunks.push_back(std::move(chunk));
@@ -2410,7 +2512,17 @@ bool span_resident(const Span& span) {
 
 bool span_alive(const Span& span) {
     if (!span.chunk_id || span.chunk_id < s_reclaim_before_id) return false;
-    for (auto& meta : s_chunk_meta) {
+    if (s_active_chunk >= 0 && static_cast<size_t>(s_active_chunk) < s_chunk_meta.size()) {
+        auto& active = s_chunk_meta[s_active_chunk];
+        if (active.id == span.chunk_id) {
+            active.last_serial = std::max(active.last_serial, s_next_serial);
+            active.retain_until = std::max(active.retain_until, s_next_serial);
+            return true;
+        }
+    }
+    for (size_t i = 0; i < s_chunk_meta.size(); ++i) {
+        if (static_cast<int>(i) == s_active_chunk) continue;
+        auto& meta = s_chunk_meta[i];
         if (meta.id != span.chunk_id) continue;
         // The caller reuses the span in the recording in progress: keep the
         // chunk reserved until that submission completes, or the ring would
@@ -2523,9 +2635,7 @@ bool format_is_compressed(VkFormat f) {
 bool format_supports(VkFormat format, VkFormatFeatureFlags features, bool optimal) {
     // These capabilities are immutable for the selected physical device.
     // Draw submission asks about attachment blend support for every object.
-    auto [it, inserted] = s_format_properties.try_emplace(format);
-    if (inserted) vkGetPhysicalDeviceFormatProperties(s_physical, format, &it->second);
-    const auto& props = it->second;
+    const auto& props = cached_format_properties(format);
     return ((optimal ? props.optimalTilingFeatures : props.linearTilingFeatures) & features) == features;
 }
 
@@ -2733,7 +2843,11 @@ bool create_image(Image& image, const ImageDesc& desc) {
         vkBindImageMemory(s_device, image.image, image.memory.memory, image.memory.offset) != VK_SUCCESS) {
         TXDIAG(txdiag::event("image_memory_failed", "\"image\":%llu,\"memory\":%llu", txdiag::handle(image.image),
                              txdiag::handle(image.memory.memory)));
-        RBREW_LOG_FATAL("vk", "FATAL: out of device memory for a %ux%u image\n", desc.width, desc.height);
+        char detail[128];
+        std::snprintf(detail, sizeof(detail), "out of device memory for a %ux%u image", desc.width, desc.height);
+        RBREW_LOG_FATAL("vk", "FATAL: %s\n", detail);
+        report_vk_fatal(rbrew::crash_diag::FailureCategory::VulkanOutOfMemory, detail,
+                        int(VK_ERROR_OUT_OF_DEVICE_MEMORY));
         vkDestroyImage(s_device, image.image, nullptr);
         image.image = VK_NULL_HANDLE;
         free_now(image.memory);
@@ -2851,9 +2965,7 @@ VkImageView image_view(Image& image, const ViewDesc& desc) {
     // every usage of the image; restrict it to what the format offers.
     if (format != image.desc.format) {
         VkImageUsageFlags allowed = 0;
-        VkFormatProperties props{};
-        vkGetPhysicalDeviceFormatProperties(s_physical, format, &props);
-        const auto f = props.optimalTilingFeatures;
+        const auto f = cached_format_properties(format).optimalTilingFeatures;
         if (f & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) allowed |= VK_IMAGE_USAGE_SAMPLED_BIT;
         if (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) allowed |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (f & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) allowed |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;

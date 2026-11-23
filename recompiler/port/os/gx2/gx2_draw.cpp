@@ -1646,18 +1646,20 @@ static void GX2SetShaderModeEx(CPUState* cpu) {
 static void GX2SetFetchShader(CPUState* cpu) {
     // Look the layout up by the struct's program pointer ([3]), which is the
     // same for the original struct and any copy of it.
-    const uint32_t program = ARG0 && rbrew_memory_accessible(MEM, ARG0, 0x10) ? rbrew_read32(MEM, ARG0 + 0x0C) : 0;
+    const bool fs_ok20 = ARG0 && rbrew_memory_accessible(MEM, ARG0, 0x20);
+    const bool fs_ok10 = fs_ok20 || (ARG0 && rbrew_memory_accessible(MEM, ARG0, 0x10));
+    const uint32_t program = fs_ok10 ? rbrew_read32(MEM, ARG0 + 0x0C) : 0;
     if (program && gx2_render_active_fetch_shader() == program) return;
     gx2_render_set_active_fetch_shader(program);
     // Pre-built fetch shader (models): no GX2InitFetchShaderEx layout, so
     // decode the program's own fetch microcode ([2] = program size). Leaving a
     // level frees its models and the hub reloads its own into that memory, so
     // a cached layout is reused only while the program bytes are unchanged.
-    if (program && rbrew_memory_accessible(MEM, ARG0, 0x10)) {
+    if (program && fs_ok10) {
         const uint32_t size = rbrew_read32(MEM, ARG0 + 0x08);
         // [5] numDivisors, [6..7] instance step rates (part of the layout).
         uint32_t divisors[2]{};
-        const bool stepped = rbrew_memory_accessible(MEM, ARG0, 0x20) && rbrew_read32(MEM, ARG0 + 0x14);
+        const bool stepped = fs_ok20 && rbrew_read32(MEM, ARG0 + 0x14);
         if (stepped) {
             divisors[0] = rbrew_read32(MEM, ARG0 + 0x18);
             divisors[1] = rbrew_read32(MEM, ARG0 + 0x1C);
@@ -1764,8 +1766,9 @@ void gx2_draw_register(CPUState* cpu) {
     REG(GX2DrawIndexedEx2);
     gx2_register_draw_commands(GX2DrawIndexedEx, GX2DrawIndexedEx2, GX2DrawEx);
     gx2_register_hot_commands({GX2SetAttribBuffer, GX2SetVertexUniformBlock, GX2SetPixelUniformBlock,
-                               GX2SetVertexShader, GX2SetPixelShader, apply_pixel_texture, apply_vertex_texture,
-                               apply_pixel_sampler, apply_vertex_sampler});
+                               GX2SetVertexShader, GX2SetPixelShader, GX2SetFetchShader, apply_pixel_texture,
+                               apply_vertex_texture, apply_pixel_sampler, apply_vertex_sampler, apply_depth_control,
+                               apply_polygon_control, apply_alpha_test, apply_scissor, apply_target_channel_masks});
     REG(GX2QueryBegin);
     REG(GX2QueryEnd);
     // Caller-side: answers from published counters without waiting, else

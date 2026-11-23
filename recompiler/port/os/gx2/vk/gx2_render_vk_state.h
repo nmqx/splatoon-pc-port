@@ -301,6 +301,8 @@ struct FetchShaderInfo {
     uint64_t revision = 0;
     uint64_t exact_hash = 0;
     uint64_t exact_hash_revision = 0;
+    uint64_t verified_batch_id = 0;
+    uint32_t verified_size = 0;
 };
 
 // Sampler state of one GX2 sampler slot (stage*18 + slot), as GPU sampler
@@ -326,8 +328,12 @@ struct State {
     uint64_t color_view_revision = 0, depth_view_revision = 0;
     uint64_t effective_color_revision() const noexcept { return color_view_revision + cb_map.size(); }
     uint64_t effective_depth_revision() const noexcept { return depth_view_revision + depth_map.size(); }
-    std::array<TextureEntryCache, 96> texture_entries{};
-    std::array<TextureEntryCache, 256> texture_entry_mru{};
+    struct SlotTextureCache {
+        const uint8_t* mem = nullptr;
+        Texture* entry = nullptr;
+    };
+    std::array<SlotTextureCache, 96> texture_entries{};
+    std::array<TextureEntryCache, 1024> texture_entry_mru{};
     std::unordered_map<TextureEntryIndexKey, Texture*, TextureEntryIndexHash> texture_entry_index;
     // Address index of tex_map image/mip ranges for gx2_render_invalidate_textures,
     // rebuilt when tex_map grows (entries are only added, or all reset).
@@ -359,6 +365,8 @@ struct State {
     uint32_t target_masks = 0xFFFFFFFF;
     bool color_write = true;
     bool conditional_draw = true;
+    uint8_t raster_reg_dirty = 0xFF; // bit0=poly, bit1=blend/color, bit2=depth/stencil, bit3=other
+    bool pm4_resource_dirty = false;
     RasterState raster;
     Framebuffer framebuffer;     // current GPU framebuffer binding
     uint32_t current_fbo_id = 0; // diagnostic name of the bound framebuffer

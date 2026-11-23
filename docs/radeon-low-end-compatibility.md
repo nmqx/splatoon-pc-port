@@ -217,6 +217,112 @@ Files: `recompiler/port/CMakeLists.txt`, `recompiler/include/rebrewu/logger.hpp`
   `RBREW_LOG_ERROR_BEGIN`, and `RBREW_LOG_FATAL_BEGIN` remain active in Release
   builds (restoring Vulkan, OOM, and `RBREW_SHADER_ERRORS=1/2` error output).
 
+### 6. Friendly crash & startup-failure diagnostics
+
+Files: `recompiler/port/runtime/crash_diagnostics.h`,
+`recompiler/port/runtime/crash_diagnostics.cpp`,
+`recompiler/port/runtime/splatoon_diagnostics.cpp`,
+`recompiler/port/os/gx2/vk/gx2_vk.cpp`, `recompiler/port/CMakeLists.txt`
+
+- **Plain-English crash & error classifier (`rbrew::crash_diag::diagnose()`):**
+  Identifies GPU driver / Vulkan ICD crashes (`amdvlk64.dll`, `amdvlk32.dll`,
+  `aticfx64.dll`, `atidxx64.dll`, `amdxc64`, `nvoglv64.dll`, `nvwgf2umx.dll`,
+  `igvk64.dll`, `igxelpicd64.dll`, `vulkan-1.dll`, `libvulkan*`, `mesa`, `radv`,
+  `anv` in either the faulting module or unwound backtrace), Vulkan init/runtime
+  failures (missing loader, Vulkan `< 1.3`, `VK_ERROR_INCOMPATIBLE_DRIVER`,
+  `VK_ERROR_EXTENSION_NOT_PRESENT` / `VK_ERROR_FEATURE_NOT_PRESENT`,
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY`, `VK_ERROR_DEVICE_LOST`), CPU
+  `EXCEPTION_ILLEGAL_INSTRUCTION` (`0xC000001D` / `SIGILL` -> advises portable
+  `-DRBREW_ENABLE_AVX2=OFF` builds), access violations, stack overflows, and
+  OOM/abort failures, outputting concrete numbered fix steps.
+- **Persistent `Diagnostics/` reports & native popup:**
+  - Windows SEH (`CrashUnhandledFilter`), `SIGABRT` / `std::terminate`, Linux
+    POSIX `sigaction` (`SIGSEGV`/`SIGILL`/`SIGBUS`/`SIGFPE`/`SIGABRT`, using
+    `dladdr`/`backtrace`), and all 11 fatal Vulkan init/runtime paths in
+    `gx2_vk.cpp` (one-shot guarded via `report_vk_fatal()`) now write
+    `Diagnostics/<timestamp>_crash/crash_report.txt` containing timestamp,
+    GPU/driver metadata captured via `VkPhysicalDeviceDriverProperties`
+    (`record_gpu_info()`), exception/signal/`VkResult`, faulting module,
+    probable cause, fix steps, and backtrace.
+  - Displays a native error popup (Win32 `MessageBoxW` on Windows,
+    `SDL_ShowSimpleMessageBox` on Linux) pointing directly to the saved report.
+  - **Non-blocking test/CI safety:** Popups are automatically suppressed in
+    test/tool binaries (`gambit_*`, `*_test*`, `*_bench*`, etc.), CI
+    environments, Linux sessions without `DISPLAY`/`WAYLAND_DISPLAY`, or when
+    `RBREW_NO_CRASH_DIALOG=1` / `RBREW_HEADLESS=1` is set.
+
+### 7. Cross-tier CPU & GPU performance optimizations
+
+Benefits all PCs from low-end integrated GPUs to high-end desktops:
+
+- **Display lists, PM4 state & render queue**
+  (`recompiler/port/os/gx2/gx2_display_list.h`, `gx2_display_list.cpp`,
+  `gx2_draw.cpp`, `vk/gx2_render_vk_state.h`, `gx2_render_vk.cpp`,
+  `gx2_vk_context.cpp`, `gx2_write_watch.cpp`):
+  - Skipped `s_mutex` / `s_lists.find()` on static PM4 lists when
+    `s_untagged_list_count == 0`; expanded `t_static_mru` (`32 -> 1024`) with
+    `s_static_patch_epoch` validation and `kDlMruSize` (`256 -> 1024`) with
+    zero-refcount borrowed `BakedList::leaf` pointers; gated `kPerfDisplayList`
+    to `t_depth == 0`.
+  - Added compact baked ops (`CallDisplayList`, `SetFetchShader`, `SetReg1`,
+    `SetReg2`, `SetTargetMasks`), eliminated 224 B zero-fill in `SmallBuffer()`,
+    and coalesced guest memory checks in `GX2SetFetchShader`.
+  - Added `State::raster_reg_dirty` / `pm4_resource_dirty` dirty masks,
+    early-returns in `gx2_render_set_target_channel_masks()` and
+    `gx2_render_set_uniform_words()`, 16 B `SlotTextureCache` + 1024-entry
+    `texture_entry_mru`, and per-batch fetch-program validation
+    (`verified_batch_id`).
+  - Gated per-item `steady_clock::now()` / `gx2interp::*` calls in
+    `gx2_vk_context.cpp` when interpolation is inactive, merged
+    `s_sleeping`/`s_event_sleeping` into one atomic `s_sleep_mask`, and
+    enlarged `gx2_write_watch.cpp` `kFastMruSize` (`1024 -> 4096`).
+- **GX2 draw hot path** (`recompiler/port/os/gx2/gx2_render_vk_draw.cpp`):
+  - Expanded `kExactKeyMemoSlots` (`1024 -> 4096`) with direct `Program*`,
+    added 256-slot per-batch `s_code_gen_cache`, compacted
+    `ExactKeyInputs::texture_bits` to `uint8_t[36]`, and deferred
+    `canonical_key` hashing to cache misses.
+  - Added grow-on-demand static GPU index buffers (`s_static_quad_ib`,
+    `s_static_quad_strip_ib`), cached expanded indexed quads in `s_index_spans`,
+    and replaced full-map `std::erase_if` sweeps with bounded 512-bucket
+    incremental sweeps (`s_index_spans`, `s_uniform_spans`).
+  - Expanded `Program::kUfBlockSlots` (`4 -> 16`), added zero-copy
+    `direct_reg_block` for `uniform_mode == 2`, merged VS+PS UBO accessibility
+    prechecks, memoized `transient_cleared_target()`, trimmed per-draw input
+    copies / dynamic-state checks, and preserved non-push `VkDescriptorSet`
+    reuse across compatible pipeline layouts.
+- **Weather & post-FX shaders** (`recompiler/port/os/gx2/gx2_weather_shaders.h`,
+  `gx2_weather.cpp`):
+  - Eliminated duplicate texture taps (`fxaa` cardinal taps, DoF source,
+    `bloom0`) and 4–5x repeated sky/sun/view transcendentals in `kComposite`,
+    added a wave-uniform `golden` guard around `lookExact()`, replaced Clarity
+    and DoF `cos`/`sin` loops with `const vec2` ring tables, and added a 2D
+    rotation recurrence + early squared-distance reject in `kAmbientOcclusion`.
+  - Hoisted loop-invariant lighting/phase terms out of `kCloudDome` raymarch
+    loops, added squared-distance culling + `f <= 0.015` early-out in
+    `heroDensity()`, and restricted `kRays` `.a` visibility evaluation to the
+    center texel neighborhood.
+  - Enabled zero-copy direct `color` sampling when linear-sampled usage is
+    available (skipping `s_scene_copy` blit), skipped `s_dome_pass` when all
+    cloud weights are 0, and added a persistent `VkDescriptorSet` cache
+    (`s_set_cache`) eliminating steady-state per-frame descriptor updates.
+- **Vulkan command recording & caches** (`recompiler/port/os/gx2/vk/gx2_vk.cpp`):
+  - Added producer-private `s_cached_tail` in `record::reserve()` to avoid
+    cross-core atomic tail loads on every `vkCmd*`.
+  - Replaced `s_format_properties` map lookups with an O(1) 256-entry
+    `s_format_properties_fast` array (+ fallback map), and added an O(1)
+    active-chunk fast path in `span_alive()`.
+
+### 8. CI test unblock fixes
+
+Files: `scripts/tests/test_update_scripts.py`, `recompiler/tests/test_weather.cpp`
+
+- Updated `test_only_setup_powershell_script_remains` in
+  `scripts/tests/test_update_scripts.py` to allow `dev-build.ps1` alongside
+  `Setup.ps1` (while still rejecting any legacy update PowerShell scripts).
+- Updated `weather_math` in `recompiler/tests/test_weather.cpp` to match commit
+  `cab2585`'s `rbrew_settings::normalize()` frame-rate contract across all
+  supported frame rates and `shader_quality` levels.
+
 ---
 
 ## Build & runtime knobs
@@ -228,6 +334,7 @@ Files: `recompiler/port/CMakeLists.txt`, `recompiler/include/rebrewu/logger.hpp`
 | **`RBREW_PUSH_DESCRIPTORS`** | Env var | `1` (if supported) | Set to `0` to disable `VK_KHR_push_descriptor` and force descriptor-pool allocation across both main draws and depth/color transfer passes. |
 | **`RBREW_SHADER_ERRORS`** | Env var | unset | Works in Release builds now that `RBREW_LOG_ERROR` is preserved: `1` logs glslang compiler diagnostics; `2` also dumps the failing GLSL source to `stderr`. |
 | **`RBREW_VBO_VRAM`** / **`RBREW_IBO_VRAM`** | Env var | `1` (discrete/large UMA), `0` (`low_vram_igpu`) | Controls staging vertex/index buffers into `DEVICE_LOCAL` memory. Defaults to `0` on low-VRAM iGPUs to avoid local-heap exhaustion; set explicitly to `1` or `0` to override. |
+| **`RBREW_NO_CRASH_DIALOG`** / **`RBREW_HEADLESS`** | Env var | unset | Set either to `1` to suppress the native crash/startup-failure popup dialog while still writing `Diagnostics/<timestamp>_crash/crash_report.txt` and logging via `RBREW_LOG_FATAL`. |
 | **`RBREW_LOG_LEVEL`** | Env var | `debug` | Runtime minimum log level (`debug`, `info`, `warning`, `error`, `fatal`, `off`). In Release builds (`RBREW_DISABLE_LOGGING`), setting `off` silences even `ERROR`/`FATAL` output. |
 
 ---
@@ -236,21 +343,32 @@ Files: `recompiler/port/CMakeLists.txt`, `recompiler/include/rebrewu/logger.hpp`
 
 Configure `recompiler/port` with `-DRBREW_BUILD_TESTS=ON` and run CTest:
 
+- **`native_crash_diagnostics`** (`recompiler/tests/test_crash_diagnostics.cpp`):
+  Verifies GPU driver DLL/ICD & backtrace detection, all crash/Vulkan/SEH/signal
+  diagnosis categories, `record_gpu_info()` round-trip, `report_fatal_error()`
+  writing `crash_report.txt` to disk, and strict GUI popup suppression in tests
+  and headless/CI runs.
 - **`memory_policy`, `memory_allocator`, `memory_transfers`**
   (`recompiler/tests/test_vulkan_memory.cpp`): Models Radeon 890M's 3-heap
   layout (`256 MiB DEVICE_LOCAL`, `256 MiB BAR`, `15.56 GiB shared`) and
   verifies `MemoryUse::Upload` selects the shared coherent heap while
   `DeviceLocal` prefers `DEVICE_LOCAL` with shared fallback.
-- **`weather_gpu`** (`recompiler/tests/test_weather.cpp`): Exercises
+- **`weather_math`, `weather_gpu`** (`recompiler/tests/test_weather.cpp`):
+  Verifies frame-rate normalization across all `shader_quality` levels,
   `exposedCloud` NaN/`±Inf`/negative inputs, `kAmbientOcclusion` collinear-depth
   zero-cross inputs, `kSkyVertex`/`kSkyFragment` with a zenith moon and
-  non-finite cloud dome texels, `fxaa` negative-RGB inputs, and `s_dome`
-  frame-0 `quality=3` and quality-transition clears.
+  non-finite cloud dome texels, `fxaa` negative-RGB inputs, `s_dome` frame-0
+  and quality-transition clears, clouds `OFF -> ON -> OFF` dome skip/clear,
+  descriptor-set cache reuse, and the `s_scene_copy` fallback path.
 - **`shader_translation`** (`recompiler/tests/test_shader_performance.cpp`):
   Verifies every translated vertex shader contains `layout(push_constant)` and
   places all `#extension` directives strictly before it.
 - **`render_geometry`** (and standalone `gambit_render_bench quads_depth`,
   `recompiler/tests/test_render_performance.cpp`): Verifies `QUADS`/`QUAD_STRIP`
-  triangle expansion and live GPU `QUADS` rasterization, non-mutating per-slot
-  `swizzle_override`, and `depth_to_depth_pass` across `D32_SFLOAT` (direct and
-  non-attachable scratch fallback) and `D32_SFLOAT_S8_UINT`.
+  triangle expansion, static GPU quad IBOs, live GPU `QUADS` rasterization,
+  non-mutating per-slot `swizzle_override`, and `depth_to_depth_pass` across
+  `D32_SFLOAT` (direct and non-attachable scratch fallback) and
+  `D32_SFLOAT_S8_UINT`.
+- **Python tool & script tests:** `recompiler/tools/test_revision_profile.py`,
+  `recompiler/tools/test_vulkan_dependencies.py`, and
+  `scripts/tests/test_update_scripts.py`.
