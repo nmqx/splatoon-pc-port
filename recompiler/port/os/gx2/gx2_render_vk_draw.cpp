@@ -6052,7 +6052,16 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
             stages_ok = build_stage(mem, *prog, 0, sd, &precheck) && build_stage(mem, *prog, 1, sd, &precheck);
         }
         if (!stages_ok) return any;
-        if (s_rendering && sd.aliases_active_fb) {
+        // AMD-only workaround: ending the pass for every draw that samples a
+        // bound attachment (ink, particles, soft depth) stutters heavily on
+        // other GPUs, which never showed the corruption. RBREW_FEEDBACK_BREAK=0/1
+        // overrides the vendor default.
+        static const bool s_feedback_break = [] {
+            const char* v = std::getenv("RBREW_FEEDBACK_BREAK");
+            if (v && v[0]) return v[0] != '0';
+            return gx2vk::caps().is_amd;
+        }();
+        if (s_feedback_break && s_rendering && sd.aliases_active_fb) {
             // Break intra-pass attachment feedback loops so CB/DCC and DB/HTILE
             // caches flush before sampling an image bound in the active pass
             // (AMD RDNA 3.5 coherency & VUID-vkCmdDraw-None-06886).

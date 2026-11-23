@@ -64,7 +64,7 @@ target_compile_definitions(rbrew_zlib_static PUBLIC Z_PREFIX)
 set_target_properties(rbrew_zlib_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(RBREW_ZLIB_HEADER "${rbrew_zlib_SOURCE_DIR}/zlib.h")
 
-option(RBREW_ENABLE_AVX2 "Enable AVX2 codegen on x64 builds (disable for older non-AVX2 CPUs)" OFF)
+option(RBREW_ENABLE_AVX2 "Enable AVX2 codegen on x64 builds (disable for older non-AVX2 CPUs)" ON)
 
 add_subdirectory(third_party/cemu_shader)
 if(MSVC AND NOT RBREW_ENABLE_AVX2)

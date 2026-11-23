@@ -82,8 +82,19 @@ uint64_t s_image_serial = 0;
 bool s_ready = false;
 bool s_debug_utils = false;
 std::atomic<bool> s_fatal_reported{false};
+std::atomic<bool> s_soft_fatal_reported{false};
 void report_vk_fatal(rbrew::crash_diag::FailureCategory category, const char* detail, int vk_result = 0,
                      const char* faulting_module = nullptr) {
+    // Startup failures (init() returns false and the game exits) and device
+    // loss get the blocking popup. Other in-game failures (an image or upload
+    // chunk allocation, a failed submit) can be survived: only write the
+    // report, once, so a modal dialog never freezes the fullscreen game.
+    const bool blocking = !s_ready || category == rbrew::crash_diag::FailureCategory::VulkanDeviceLost;
+    if (!blocking) {
+        if (s_soft_fatal_reported.exchange(true, std::memory_order_acq_rel)) return;
+        rbrew::crash_diag::report_fatal_error(category, detail, vk_result, faulting_module, false);
+        return;
+    }
     if (s_fatal_reported.exchange(true, std::memory_order_acq_rel)) return;
     rbrew::crash_diag::report_fatal_error(category, detail, vk_result, faulting_module);
 }
@@ -1252,6 +1263,7 @@ bool init(SDL_Window* window, bool native_depth) {
     if (s_ready) return true;
     clear_format_properties_cache();
     s_fatal_reported.store(false, std::memory_order_release);
+    s_soft_fatal_reported.store(false, std::memory_order_release);
     s_window = window;
     if (volkInitialize() != VK_SUCCESS) {
         RBREW_LOG_FATAL("vk", "FATAL: the Vulkan loader (vulkan-1.dll) is not available\n");
@@ -1724,6 +1736,7 @@ void shutdown() {
     record::stop();
     clear_format_properties_cache();
     s_fatal_reported.store(false, std::memory_order_release);
+    s_soft_fatal_reported.store(false, std::memory_order_release);
     rbrew::crash_diag::clear_gpu_info();
     fg::shutdown_all();
     if (!s_device) return;

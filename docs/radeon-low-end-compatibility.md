@@ -205,7 +205,7 @@ Files: `recompiler/port/third_party/cemu_shader/Cafe/HW/Latte/LegacyShaderDecomp
 
 Files: `recompiler/port/CMakeLists.txt`, `recompiler/include/rebrewu/logger.hpp`
 
-- Added CMake option `RBREW_ENABLE_AVX2` (default `OFF`) gating `/arch:AVX2`
+- Added CMake option `RBREW_ENABLE_AVX2` (default `ON`, the previous behavior; `OFF` for pre-Haswell CPUs) gating `/arch:AVX2`
   across MSVC targets (`gambit_generated`, `gambit_runtime`, `cemu_shader`,
   `gambit_guest_bench`) and `-mavx2 -mfma` / `-mavx2 -mfma -mbmi2 -mmovbe`
   (replacing unconditional `-march=native`) on GCC/Clang so default builds run
@@ -329,7 +329,7 @@ Files: `scripts/tests/test_update_scripts.py`, `recompiler/tests/test_weather.cp
 
 | Knob | Type | Default | Description |
 | --- | --- | --- | --- |
-| **`RBREW_ENABLE_AVX2`** | CMake option | `OFF` | Opt-in AVX2/FMA/BMI2/MOVBE codegen on x64 builds. Leave `OFF` for portable binaries that run on older non-AVX2 CPUs; set `-DRBREW_ENABLE_AVX2=ON` for Haswell+ / Zen+ local builds. |
+| **`RBREW_ENABLE_AVX2`** | CMake option | `ON` | AVX2/FMA/BMI2/MOVBE codegen on x64 builds (Haswell+ / Zen+, as the released builds always used). Set `-DRBREW_ENABLE_AVX2=OFF` only for a binary that must run on an older non-AVX2 CPU. |
 | **`RBREW_DIAGNOSTIC_RUNTIME`** | CMake option | `OFF` | Keeps verbose `DEBUG`/`INFO`/`WARN` logs, frame capture, and profiler hooks. When `OFF`, `RBREW_DISABLE_LOGGING` strips verbose diagnostics while still preserving `ERROR` and `FATAL` logs. |
 | **`RBREW_PUSH_DESCRIPTORS`** | Env var | `1` (if supported) | Set to `0` to disable `VK_KHR_push_descriptor` and force descriptor-pool allocation across both main draws and depth/color transfer passes. |
 | **`RBREW_SHADER_ERRORS`** | Env var | unset | Works in Release builds now that `RBREW_LOG_ERROR` is preserved: `1` logs glslang compiler diagnostics; `2` also dumps the failing GLSL source to `stderr`. |
