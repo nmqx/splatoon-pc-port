@@ -207,6 +207,8 @@ struct RenderWaitResources {
 #else
     bool high_res = true;
 
+    RenderWaitResources() = default;
+
     void close() { s_sleep_mask.fetch_and(~kSleepEvent, std::memory_order_seq_cst); }
 
     ~RenderWaitResources() { close(); }
